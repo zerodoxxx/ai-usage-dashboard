@@ -67,3 +67,17 @@ def test_legacy_exports_and_fallbacks_remain_compatible() -> None:
     assert get_pricing("unrecognized-model") == MODEL_PRICING["gpt-5.6-luna"]
     assert get_pricing_strict("unrecognized-model").status == "unknown"
     assert calculate_cost("gpt-6-astra", 1_000_000, 1_000_000, 1_000_000)["cost_cached_usd"] == 61.0
+
+
+def test_current_claude_and_deepseek_models_have_pricing() -> None:
+    opus = get_pricing_strict("claude-opus-5-20250514", provider="claude-code")
+    assert opus.status == "known"
+    assert opus.rates == PricingRates(5.0, 0.5, 25.0, cache_creation=6.25)
+
+    haiku = get_pricing_strict("claude-haiku-4-5-20251001", provider="claude")
+    assert haiku.status == "known"
+    assert haiku.rates == PricingRates(1.0, 0.1, 5.0, cache_creation=1.25)
+
+    flash = get_pricing_strict("deepseek-v4-flash", provider="deepseek")
+    assert flash.status == "known"
+    assert flash.rates == PricingRates(0.44, 0.014, 1.32)

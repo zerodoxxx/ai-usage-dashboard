@@ -50,6 +50,10 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "Claude Sonnet 4": {"uncached_input": 3.00, "cached_input": 0.30, "output": 15.00},
     "Claude Haiku 4.5": {"uncached_input": 1.00, "cached_input": 0.10, "output": 5.00},
     "Claude Haiku 3.5": {"uncached_input": 0.80, "cached_input": 0.08, "output": 4.00},
+    # DeepSeek V4. The official API publishes peak and off-peak rates; the
+    # static catalog uses the latest peak rates so usage is not understated.
+    "deepseek-v4-flash": {"uncached_input": 0.44, "cached_input": 0.014, "output": 1.32},
+    "deepseek-v4-pro": {"uncached_input": 1.32, "cached_input": 0.044, "output": 3.96},
 }
 
 DEFAULT_MODEL = "gpt-5.6-luna"
@@ -75,6 +79,7 @@ _ALIASES: list[tuple[str, str]] = [
     ("claude-sonnet-4-6", "Claude Sonnet 4.6"), ("claude-sonnet-4-5", "Claude Sonnet 4.5"),
     ("claude-sonnet-4", "Claude Sonnet 4"), ("claude-haiku-4-5", "Claude Haiku 4.5"),
     ("claude-haiku-3-5", "Claude Haiku 3.5"),
+    ("deepseek-chat", "deepseek-v4-flash"), ("deepseek-reasoner", "deepseek-v4-pro"),
 ]
 
 Provider = str
@@ -167,6 +172,7 @@ def _normalize(value: str | None) -> str:
 _PROVIDER_ALIASES: dict[str, str] = {
     "agy": "antigravity", "antigravity": "antigravity", "gemini": "antigravity", "google": "antigravity",
     "claude": "claude", "claude-code": "claude", "anthropic": "claude",
+    "deepseek": "deepseek", "deep-seek": "deepseek",
     "codex": "codex", "openai": "codex", "chatgpt": "codex",
 }
 
@@ -296,6 +302,8 @@ def _build_catalog() -> PricingCatalog:
             provider = "antigravity"
         elif folded_model.startswith("claude"):
             provider = "claude"
+        elif folded_model.startswith("deepseek"):
+            provider = "deepseek"
         else:
             provider = "codex"
         aliases = tuple(alias for alias, target in _ALIASES if target == model)

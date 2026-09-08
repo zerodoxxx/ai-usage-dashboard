@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 _CLAUDE_PARSE_CACHE: dict[tuple[str, int, int], UsageSession | None] = {}
 
 
+def _pricing_provider(model: str) -> str:
+    """Return the billing provider for a model recorded in Claude logs."""
+    return "deepseek" if model.casefold().startswith("deepseek") else "claude"
+
+
 def _as_int(value: Any) -> int:
     try:
         return max(0, int(value or 0))
@@ -91,7 +96,7 @@ def _usage_event(
             base_input,
             cache_read,
             output,
-            provider="claude",
+            provider=_pricing_provider(model),
             cache_write=cache_write,
         )
         if resolved.get("status") == "known":
