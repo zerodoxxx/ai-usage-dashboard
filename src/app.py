@@ -20,7 +20,7 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 app = FastAPI(
     title="AI Tools Usage & Cost Visualizer",
     version="1.0.0",
-    description="Real-time usage telemetry, token auditing, and cost analysis dashboard for Codex and AGY.",
+    description="Real-time usage telemetry, token auditing, and cost analysis dashboard for Codex, AGY, and Claude Code.",
 )
 
 # Ensure static directory exists before mounting
@@ -43,7 +43,7 @@ def read_index() -> FileResponse:
 def api_usage(
     tool: str = Query(
         default="all",
-        description="Filter metrics by tool: 'all', 'codex', 'agy', or 'antigravity'.",
+        description="Filter metrics by tool: 'all', 'codex', 'agy', 'antigravity', or 'claude-code'.",
     ),
     time_range: str = Query(
         default="all",

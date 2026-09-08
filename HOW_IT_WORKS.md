@@ -2,13 +2,13 @@
 
 ## Overview
 
-This project is a local-only web dashboard that reads telemetry files already written to your disk by AI coding tools. Built-in adapters support **OpenAI Codex** and **Google Antigravity (AGY)**, and the provider-neutral extraction contract allows additional tools such as Claude Code to be registered without changing aggregation logic.
+This project is a local-only web dashboard that reads telemetry files already written to your disk by AI coding tools. Built-in adapters support **OpenAI Codex**, **Claude Code**, and **Google Antigravity (AGY)**.
 
 No API keys, no cloud connections, no subscriptions. Everything runs locally.
 
 ---
 
-## The Two Tools Being Tracked
+## The Tools Being Tracked
 
 ### 1. OpenAI Codex (`~/.codex/`)
 
@@ -59,6 +59,10 @@ output_tokens ≈ (output_chars + thinking_chars) // 4
 
 For multi-turn sessions (where prompt caching is very effective), a **45% cache hit rate** is assumed for input tokens. This is a conservative estimate based on typical coding session patterns.
 
+### 3. Claude Code (`~/.claude/`)
+
+Claude Code stores one JSONL transcript per session below `~/.claude/projects` (including delegated sessions under `subagents/`). Assistant records include the model, timestamp, and API usage fields. The adapter reads base input, cache reads, cache writes, output, and optional reasoning tokens, and deduplicates repeated records that share the same message ID. Per-message events are retained internally so rolling time ranges include only calls that occurred inside the selected window.
+
 Active model is read from `~/.gemini/antigravity-cli/settings.json`.
 
 ---
@@ -100,7 +104,7 @@ Codex rollout files can be large (2–4 MB each). Re-parsing 50–100 files on e
 
 **Solution:** `src/parsers/codex.py` maintains an in-memory dictionary `_ROLLOUT_PARSE_CACHE` keyed by `(file_path, mtime_ns, size)`. If a rollout file hasn't been modified since the last parse, the cached result is returned immediately. Only new or modified files trigger actual JSONL reads.
 
-AGY has a snapshot cache keyed by a lightweight signature of its settings, SQLite, and transcript files. A changed file invalidates the AGY snapshot; unchanged polls reuse a deep-copied result. When the dashboard requests all tools, the Codex and AGY parsers run concurrently, so the request is bounded by the slower parser instead of the sum of both parser times.
+AGY has a snapshot cache keyed by a lightweight signature of its settings, SQLite, and transcript files. A changed file invalidates the AGY snapshot; unchanged polls reuse a deep-copied result. When the dashboard requests all tools, the Codex, Claude Code, and AGY parsers run concurrently, so the request is bounded by the slowest parser instead of the sum of all three.
 
 This means after the first load, polling responses are nearly instant.
 
@@ -163,6 +167,7 @@ This lets you see exactly how much you'd be paying if OpenAI/Google didn't have 
 | `src/parsers/source_registry.py` | Provider adapter registry with canonical-key and alias lookup |
 | `src/parsers/codex.py` | Reads Codex rollout JSONL + SQLite, returns structured metrics dict |
 | `src/parsers/agy.py` | Reads AGY transcripts + DBs, estimates tokens, returns structured metrics dict |
+| `src/parsers/claude.py` | Reads Claude Code session JSONL and normalizes API usage |
 | `src/parsers/aggregator.py` | Runs registered adapters, prices normalized sessions, slices time windows, and derives analytics |
 | `src/static/js/odometer.js` | `RollingOdometer` class — zero-dependency vertical digit animation |
 | `src/static/js/dashboard.js` | All frontend logic: state, polling, Chart.js, table rendering, search |

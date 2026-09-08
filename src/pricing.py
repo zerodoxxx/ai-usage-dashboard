@@ -36,6 +36,20 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "Gemini 2.5 Pro": {"uncached_input": 1.25, "cached_input": 0.3125, "output": 10.00},
     "Gemini 1.5 Flash": {"uncached_input": 0.075, "cached_input": 0.01875, "output": 0.30},
     "Gemini 1.5 Pro": {"uncached_input": 1.25, "cached_input": 0.3125, "output": 5.00},
+    # Claude Code / Anthropic. Rates are USD per million tokens.
+    "Claude Opus 5": {"uncached_input": 5.00, "cached_input": 0.50, "output": 25.00},
+    "Claude Opus 4.8": {"uncached_input": 5.00, "cached_input": 0.50, "output": 25.00},
+    "Claude Opus 4.7": {"uncached_input": 5.00, "cached_input": 0.50, "output": 25.00},
+    "Claude Opus 4.6": {"uncached_input": 5.00, "cached_input": 0.50, "output": 25.00},
+    "Claude Opus 4.5": {"uncached_input": 5.00, "cached_input": 0.50, "output": 25.00},
+    "Claude Opus 4.1": {"uncached_input": 15.00, "cached_input": 1.50, "output": 75.00},
+    "Claude Opus 4": {"uncached_input": 15.00, "cached_input": 1.50, "output": 75.00},
+    "Claude Sonnet 5": {"uncached_input": 2.00, "cached_input": 0.20, "output": 10.00},
+    "Claude Sonnet 4.6": {"uncached_input": 3.00, "cached_input": 0.30, "output": 15.00},
+    "Claude Sonnet 4.5": {"uncached_input": 3.00, "cached_input": 0.30, "output": 15.00},
+    "Claude Sonnet 4": {"uncached_input": 3.00, "cached_input": 0.30, "output": 15.00},
+    "Claude Haiku 4.5": {"uncached_input": 1.00, "cached_input": 0.10, "output": 5.00},
+    "Claude Haiku 3.5": {"uncached_input": 0.80, "cached_input": 0.08, "output": 4.00},
 }
 
 DEFAULT_MODEL = "gpt-5.6-luna"
@@ -54,6 +68,13 @@ _ALIASES: list[tuple[str, str]] = [
     ("o1-mini", "o1-mini"), ("o1-preview", "o1"), ("o1", "o1"),
     ("gpt-4o-mini", "gpt-4o-mini"), ("4o-mini", "gpt-4o-mini"),
     ("gpt-4o", "gpt-4o"), ("4o", "gpt-4o"), ("codex-auto-review", "gpt-5.6-luna"),
+    ("claude-opus-5", "Claude Opus 5"), ("claude-opus-4-8", "Claude Opus 4.8"),
+    ("claude-opus-4-7", "Claude Opus 4.7"), ("claude-opus-4-6", "Claude Opus 4.6"),
+    ("claude-opus-4-5", "Claude Opus 4.5"), ("claude-opus-4-1", "Claude Opus 4.1"),
+    ("claude-opus-4", "Claude Opus 4"), ("claude-sonnet-5", "Claude Sonnet 5"),
+    ("claude-sonnet-4-6", "Claude Sonnet 4.6"), ("claude-sonnet-4-5", "Claude Sonnet 4.5"),
+    ("claude-sonnet-4", "Claude Sonnet 4"), ("claude-haiku-4-5", "Claude Haiku 4.5"),
+    ("claude-haiku-3-5", "Claude Haiku 3.5"),
 ]
 
 Provider = str
@@ -270,8 +291,16 @@ class PricingCatalog:
 def _build_catalog() -> PricingCatalog:
     catalog = PricingCatalog()
     for model, rates in MODEL_PRICING.items():
-        provider = "antigravity" if model.casefold().startswith("gemini") else "codex"
+        folded_model = model.casefold()
+        if folded_model.startswith("gemini"):
+            provider = "antigravity"
+        elif folded_model.startswith("claude"):
+            provider = "claude"
+        else:
+            provider = "codex"
         aliases = tuple(alias for alias, target in _ALIASES if target == model)
+        if provider == "claude":
+            rates = {**rates, "cache_creation": rates["uncached_input"] * 1.25}
         catalog.register(provider, model, rates, aliases=aliases)
     return catalog
 

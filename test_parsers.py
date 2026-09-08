@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.pricing import MODEL_PRICING, calculate_cost, get_pricing
 from src.parsers.codex import _parse_rollout_file, parse_codex_usage
 from src.parsers.agy import parse_agy_usage
+from src.parsers.claude import parse_claude_code_usage
 from src.parsers.aggregator import _filter_usage_data, get_tool_usage
 
 
@@ -161,8 +162,11 @@ def test_agy() -> dict:
     return data
 
 
-def test_aggregator(codex_data: dict, agy_data: dict) -> None:
+def test_aggregator() -> None:
     print("\n--- 4. Testing Aggregator (All Tools) ---")
+    codex_data = parse_codex_usage()
+    agy_data = parse_agy_usage()
+    claude_data = get_tool_usage("claude")
     all_data = get_tool_usage("all")
     assert all_data["tool"] == "all"
     s = all_data["summary"]
@@ -171,18 +175,21 @@ def test_aggregator(codex_data: dict, agy_data: dict) -> None:
     a_sum = agy_data["summary"]
 
     # Verify odometer math (re-sync if live telemetry write occurred during test)
-    if s["total_tokens"] != c_sum["total_tokens"] + a_sum["total_tokens"]:
+    cl_sum = claude_data["summary"]
+    if s["total_tokens"] != c_sum["total_tokens"] + a_sum["total_tokens"] + cl_sum["total_tokens"]:
         codex_data = parse_codex_usage()
         agy_data = parse_agy_usage()
+        claude_data = get_tool_usage("claude")
         c_sum = codex_data["summary"]
         a_sum = agy_data["summary"]
+        cl_sum = claude_data["summary"]
         all_data = get_tool_usage("all")
         s = all_data["summary"]
 
-    assert s["total_tokens"] == c_sum["total_tokens"] + a_sum["total_tokens"]
-    assert s["session_count"] == c_sum["session_count"] + a_sum["session_count"]
-    assert s["call_count"] == c_sum["call_count"] + a_sum["call_count"]
-    assert abs(s["cost_cached_usd"] - (c_sum["cost_cached_usd"] + a_sum["cost_cached_usd"])) < 1e-4
+    assert s["total_tokens"] == c_sum["total_tokens"] + a_sum["total_tokens"] + cl_sum["total_tokens"]
+    assert s["session_count"] == c_sum["session_count"] + a_sum["session_count"] + cl_sum["session_count"]
+    assert s["call_count"] == c_sum["call_count"] + a_sum["call_count"] + cl_sum["call_count"]
+    assert abs(s["cost_cached_usd"] - (c_sum["cost_cached_usd"] + a_sum["cost_cached_usd"] + cl_sum["cost_cached_usd"])) < 1e-4
 
     print(f"✓ Total Combined Sessions: {s['session_count']}")
     print(f"✓ Total Combined Tokens:   {s['total_tokens']:,}")
@@ -198,7 +205,9 @@ def test_aggregator(codex_data: dict, agy_data: dict) -> None:
     assert single_c["tool"] == "codex"
     single_a = get_tool_usage("antigravity")
     assert single_a["tool"] == "antigravity"
-    print("✓ Direct tool dispatch ('codex', 'antigravity') verified.")
+    single_claude = get_tool_usage("claude")
+    assert single_claude["tool"] == "claude-code"
+    print("✓ Direct tool dispatch ('codex', 'antigravity', 'claude') verified.")
 
 
 def test_time_filters() -> None:
@@ -309,7 +318,7 @@ if __name__ == "__main__":
     codex_res = test_codex()
     test_codex_event_deduplication()
     agy_res = test_agy()
-    test_aggregator(codex_res, agy_res)
+    test_aggregator()
     test_time_filters()
     print("\n========================================")
     print("  ALL PARSER & PRICING TESTS PASSED!  ")

@@ -136,6 +136,15 @@
     }
   }
 
+  function providerBadge(tool) {
+    const normalized = String(tool || '').toLowerCase();
+    if (normalized === 'codex') return { className: 'badge-codex', text: 'Codex' };
+    if (normalized === 'claude' || normalized === 'claude-code') {
+      return { className: 'badge-claude', text: 'Claude Code' };
+    }
+    return { className: 'badge-agy', text: 'Antigravity' };
+  }
+
   /**
    * Toast notification display
    */
@@ -249,12 +258,13 @@
       return state.pricingData[modelName];
     }
     const norm = (modelName || '').toLowerCase().trim();
+    const comparable = (value) => String(value || '').toLowerCase().trim().replace(/[\s_.]+/g, '-');
     const sortedPricing = Object.entries(state.pricingData).sort((a, b) => b[0].length - a[0].length);
     for (const [k, v] of sortedPricing) {
-      if (k.toLowerCase() === norm) return v;
+      if (comparable(k) === comparable(norm)) return v;
     }
     for (const [k, v] of sortedPricing) {
-      if (norm.includes(k.toLowerCase())) return v;
+      if (comparable(norm).includes(comparable(k))) return v;
     }
     if (norm.includes('gemini')) {
       return state.pricingData['Gemini 3.8 Flash (High)'] || { uncached_input: 0.10, cached_input: 0.025, output: 0.40 };
@@ -520,9 +530,7 @@
 
     tbody.innerHTML = sessionList.map((session) => {
       const tool = String(session.tool || '');
-      const isCodex = tool === 'codex';
-      const badgeClass = isCodex ? 'badge-codex' : 'badge-agy';
-      const badgeText = isCodex ? 'Codex' : 'Antigravity';
+      const badge = providerBadge(tool);
       const activity = formatDateTime(session.activity_at || session.created_at || session.start_time);
       return `
         <tr>
@@ -530,7 +538,7 @@
             <strong class="insight-session-title" title="${escapeHtml(String(session.title || 'Untitled Session'))}">${escapeHtml(String(session.title || 'Untitled Session'))}</strong>
             <div class="text-muted" style="font-size: 10px; font-family: var(--font-mono);">${escapeHtml(activity)}</div>
           </td>
-          <td><span class="provider-badge ${badgeClass}">${badgeText}</span></td>
+          <td><span class="provider-badge ${badge.className}">${badge.text}</span></td>
           <td class="cell-mono">${escapeHtml(String(session.model || 'unknown'))}</td>
           <td class="cell-mono cell-right">${Number(session.total_tokens || 0).toLocaleString()}</td>
           <td class="cell-mono cell-right text-success">${formatCurrency(session.cost_cached_usd)}</td>
@@ -560,9 +568,7 @@
     let rowsHtml = '';
     modelList.forEach((m) => {
       const modelName = String(m.model || 'unknown');
-      const isCodex = m.tool === 'codex' || /gpt|o1|o3/i.test(modelName);
-      const badgeClass = isCodex ? 'badge-openai' : 'badge-agy';
-      const badgeText = isCodex ? 'OpenAI' : 'Google AGY';
+      const badge = providerBadge(m.tool || (/gpt|o1|o3/i.test(modelName) ? 'codex' : 'antigravity'));
 
       const rates = getModelRates(modelName);
       const ratesStr = `$${(rates?.uncached_input ?? 0).toFixed(2)} / $${(rates?.cached_input ?? 0).toFixed(3)} / $${(rates?.output ?? 0).toFixed(2)}`;
@@ -576,7 +582,7 @@
         <tr>
           <td>
             <strong>${escapeHtml(modelName)}</strong>
-            <span class="provider-badge ${badgeClass}" style="margin-left: 8px;">${badgeText}</span>
+            <span class="provider-badge ${badge.className}" style="margin-left: 8px;">${badge.text}</span>
           </td>
           <td class="cell-mono cell-right">${(m.uncached_input || 0).toLocaleString()}</td>
           <td class="cell-mono cell-right">${(m.cached_input || 0).toLocaleString()}</td>
@@ -640,9 +646,7 @@
     displayList.forEach((s) => {
       if (!s || typeof s !== 'object') return;
       const toolStr = String(s.tool || '');
-      const isCodex = toolStr === 'codex';
-      const badgeClass = isCodex ? 'badge-codex' : 'badge-agy';
-      const badgeText = isCodex ? 'Codex' : 'Antigravity';
+      const badge = providerBadge(toolStr);
 
       const hitRate = Number(s.cache_hit_rate) || 0;
       let hitRateClass = 'hit-rate-low';
@@ -661,7 +665,7 @@
             <div class="text-muted" style="font-size: 11px; font-family: var(--font-mono);">${escapeHtml(idStr)}</div>
           </td>
           <td>
-            <span class="provider-badge ${badgeClass}">${badgeText}</span>
+            <span class="provider-badge ${badge.className}">${badge.text}</span>
           </td>
           <td class="cell-mono">${escapeHtml(modelStr)}</td>
           <td class="cell-mono cell-right"><strong>${(s.total_tokens || 0).toLocaleString()}</strong></td>
