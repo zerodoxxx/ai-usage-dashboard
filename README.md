@@ -21,6 +21,23 @@ conda activate ai-usage-dashboard
 python run.py --open
 ```
 
+To start the dashboard independently of the terminal or IDE that launched it:
+
+```bash
+bash launch_background.sh
+```
+
+The command waits until the health endpoint is ready, opens the dashboard, and
+then returns so the terminal can be closed safely. The server output is written
+to `~/.ai-usage-dashboard/dashboard.log` and its process is tracked in
+`~/.ai-usage-dashboard/dashboard.pid`.
+
+```bash
+bash launch_background.sh --status
+bash launch_background.sh --log
+bash launch_background.sh --stop
+```
+
 Dashboard: http://127.0.0.1:8765
 
 ## Data Sources
