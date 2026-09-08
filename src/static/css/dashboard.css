@@ -871,6 +871,12 @@ input:checked + .slider:before {
   color: #60a5fa;
 }
 
+.badge-claude {
+  background: rgba(249, 115, 22, 0.12);
+  border: 1px solid rgba(249, 115, 22, 0.3);
+  color: #fb923c;
+}
+
 /* Cache hit rate pill */
 .hit-rate-pill {
   display: inline-block;

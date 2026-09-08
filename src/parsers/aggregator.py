@@ -11,6 +11,7 @@ from typing import Any, Mapping
 
 from ..pricing import MODEL_PRICING, calculate_cost_strict
 from .agy import AntigravitySource
+from .claude import ClaudeCodeSource
 from .codex import CodexSource
 from .contracts import UsageSession
 from .source_registry import SOURCE_REGISTRY, SourceRegistry, normalize_source_key
@@ -19,7 +20,7 @@ _CANONICAL_MODELS: dict[str, str] = {k.lower(): k for k in MODEL_PRICING}
 _TIME_RANGES = {"all", "month", "30d", "7d", "24h"}
 _PARSER_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="usage-parser")
 DEFAULT_SOURCE_REGISTRY = SOURCE_REGISTRY
-for _builtin_source in (CodexSource(), AntigravitySource()):
+for _builtin_source in (CodexSource(), AntigravitySource(), ClaudeCodeSource()):
     if DEFAULT_SOURCE_REGISTRY.lookup(_builtin_source.key) is None:
         DEFAULT_SOURCE_REGISTRY.register(_builtin_source)
 
@@ -768,6 +769,7 @@ def _serialize_extracted_session(session: UsageSession) -> dict[str, Any]:
 def _source_roots(
     codex_dir: str | Path | None,
     agy_dir: str | Path | None,
+    claude_dir: str | Path | None,
     source_dirs: Mapping[str, str | Path | None] | None,
     registry: SourceRegistry,
 ) -> dict[str, str | Path | None]:
@@ -775,6 +777,7 @@ def _source_roots(
     roots: dict[str, str | Path | None] = {
         "codex": codex_dir,
         "antigravity": agy_dir,
+        "claude-code": claude_dir,
     }
     for key, value in (source_dirs or {}).items():
         source = registry.lookup(key)
@@ -789,6 +792,7 @@ def get_tool_usage(
     agy_dir: str | Path | None = None,
     time_range: str = "all",
     *,
+    claude_dir: str | Path | None = None,
     source_dirs: Mapping[str, str | Path | None] | None = None,
     registry: SourceRegistry | None = None,
 ) -> dict[str, Any]:
@@ -814,7 +818,7 @@ def get_tool_usage(
         sources = (source,)
         result_tool = normalize_source_key(source.key)
 
-    roots = _source_roots(codex_dir, agy_dir, source_dirs, active_registry)
+    roots = _source_roots(codex_dir, agy_dir, claude_dir, source_dirs, active_registry)
     futures = [
         _PARSER_EXECUTOR.submit(
             source.extract_sessions,
