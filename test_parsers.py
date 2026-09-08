@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -12,9 +15,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.pricing import MODEL_PRICING, calculate_cost, get_pricing
-from src.parsers.codex import parse_codex_usage
+from src.parsers.codex import _parse_rollout_file, parse_codex_usage
 from src.parsers.agy import parse_agy_usage
-from src.parsers.aggregator import get_tool_usage
+from src.parsers.aggregator import _filter_usage_data, get_tool_usage
 
 
 def test_pricing() -> None:
@@ -85,6 +88,62 @@ def test_codex() -> dict:
     return data
 
 
+def test_codex_event_deduplication() -> None:
+    print("\n--- 3. Testing Codex Per-Call Events ---")
+    first_usage = {
+        "input_tokens": 100,
+        "cached_input_tokens": 20,
+        "output_tokens": 10,
+        "reasoning_output_tokens": 2,
+        "total_tokens": 110,
+    }
+    second_usage = {
+        "input_tokens": 200,
+        "cached_input_tokens": 100,
+        "output_tokens": 20,
+        "reasoning_output_tokens": 3,
+        "total_tokens": 220,
+    }
+    cumulative = {
+        "input_tokens": 300,
+        "cached_input_tokens": 120,
+        "output_tokens": 30,
+        "reasoning_output_tokens": 5,
+        "total_tokens": 330,
+    }
+
+    def token_count(timestamp: str, last_usage: dict, total_usage: dict) -> dict:
+        return {
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": last_usage,
+                    "total_token_usage": total_usage,
+                },
+            },
+        }
+
+    with TemporaryDirectory() as temp_dir:
+        rollout_path = Path(temp_dir) / "rollout-test.jsonl"
+        lines = [
+            {"timestamp": "2026-09-08T10:00:00Z", "type": "session_meta", "payload": {"model": "gpt-5.6-luna"}},
+            {"timestamp": "2026-09-08T10:00:01Z", "type": "token_usage_record", "payload": {"usage": first_usage}},
+            token_count("2026-09-08T10:00:01.010Z", first_usage, first_usage),
+            {"timestamp": "2026-09-08T10:01:00Z", "type": "token_usage_record", "payload": {"usage": second_usage}},
+            token_count("2026-09-08T10:01:00.010Z", second_usage, cumulative),
+        ]
+        rollout_path.write_text("\n".join(json.dumps(line) for line in lines), encoding="utf-8")
+        parsed = _parse_rollout_file(rollout_path)
+
+    assert parsed["call_count"] == 2
+    assert len(parsed["usage_events"]) == 2
+    assert sum(event["total_tokens"] for event in parsed["usage_events"]) == 330
+    assert sum(event["cached_input_tokens"] for event in parsed["usage_events"]) == 120
+    print("✓ Duplicate token record/status messages are counted once per API call.")
+
+
 def test_agy() -> dict:
     print("\n--- 3. Testing Antigravity (AGY) Parser ---")
     data = parse_agy_usage()
@@ -142,11 +201,116 @@ def test_aggregator(codex_data: dict, agy_data: dict) -> None:
     print("✓ Direct tool dispatch ('codex', 'antigravity') verified.")
 
 
+def test_time_filters() -> None:
+    print("\n--- 5. Testing Time Filters ---")
+    now = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+
+    def make_session(identifier: str, created_at: str, tokens: int) -> dict:
+        return {
+            "id": identifier,
+            "tool": "codex",
+            "model": "gpt-5.6-luna",
+            "created_at": created_at,
+            "start_time": created_at,
+            "call_count": 1,
+            "uncached_input": tokens,
+            "cached_input": 0,
+            "total_input": tokens,
+            "output": 0,
+            "reasoning_output": 0,
+            "total_tokens": tokens,
+            "cost_cached_usd": 0.1,
+            "cost_uncached_usd": 0.2,
+            "savings_usd": 0.1,
+        }
+
+    data = {
+        "tool": "codex",
+        "summary": {},
+        "models": [],
+        "timeline": [],
+        "sessions": [
+            make_session("today", "2026-09-08T12:00:00+00:00", 100),
+            make_session("month", "2026-09-01T00:00:00+00:00", 200),
+            make_session("old", "2026-08-31T23:59:59+00:00", 400),
+        ],
+    }
+
+    expected_tokens = {"month": 300, "30d": 700, "7d": 100, "24h": 100}
+    for time_range, expected in expected_tokens.items():
+        result = _filter_usage_data(data, time_range, now=now)
+        assert result["summary"]["total_tokens"] == expected, (time_range, result["summary"])
+        assert result["summary"]["session_count"] == (2 if time_range == "month" else 1 if time_range in ("7d", "24h") else 3)
+        assert result["time_range"] == time_range
+
+    # A long-running session can span the boundary of a rolling window. The
+    # filter must use its per-call records instead of excluding the whole
+    # session based on its original creation date.
+    event_data = {
+        "tool": "codex",
+        "summary": {},
+        "models": [],
+        "timeline": [],
+        "sessions": [{
+            **make_session("long-running", "2026-08-01T00:00:00+00:00", 330),
+            "call_count": 2,
+            "uncached_input": 180,
+            "cached_input": 120,
+            "total_input": 300,
+            "output": 30,
+            "total_tokens": 330,
+            "usage_events": [
+                {
+                    "timestamp": "2026-09-01T00:00:00+00:00",
+                    "input_tokens": 100,
+                    "cached_input_tokens": 20,
+                    "output_tokens": 10,
+                    "total_tokens": 110,
+                },
+                {
+                    "timestamp": "2026-09-08T12:00:00+00:00",
+                    "input_tokens": 200,
+                    "cached_input_tokens": 100,
+                    "output_tokens": 20,
+                    "total_tokens": 220,
+                },
+            ],
+        }],
+    }
+
+    rolling_result = _filter_usage_data(event_data, "7d", now=now)
+    assert rolling_result["summary"]["total_tokens"] == 220
+    assert rolling_result["summary"]["call_count"] == 1
+    assert rolling_result["sessions"][0]["activity_at"] == "2026-09-08T12:00:00+00:00"
+    assert "usage_events" not in rolling_result["sessions"][0]
+    assert [(day["date"], day["total_tokens"], day["call_count"]) for day in rolling_result["timeline"]] == [
+        ("2026-09-08", 220, 1)
+    ]
+
+    month_result = _filter_usage_data(event_data, "month", now=now)
+    assert month_result["summary"]["total_tokens"] == 330
+    assert month_result["summary"]["call_count"] == 2
+    assert [(day["date"], day["total_tokens"], day["call_count"]) for day in month_result["timeline"]] == [
+        ("2026-09-01", 110, 1),
+        ("2026-09-08", 220, 1),
+    ]
+
+    all_result = _filter_usage_data(event_data, "all", now=now)
+    assert [(day["date"], day["total_tokens"]) for day in all_result["timeline"]] == [
+        ("2026-09-01", 110),
+        ("2026-09-08", 220),
+    ]
+
+    print("✓ Calendar-month, rolling, and per-call time-range boundaries verified.")
+
+
 if __name__ == "__main__":
     test_pricing()
     codex_res = test_codex()
+    test_codex_event_deduplication()
     agy_res = test_agy()
     test_aggregator(codex_res, agy_res)
+    test_time_filters()
     print("\n========================================")
     print("  ALL PARSER & PRICING TESTS PASSED!  ")
     print("========================================\n")

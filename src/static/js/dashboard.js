@@ -9,6 +9,7 @@
   // Global Dashboard State
   const state = {
     currentTool: 'all',
+    currentTimeRange: 'all',
     autoRefreshInterval: 30000,
     refreshTimer: null,
     isFetching: false,
@@ -191,7 +192,7 @@
   }
 
   /**
-   * Fetch usage data from /api/usage?tool=...
+   * Fetch usage data from /api/usage?tool=...&time_range=...
    * @param {boolean} [isUserInitiated=false]
    */
   async function fetchUsageData(isUserInitiated = false) {
@@ -213,7 +214,11 @@
     if (refreshIcon) refreshIcon.classList.add('spin');
 
     try {
-      const res = await fetch(`/api/usage?tool=${encodeURIComponent(state.currentTool)}`, {
+      const query = new URLSearchParams({
+        tool: state.currentTool,
+        time_range: state.currentTimeRange,
+      });
+      const res = await fetch(`/api/usage?${query.toString()}`, {
         signal: controller.signal,
       });
       if (!res.ok) {
@@ -227,6 +232,7 @@
 
       // Update UI components
       updateMetricCards(data.summary || {});
+      updateAnalytics(data.analytics || {}, data.summary || {});
       renderModelTable(data.models || []);
       renderSessionsTable();
       updateCharts(data);
@@ -285,6 +291,12 @@
     if (elements.cardSavingsText) {
       elements.cardSavingsText.textContent = `Saved $${savings.toFixed(4)} cached`;
     }
+    if (elements.cardTokensSubtext) {
+      const selectedOption = elements.timeRangeSelect?.selectedOptions?.[0];
+      elements.cardTokensSubtext.textContent = state.currentTimeRange === 'all'
+        ? 'Cumulative audit'
+        : `${selectedOption?.textContent || 'Selected range'} usage`;
+    }
     if (elements.cardCachedShare) {
       elements.cardCachedShare.textContent = `${cacheHitRate.toFixed(1)}% of input tokens`;
     }
@@ -294,6 +306,147 @@
     if (elements.cardCallsSubtext) {
       elements.cardCallsSubtext.textContent = `${callCount.toLocaleString()} API calls recorded`;
     }
+  }
+
+  /**
+   * Format the secondary analytics snapshot.
+   */
+  function updateAnalytics(analytics, summary) {
+    const details = analytics && typeof analytics === 'object' ? analytics : {};
+    const totals = summary && typeof summary === 'object' ? summary : {};
+    const formatCurrency = (value) => `$${Number(value || 0).toFixed(4)}`;
+    const formatChange = (value) => {
+      if (value === null || value === undefined || !Number.isFinite(Number(value))) return 'n/a';
+      const numericValue = Number(value);
+      return `${numericValue > 0 ? '+' : ''}${numericValue.toFixed(1)}%`;
+    };
+    const changeClass = (value, lowerIsBetter = false) => {
+      if (value === null || value === undefined || !Number.isFinite(Number(value)) || Number(value) === 0) {
+        return 'comparison-neutral';
+      }
+      const improved = lowerIsBetter ? Number(value) < 0 : Number(value) > 0;
+      return improved ? 'comparison-positive' : 'comparison-negative';
+    };
+
+    const selectedOption = elements.timeRangeSelect?.selectedOptions?.[0];
+    if (elements.analyticsWindowBadge) {
+      elements.analyticsWindowBadge.textContent = selectedOption?.textContent || 'Selected range';
+    }
+    if (elements.analyticsCallCount) {
+      elements.analyticsCallCount.textContent = Number(totals.call_count || 0).toLocaleString();
+    }
+    if (elements.analyticsAvgCost) {
+      elements.analyticsAvgCost.textContent = formatCurrency(details.avg_cost_per_session_usd);
+    }
+    if (elements.analyticsAvgTokens) {
+      elements.analyticsAvgTokens.textContent = formatCompactNumber(Math.round(Number(details.avg_tokens_per_session || 0)));
+    }
+    if (elements.analyticsMonthlyProjection) {
+      elements.analyticsMonthlyProjection.textContent = formatCurrency(details.monthly_projection_usd);
+    }
+    if (elements.analyticsProjectionBasis) {
+      const projectionLabels = {
+        last_30_days: 'Based on last 30 days',
+        current_month_run_rate: 'Current-month run rate',
+        '30d_run_rate': '30-day run rate',
+        '7d_run_rate': '7-day run rate',
+        '24h_run_rate': '24-hour run rate',
+      };
+      elements.analyticsProjectionBasis.textContent = projectionLabels[details.projection_basis] || 'Based on current usage';
+    }
+
+    const peakDay = details.peak_day;
+    if (elements.analyticsPeakDayCost) {
+      elements.analyticsPeakDayCost.textContent = peakDay ? formatCurrency(peakDay.cost_cached_usd) : '$0.0000';
+    }
+    if (elements.analyticsPeakDayDetail) {
+      elements.analyticsPeakDayDetail.textContent = peakDay
+        ? `${peakDay.date} · ${Number(peakDay.call_count || 0).toLocaleString()} calls`
+        : 'No daily usage yet';
+    }
+
+    renderTopSessions(details.top_sessions || [], formatCurrency);
+
+    const comparison = details.comparison;
+    if (elements.comparisonSubtitle) {
+      elements.comparisonSubtitle.textContent = comparison
+        ? `Compared with the ${comparison.label}`
+        : 'Select a preset range to compare usage';
+    }
+    if (!elements.comparisonContent) return;
+    if (!comparison) {
+      elements.comparisonContent.innerHTML = '<div class="comparison-empty">No comparison available for All time.</div>';
+      return;
+    }
+
+    const comparisonRows = [
+      {
+        label: 'Est. cost',
+        current: formatCurrency(comparison.current?.cost_cached_usd),
+        previous: formatCurrency(comparison.previous?.cost_cached_usd),
+        change: comparison.change_pct?.cost_cached_usd,
+        lowerIsBetter: true,
+      },
+      {
+        label: 'Tokens',
+        current: formatCompactNumber(comparison.current?.total_tokens || 0),
+        previous: formatCompactNumber(comparison.previous?.total_tokens || 0),
+        change: comparison.change_pct?.total_tokens,
+      },
+      {
+        label: 'API calls',
+        current: Number(comparison.current?.call_count || 0).toLocaleString(),
+        previous: Number(comparison.previous?.call_count || 0).toLocaleString(),
+        change: comparison.change_pct?.call_count,
+      },
+    ];
+    elements.comparisonContent.innerHTML = `
+      <div class="comparison-heading">
+        <span>Metric</span><span>Current</span><span>Previous</span><span>Change</span>
+      </div>
+      ${comparisonRows.map((row) => `
+        <div class="comparison-row">
+          <span class="comparison-label">${row.label}</span>
+          <span class="comparison-value">${row.current}</span>
+          <span class="comparison-value">${row.previous}</span>
+          <span class="comparison-change ${changeClass(row.change, row.lowerIsBetter)}">${formatChange(row.change)}</span>
+        </div>
+      `).join('')}
+    `;
+  }
+
+  /**
+   * Render the five highest-cost sessions in the current view.
+   */
+  function renderTopSessions(sessions, formatCurrency) {
+    const tbody = elements.topSessionsTableBody;
+    if (!tbody) return;
+
+    const sessionList = (Array.isArray(sessions) ? sessions : []).filter((session) => session && typeof session === 'object');
+    if (sessionList.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No session cost data available.</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = sessionList.map((session) => {
+      const tool = String(session.tool || '');
+      const isCodex = tool === 'codex';
+      const badgeClass = isCodex ? 'badge-codex' : 'badge-agy';
+      const badgeText = isCodex ? 'Codex' : 'Antigravity';
+      const activity = formatDateTime(session.activity_at || session.created_at || session.start_time);
+      return `
+        <tr>
+          <td>
+            <strong class="insight-session-title" title="${escapeHtml(String(session.title || 'Untitled Session'))}">${escapeHtml(String(session.title || 'Untitled Session'))}</strong>
+            <div class="text-muted" style="font-size: 10px; font-family: var(--font-mono);">${escapeHtml(activity)}</div>
+          </td>
+          <td><span class="provider-badge ${badgeClass}">${badgeText}</span></td>
+          <td class="cell-mono">${escapeHtml(String(session.model || 'unknown'))}</td>
+          <td class="cell-mono cell-right">${Number(session.total_tokens || 0).toLocaleString()}</td>
+          <td class="cell-mono cell-right text-success">${formatCurrency(session.cost_cached_usd)}</td>
+        </tr>
+      `;
+    }).join('');
   }
 
   /**
@@ -406,7 +559,7 @@
       if (hitRate >= 75) hitRateClass = 'hit-rate-high';
       else if (hitRate >= 35) hitRateClass = 'hit-rate-mid';
 
-      const dateStr = formatDateTime(s.created_at || s.start_time);
+      const dateStr = formatDateTime(s.activity_at || s.created_at || s.start_time);
       const titleStr = String(s.title || 'Untitled Session');
       const idStr = String(s.id || '');
       const modelStr = String(s.model || 'unknown');
@@ -576,11 +729,15 @@
     const labels = sortedTimeline.map((t) => t.date);
     const costData = sortedTimeline.map((t) => t.cost_cached_usd || 0);
     const tokenData = sortedTimeline.map((t) => t.total_tokens || 0);
+    const callData = sortedTimeline.map((t) => t.call_count || 0);
 
     if (chartCost) {
       chartCost.data.labels = labels;
       chartCost.data.datasets[0].data = costData;
       chartCost.data.datasets[1].data = tokenData;
+      if (chartCost.data.datasets[2]) {
+        chartCost.data.datasets[2].data = callData;
+      }
       chartCost.update();
       return;
     }
@@ -614,6 +771,19 @@
             borderWidth: 1,
             borderRadius: 4,
             yAxisID: 'yTokens',
+          },
+          {
+            type: 'line',
+            label: 'API Calls',
+            data: callData,
+            borderColor: '#f59e0b',
+            backgroundColor: 'rgba(245, 158, 11, 0.15)',
+            borderWidth: 2,
+            fill: false,
+            tension: 0.35,
+            yAxisID: 'yCalls',
+            pointRadius: 3,
+            pointHoverRadius: 6,
           },
         ],
       },
@@ -695,6 +865,23 @@
               font: { size: 11 },
             },
           },
+          yCalls: {
+            type: 'linear',
+            position: 'right',
+            offset: true,
+            grid: { drawOnChartArea: false },
+            ticks: {
+              color: '#fbbf24',
+              font: { size: 11 },
+              callback: (val) => Number(val).toLocaleString(),
+            },
+            title: {
+              display: true,
+              text: 'Calls',
+              color: '#fbbf24',
+              font: { size: 11 },
+            },
+          },
         },
       },
     });
@@ -741,6 +928,14 @@
       });
     }
 
+    // Time range dropdown switch
+    if (elements.timeRangeSelect) {
+      elements.timeRangeSelect.addEventListener('change', (e) => {
+        state.currentTimeRange = e.target.value;
+        fetchUsageData(true).catch((err) => console.error('Error fetching usage data on time range select:', err));
+      });
+    }
+
     // Auto-refresh toggle
     if (elements.autoRefreshToggle) {
       elements.autoRefreshToggle.addEventListener('change', () => {
@@ -777,15 +972,29 @@
    */
   function cacheElements() {
     elements.toolSelect = document.getElementById('tool-select');
+    elements.timeRangeSelect = document.getElementById('time-range-select');
     elements.autoRefreshToggle = document.getElementById('auto-refresh-toggle');
     elements.refreshInterval = document.getElementById('refresh-interval');
     elements.refreshBtn = document.getElementById('refresh-btn');
     elements.lastSyncedBadge = document.getElementById('last-synced-badge');
 
     elements.cardSavingsText = document.getElementById('card-savings-text');
+    elements.cardTokensSubtext = document.getElementById('card-tokens-subtext');
     elements.cardCachedShare = document.getElementById('card-cached-share');
     elements.cardReasoningSubtext = document.getElementById('card-reasoning-subtext');
     elements.cardCallsSubtext = document.getElementById('card-calls-subtext');
+
+    elements.analyticsWindowBadge = document.getElementById('analytics-window-badge');
+    elements.analyticsCallCount = document.getElementById('analytics-call-count');
+    elements.analyticsAvgCost = document.getElementById('analytics-avg-cost');
+    elements.analyticsAvgTokens = document.getElementById('analytics-avg-tokens');
+    elements.analyticsMonthlyProjection = document.getElementById('analytics-monthly-projection');
+    elements.analyticsProjectionBasis = document.getElementById('analytics-projection-basis');
+    elements.analyticsPeakDayCost = document.getElementById('analytics-peak-day-cost');
+    elements.analyticsPeakDayDetail = document.getElementById('analytics-peak-day-detail');
+    elements.topSessionsTableBody = document.getElementById('top-sessions-table-body');
+    elements.comparisonSubtitle = document.getElementById('comparison-subtitle');
+    elements.comparisonContent = document.getElementById('comparison-content');
 
     elements.chartTokensCanvas = document.getElementById('chart-tokens');
     elements.chartCostCanvas = document.getElementById('chart-cost');

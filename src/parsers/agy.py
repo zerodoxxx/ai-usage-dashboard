@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -14,6 +15,71 @@ from typing import Any
 from ..pricing import calculate_cost
 
 logger = logging.getLogger(__name__)
+
+_AGY_PARSE_CACHE: dict[tuple[str, tuple[tuple[str, int, int], ...]], dict[str, Any]] = {}
+
+
+def _source_signature(base_dir: Path) -> tuple[str, tuple[tuple[str, int, int], ...]]:
+    """Build a lightweight signature for the AGY files used by the parser."""
+    tracked_paths: set[Path] = set()
+    for path in (base_dir / "settings.json",):
+        if path.exists():
+            tracked_paths.add(path)
+
+    for path in base_dir.glob("*.db*"):
+        if path.is_file():
+            tracked_paths.add(path)
+
+    conv_dir = base_dir / "conversations"
+    if conv_dir.exists():
+        for path in conv_dir.glob("*.db*"):
+            if path.is_file():
+                tracked_paths.add(path)
+
+    brain_dir = base_dir / "brain"
+    if brain_dir.exists():
+        for root, _dirs, files in os.walk(brain_dir):
+            if "transcript.jsonl" in files:
+                tracked_paths.add(Path(root) / "transcript.jsonl")
+
+    entries: list[tuple[str, int, int]] = []
+    for path in sorted(tracked_paths, key=lambda item: str(item)):
+        try:
+            stat = path.stat()
+            entries.append((str(path.relative_to(base_dir)), stat.st_mtime_ns, stat.st_size))
+        except (OSError, ValueError):
+            continue
+    return str(base_dir.resolve()), tuple(entries)
+
+
+def _cache_result(cache_key: tuple[str, tuple[tuple[str, int, int], ...]], result: dict[str, Any]) -> None:
+    """Store the newest AGY snapshot and discard stale snapshots for its root."""
+    _AGY_PARSE_CACHE[cache_key] = copy.deepcopy(result)
+    root = cache_key[0]
+    for old_key in list(_AGY_PARSE_CACHE):
+        if old_key != cache_key and old_key[0] == root:
+            del _AGY_PARSE_CACHE[old_key]
+
+
+def _allocate_total(total: int, weights: list[int]) -> list[int]:
+    """Distribute an estimated total across weighted transcript events."""
+    if not weights:
+        return []
+    safe_weights = [max(0, int(weight)) for weight in weights]
+    weight_sum = sum(safe_weights)
+    if total <= 0 or weight_sum <= 0:
+        return [0] * len(weights)
+
+    allocations = [(total * weight) // weight_sum for weight in safe_weights]
+    remainder = total - sum(allocations)
+    fractions = sorted(
+        range(len(weights)),
+        key=lambda index: (total * safe_weights[index]) % weight_sum,
+        reverse=True,
+    )
+    for index in fractions[:remainder]:
+        allocations[index] += 1
+    return allocations
 
 
 def _to_iso_string(ts: int | float | str | None) -> str:
@@ -72,6 +138,11 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
     if not base_dir.exists():
         return empty_result
 
+    cache_key = _source_signature(base_dir)
+    cached_result = _AGY_PARSE_CACHE.get(cache_key)
+    if cached_result is not None:
+        return copy.deepcopy(cached_result)
+
     # 1. Read configured model from settings.json
     configured_model = "Gemini 3.8 Flash (High)"
     settings_file = base_dir / "settings.json"
@@ -81,8 +152,8 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                 settings_data = json.load(f)
                 if settings_data.get("model"):
                     configured_model = str(settings_data["model"]).strip()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to read settings.json from %s: %s", settings_file, e)
 
     # 2. Comprehensive session discovery:
     # 2a. Scan brain/**/transcript.jsonl using os.walk
@@ -200,6 +271,8 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
             first_ts: str | None = None
             last_ts: str | None = None
             first_user_prompt = ""
+            pending_input_chars = 0
+            call_events: list[dict[str, Any]] = []
 
             try:
                 with open(t_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -231,6 +304,7 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                             or step_type in ("USER_INPUT", "CHECKPOINT", "SYSTEM_MESSAGE")
                         ):
                             input_chars += len(content)
+                            pending_input_chars += len(content)
                             if not first_user_prompt and content:
                                 cleaned_p = next(
                                     (ln.strip() for ln in content.splitlines() if ln.strip() and not ln.startswith("<")),
@@ -241,17 +315,27 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                         # Tool output results fed into model context
                         elif step_type == "GENERIC":
                             input_chars += len(content)
+                            pending_input_chars += len(content)
                         # Model generation
                         elif step_type == "PLANNER_RESPONSE" or source == "MODEL":
                             call_count += 1
-                            output_chars += len(content)
+                            call_output_chars = len(content)
                             tool_calls = step.get("tool_calls")
                             if tool_calls:
                                 try:
-                                    output_chars += len(json.dumps(tool_calls, default=str))
+                                    call_output_chars += len(json.dumps(tool_calls, default=str))
                                 except Exception:
                                     pass
-                            thinking_chars += len(thinking)
+                            call_thinking_chars = len(thinking)
+                            output_chars += call_output_chars
+                            thinking_chars += call_thinking_chars
+                            call_events.append({
+                                "timestamp": str(ts or last_ts or first_ts or ""),
+                                "input_chars": pending_input_chars,
+                                "output_chars": call_output_chars,
+                                "thinking_chars": call_thinking_chars,
+                            })
+                            pending_input_chars = 0
             except Exception as e:
                 logger.warning("Error reading transcript for %s: %s", t_path, e)
                 continue
@@ -266,6 +350,52 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
             reasoning_output_tokens = thinking_chars // 4
             output_tokens = (output_chars + thinking_chars) // 4
             total_tokens = input_tokens + output_tokens
+
+            # Attribute transcript input/output estimates to individual model
+            # calls so rolling time filters can include only the calls that
+            # occurred inside the selected window. Any trailing context is
+            # assigned to the final call to preserve the session total.
+            if call_events and pending_input_chars:
+                call_events[-1]["input_chars"] += pending_input_chars
+
+            usage_events: list[dict[str, Any]] = []
+            if call_events:
+                input_allocations = _allocate_total(
+                    input_tokens,
+                    [int(event["input_chars"]) for event in call_events],
+                )
+                output_allocations = _allocate_total(
+                    output_tokens,
+                    [int(event["output_chars"]) + int(event["thinking_chars"]) for event in call_events],
+                )
+                reasoning_allocations = _allocate_total(
+                    reasoning_output_tokens,
+                    [int(event["thinking_chars"]) for event in call_events],
+                )
+                cached_total = int(input_tokens * 0.45) if call_count > 1 else 0
+                cached_allocations = _allocate_total(cached_total, input_allocations)
+                for index, event in enumerate(call_events):
+                    event_input = input_allocations[index]
+                    event_cached = min(event_input, cached_allocations[index])
+                    event_output = output_allocations[index]
+                    usage_events.append({
+                        "timestamp": event["timestamp"],
+                        "input_tokens": event_input,
+                        "cached_input_tokens": event_cached,
+                        "output_tokens": event_output,
+                        "reasoning_output_tokens": reasoning_allocations[index],
+                        "total_tokens": event_input + event_output,
+                    })
+
+            if not usage_events and total_tokens > 0:
+                usage_events.append({
+                    "timestamp": str(first_ts or last_ts or ""),
+                    "input_tokens": input_tokens,
+                    "cached_input_tokens": cached_input,
+                    "output_tokens": output_tokens,
+                    "reasoning_output_tokens": reasoning_output_tokens,
+                    "total_tokens": total_tokens,
+                })
 
             db_entry = summaries.get(session_id)
             if db_entry:
@@ -300,6 +430,7 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                 "created_at": created_at_iso,
                 "start_time": first_ts,
                 "end_time": last_ts or str(last_modified or ""),
+                "usage_events": usage_events,
             })
         else:
             steps = 0
@@ -326,6 +457,14 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
             cost = calculate_cost(configured_model, uncached_input, cached_input, output_tokens)
             total_input = input_tokens
             cache_hit_rate = round((cached_input / total_input * 100.0), 2) if total_input > 0 else 0.0
+            usage_events = [{
+                "timestamp": created_at_iso,
+                "input_tokens": input_tokens,
+                "cached_input_tokens": cached_input,
+                "output_tokens": output_tokens,
+                "reasoning_output_tokens": reasoning_output_tokens,
+                "total_tokens": total_tokens,
+            }] if total_tokens > 0 else []
 
             sessions.append({
                 "id": session_id,
@@ -346,6 +485,7 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                 "created_at": created_at_iso,
                 "start_time": str(last_modified or ""),
                 "end_time": str(last_modified or ""),
+                "usage_events": usage_events,
             })
 
     # Sort sessions by created_at descending
@@ -465,10 +605,12 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
         "call_count": sum(s["call_count"] for s in sessions),
     }
 
-    return {
+    result = {
         "tool": "antigravity",
         "summary": summary,
         "models": models_list,
         "timeline": timeline_list,
         "sessions": sessions,
     }
+    _cache_result(cache_key, result)
+    return copy.deepcopy(result)

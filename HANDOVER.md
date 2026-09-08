@@ -56,7 +56,7 @@ ai-usage-dashboard/
     ├── parsers/
     │   ├── codex.py         # Reads ~/.codex/sessions/**/rollout-*.jsonl + state_5.sqlite
     │   ├── agy.py           # Reads ~/.gemini/antigravity-cli/brain/**/transcript.jsonl + DBs
-    │   └── aggregator.py   # get_tool_usage(tool="all"|"codex"|"agy")
+    │   └── aggregator.py   # get_tool_usage(tool, time_range) + analytics
     ├── static/
     │   ├── css/dashboard.css
     │   └── js/
@@ -72,12 +72,15 @@ ai-usage-dashboard/
 
 **Codex:** `~/.codex/state_5.sqlite` (threads table) + `~/.codex/sessions/**/rollout-*.jsonl`
 - Exact token fields: `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`
-- File mtime+size cache prevents re-reads on polling
+- Incremental usage events enable per-call time windows
+- File mtime_ns+size cache prevents re-reads on polling
 
 **AGY:** `~/.gemini/antigravity-cli/`
 - `settings.json` → active model
 - `conversation_summaries.db` + `conversations/*.db` → session metadata
 - `brain/**/transcript.jsonl` → character-length token estimation (chars // 4)
+- Transcript estimates are allocated across model-response events for time-window slicing
+- Snapshot cache avoids re-parsing unchanged AGY sources
 - 45% cache hit rate applied for multi-turn sessions
 
 ---
@@ -87,7 +90,7 @@ ai-usage-dashboard/
 | Endpoint | Description |
 |:---------|:------------|
 | `GET /` | Dashboard HTML |
-| `GET /api/usage?tool=all\|codex\|agy` | Live parsed metrics JSON |
+| `GET /api/usage?tool=all\|codex\|agy&time_range=all\|month\|30d\|7d\|24h` | Live parsed metrics JSON with tool/time filtering |
 | `GET /api/pricing` | All 14 model pricing rates |
 | `GET /api/health` | Health check |
 
@@ -122,10 +125,14 @@ ai-usage-dashboard/
 - [x] FastAPI server + static file serving
 - [x] Zero-dep `RollingOdometer` (CSS 3D, staggered cubic-bezier animation)
 - [x] Dark-mode SPA: 6 odometer cards, dual Chart.js charts, 12-col model table, session search
+- [x] Tool and time-range filters with consistent server-side aggregate recalculation
+- [x] Per-call window slicing for long-running sessions
+- [x] Analytics snapshot: top-cost sessions, period comparison, peak day, call trend, and monthly projection
+- [x] AGY snapshot caching and concurrent all-tool parsing for faster polling
 - [x] CLI runner with --open, --port, --host flags
 - [x] o1-mini correct pricing (not aliased to o1)
 - [x] XSS-safe toasts, AbortController, NoneType guards, query_only PRAGMA
-- [x] All 11 tests pass (parsers + server)
+- [x] Parser, API, boundary, syntax, and live-browser checks pass
 
 ---
 
@@ -139,12 +146,12 @@ gh pr create --title "feat: AI Usage & Cost Visualizer" --body "Initial implemen
 ```
 
 ### P2 — Optional Enhancements
-1. **Date range filter** — pill selector (Today / 7D / 30D / All) filtering `timeline` + `sessions` in `dashboard.js`
+1. **Custom date range** — user-selected start/end dates beyond the preset time windows
 2. **Claude Cost Tracker integration** — add `src/parsers/claude.py` reading `~/.claude-cost-tracker/usage.db` (schema: session_id, model, input/output/cache tokens, estimated_cost_usd) + 3rd dropdown option
 3. **Export button** — convert `state.allSessions` to CSV blob in `dashboard.js`
 
 ### P3 — Code Quality
-- `dashboard.js` is 834 lines — extract `chart-helpers.js` and `table-renderer.js`
+- `dashboard.js` is 1,037 lines — extract `chart-helpers.js`, `analytics-renderer.js`, and `table-renderer.js`
 - Add support for multiple AGY model labels when user switches models
 
 ---

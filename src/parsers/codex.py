@@ -16,7 +16,136 @@ from ..pricing import calculate_cost
 
 logger = logging.getLogger(__name__)
 
-_ROLLOUT_PARSE_CACHE: dict[tuple[str, float, int], dict[str, Any]] = {}
+_ROLLOUT_PARSE_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
+_USAGE_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+
+
+def _as_int(value: Any) -> int:
+    """Convert a usage value to a non-negative integer."""
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _normalize_usage(usage: Any) -> dict[str, int] | None:
+    """Normalize a usage mapping and fill a missing total-token value."""
+    if not isinstance(usage, dict):
+        return None
+
+    normalized = {field: _as_int(usage.get(field)) for field in _USAGE_FIELDS}
+    normalized["cached_input_tokens"] = min(
+        normalized["input_tokens"], normalized["cached_input_tokens"]
+    )
+    if normalized["total_tokens"] == 0:
+        normalized["total_tokens"] = normalized["input_tokens"] + normalized["output_tokens"]
+    return normalized if any(normalized.values()) else None
+
+
+def _usage_delta(current: dict[str, int], previous: dict[str, int] | None) -> dict[str, int]:
+    """Return the positive delta between cumulative usage snapshots."""
+    if previous is None or any(current[field] < previous[field] for field in _USAGE_FIELDS):
+        return dict(current)
+    return {
+        field: max(0, current[field] - previous[field])
+        for field in _USAGE_FIELDS
+    }
+
+
+def _allocate_total(total: int, weights: list[int]) -> list[int]:
+    """Distribute a total across events while preserving the exact sum."""
+    if not weights:
+        return []
+    safe_weights = [max(0, int(weight)) for weight in weights]
+    weight_sum = sum(safe_weights)
+    if total <= 0 or weight_sum <= 0:
+        return [0] * len(weights)
+
+    allocations = [(total * weight) // weight_sum for weight in safe_weights]
+    remainder = total - sum(allocations)
+    fractions = sorted(
+        range(len(weights)),
+        key=lambda index: (total * safe_weights[index]) % weight_sum,
+        reverse=True,
+    )
+    for index in fractions[:remainder]:
+        allocations[index] += 1
+    return allocations
+
+
+def _event_totals(events: list[dict[str, Any]]) -> dict[str, int]:
+    """Sum normalized metrics across a list of usage events."""
+    return {
+        field: sum(_as_int(event.get(field)) for event in events)
+        for field in _USAGE_FIELDS
+    }
+
+
+def _reconcile_usage_events(
+    events: list[dict[str, Any]],
+    target: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Scale event metrics to an authoritative session total when needed."""
+    if not events:
+        return []
+
+    input_allocations = _allocate_total(
+        target["input_tokens"],
+        [
+            _as_int(event.get("input_tokens"))
+            or _as_int(event.get("total_tokens"))
+            for event in events
+        ],
+    )
+    cached_allocations = _allocate_total(
+        target["cached_input_tokens"], input_allocations
+    )
+    output_allocations = _allocate_total(
+        target["output_tokens"],
+        [_as_int(event.get("output_tokens")) for event in events],
+    )
+    reasoning_allocations = _allocate_total(
+        target["reasoning_output_tokens"],
+        [_as_int(event.get("reasoning_output_tokens")) for event in events],
+    )
+    total_allocations = _allocate_total(
+        target["total_tokens"],
+        [
+            _as_int(event.get("total_tokens"))
+            or _as_int(event.get("input_tokens")) + _as_int(event.get("output_tokens"))
+            for event in events
+        ],
+    )
+
+    reconciled: list[dict[str, Any]] = []
+    for index, event in enumerate(events):
+        reconciled.append({
+            "timestamp": str(event.get("timestamp") or ""),
+            "input_tokens": input_allocations[index],
+            "cached_input_tokens": min(input_allocations[index], cached_allocations[index]),
+            "output_tokens": output_allocations[index],
+            "reasoning_output_tokens": reasoning_allocations[index],
+            "total_tokens": total_allocations[index],
+        })
+    return reconciled
+
+
+def _build_usage_event(timestamp: Any, usage: Any) -> dict[str, Any] | None:
+    """Normalize one incremental token-usage record for time-window slicing."""
+    normalized = _normalize_usage(usage)
+    if normalized is None:
+        return None
+
+    return {
+        "timestamp": _to_iso_string(timestamp),
+        **normalized,
+    }
 
 
 def _to_iso_string(ts: int | float | str | None) -> str:
@@ -41,7 +170,7 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
     cache_key = None
     try:
         stat = file_path.stat()
-        cache_key = (str(file_path.resolve()), stat.st_mtime, stat.st_size)
+        cache_key = (str(file_path.resolve()), stat.st_mtime_ns, stat.st_size)
         if cache_key in _ROLLOUT_PARSE_CACHE:
             return dict(_ROLLOUT_PARSE_CACHE[cache_key])
     except OSError as e:
@@ -51,15 +180,12 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
     extracted_model: str | None = None
     first_timestamp: str | None = None
     last_timestamp: str | None = None
-
-    last_cumulative: dict[str, Any] | None = None
-    sum_incremental = {
-        "input_tokens": 0,
-        "cached_input_tokens": 0,
-        "output_tokens": 0,
-        "reasoning_output_tokens": 0,
-        "total_tokens": 0,
-    }
+    token_record_events: list[dict[str, Any]] = []
+    event_msg_events: list[dict[str, Any]] = []
+    event_msg_fallback_events: list[dict[str, Any]] = []
+    token_record_count = 0
+    previous_event_msg_cumulative: dict[str, int] | None = None
+    last_cumulative: dict[str, int] | None = None
 
     has_error = False
     try:
@@ -100,19 +226,18 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
 
                 # Format 1: token_usage_record
                 elif rec_type == "token_usage_record":
-                    call_count += 1
+                    token_record_count += 1
                     u = payload.get("usage")
                     if not isinstance(u, dict):
                         u = {}
-                    sum_incremental["input_tokens"] += u.get("input_tokens") or 0
-                    sum_incremental["cached_input_tokens"] += u.get("cached_input_tokens") or 0
-                    sum_incremental["output_tokens"] += u.get("output_tokens") or 0
-                    sum_incremental["reasoning_output_tokens"] += u.get("reasoning_output_tokens") or 0
-                    sum_incremental["total_tokens"] += u.get("total_tokens") or 0
+                    usage_event = _build_usage_event(ts, u)
+                    if usage_event:
+                        token_record_events.append(usage_event)
 
                     thread_cum = payload.get("thread_token_usage") or payload.get("turn_token_usage")
-                    if isinstance(thread_cum, dict) and thread_cum:
-                        last_cumulative = thread_cum
+                    normalized_thread_cum = _normalize_usage(thread_cum)
+                    if normalized_thread_cum:
+                        last_cumulative = normalized_thread_cum
 
                 # Format 2: event_msg with payload.type == 'token_count'
                 elif rec_type == "event_msg" and payload.get("type") == "token_count":
@@ -122,33 +247,73 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
                     last_u = info.get("last_token_usage")
                     if not isinstance(last_u, dict):
                         last_u = {}
-                    sum_incremental["input_tokens"] += last_u.get("input_tokens") or 0
-                    sum_incremental["cached_input_tokens"] += last_u.get("cached_input_tokens") or 0
-                    sum_incremental["output_tokens"] += last_u.get("output_tokens") or 0
-                    sum_incremental["reasoning_output_tokens"] += last_u.get("reasoning_output_tokens") or 0
-                    sum_incremental["total_tokens"] += last_u.get("total_tokens") or 0
 
                     tot_u = info.get("total_token_usage")
-                    if isinstance(tot_u, dict) and tot_u:
-                        last_cumulative = tot_u
+                    normalized_total = _normalize_usage(tot_u)
+                    if normalized_total:
+                        event_delta = _usage_delta(normalized_total, previous_event_msg_cumulative)
+                        previous_event_msg_cumulative = normalized_total
+                        usage_event = _build_usage_event(ts, event_delta)
+                        if usage_event:
+                            event_msg_events.append(usage_event)
+                        last_cumulative = normalized_total
+                    else:
+                        usage_event = _build_usage_event(ts, last_u)
+                        if usage_event:
+                            event_msg_fallback_events.append(usage_event)
     except Exception as e:
         has_error = True
         logger.warning("Error reading rollout file %s: %s", file_path, e)
 
     if last_cumulative:
-        input_tokens = int(last_cumulative.get("input_tokens") or 0)
-        cached_input_tokens = int(last_cumulative.get("cached_input_tokens") or 0)
-        output_tokens = int(last_cumulative.get("output_tokens") or 0)
-        reasoning_output_tokens = int(last_cumulative.get("reasoning_output_tokens") or 0)
-        total_tokens = int(last_cumulative.get("total_tokens") or (input_tokens + output_tokens))
+        input_tokens = last_cumulative["input_tokens"]
+        cached_input_tokens = last_cumulative["cached_input_tokens"]
+        output_tokens = last_cumulative["output_tokens"]
+        reasoning_output_tokens = last_cumulative["reasoning_output_tokens"]
+        total_tokens = last_cumulative["total_tokens"]
     else:
-        input_tokens = sum_incremental["input_tokens"]
-        cached_input_tokens = sum_incremental["cached_input_tokens"]
-        output_tokens = sum_incremental["output_tokens"]
-        reasoning_output_tokens = sum_incremental["reasoning_output_tokens"]
-        total_tokens = sum_incremental["total_tokens"] or (input_tokens + output_tokens)
+        usage_events_for_totals = token_record_events or event_msg_fallback_events
+        input_tokens = sum(event["input_tokens"] for event in usage_events_for_totals)
+        cached_input_tokens = sum(event["cached_input_tokens"] for event in usage_events_for_totals)
+        output_tokens = sum(event["output_tokens"] for event in usage_events_for_totals)
+        reasoning_output_tokens = sum(event["reasoning_output_tokens"] for event in usage_events_for_totals)
+        total_tokens = sum(event["total_tokens"] for event in usage_events_for_totals)
+
+    # A rollout may contain both a token_usage_record and a token_count status
+    # message for the same call. Prefer whichever event stream matches the
+    # authoritative session total, then reconcile a partially-written stream.
+    target_totals = {
+        field: _as_int(value)
+        for field, value in last_cumulative.items()
+    } if last_cumulative else None
+    if target_totals:
+        token_totals = _event_totals(token_record_events)
+        message_totals = _event_totals(event_msg_events)
+        if token_record_events and token_totals == target_totals:
+            usage_events = token_record_events
+        elif event_msg_events and message_totals == target_totals:
+            usage_events = event_msg_events
+        else:
+            usage_events = event_msg_events or token_record_events or event_msg_fallback_events
+            usage_events = _reconcile_usage_events(usage_events, target_totals)
+    else:
+        usage_events = token_record_events or event_msg_fallback_events
+    call_count = len(usage_events) or token_record_count
 
     uncached_input_tokens = max(0, input_tokens - cached_input_tokens)
+
+    # Older or malformed rollouts may expose only a final total. Keep a
+    # timestamped fallback event so the session can still participate in a
+    # time filter without changing the all-time totals.
+    if not usage_events and total_tokens > 0:
+        usage_events.append({
+            "timestamp": _to_iso_string(last_timestamp or first_timestamp),
+            "input_tokens": input_tokens,
+            "cached_input_tokens": cached_input_tokens,
+            "output_tokens": output_tokens,
+            "reasoning_output_tokens": reasoning_output_tokens,
+            "total_tokens": total_tokens,
+        })
 
     result = {
         "call_count": max(1, call_count) if total_tokens > 0 else call_count,
@@ -161,6 +326,7 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
         "start_time": first_timestamp,
         "end_time": last_timestamp,
         "model": extracted_model,
+        "usage_events": usage_events,
     }
     if cache_key is not None and not has_error:
         _ROLLOUT_PARSE_CACHE[cache_key] = result
@@ -212,7 +378,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
     rollout_files_by_path: dict[str, Path] = {}
     rollout_files_by_id: dict[str, Path] = {}
 
-    for p in base_dir.glob("sessions/**/rollout-*.jsonl"):
+    for p in base_dir.glob("**/*rollout-*.jsonl"):
         rollout_files_by_path[str(p)] = p
         # Filename pattern: rollout-<date>-<thread_id>.jsonl
         fname = p.name
@@ -227,6 +393,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
 
     if db_path.exists():
         conn: sqlite3.Connection | None = None
+        cursor: sqlite3.Cursor | None = None
         try:
             try:
                 uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
@@ -244,15 +411,19 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
             )
             for row in cursor.fetchall():
                 threads_data.append(dict(row))
-            cursor.close()
         except Exception as e:
             logger.warning("Error querying Codex SQLite database %s: %s", db_path, e)
         finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception as e:
+                    logger.debug("Failed to close cursor: %s", e)
             if conn is not None:
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to close connection: %s", e)
 
     sessions: list[dict[str, Any]] = []
     processed_rollout_paths: set[str] = set()
@@ -268,6 +439,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
         reasoning_effort = t.get("reasoning_effort")
         db_tokens = int(t.get("tokens_used") or 0)
         created_at_raw = t.get("created_at")
+        usage_events: list[dict[str, Any]] = []
 
         matched_rollout_path: Path | None = None
         if db_rollout_path and os.path.exists(db_rollout_path):
@@ -278,7 +450,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
             matched_rollout_path = rollout_files_by_id[t_id.lower()]
 
         if matched_rollout_path:
-            processed_rollout_paths.add(str(matched_rollout_path))
+            processed_rollout_paths.add(str(matched_rollout_path.resolve()))
             parsed = _parse_rollout_file(matched_rollout_path)
             call_count = parsed["call_count"]
             input_tokens = parsed["input_tokens"]
@@ -289,6 +461,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
             total_tokens = parsed["total_tokens"]
             start_time = parsed["start_time"]
             end_time = parsed["end_time"]
+            usage_events = list(parsed.get("usage_events") or [])
         else:
             call_count = 1 if db_tokens > 0 else 0
             input_tokens = int(db_tokens * 0.8)
@@ -310,6 +483,16 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
             call_count = max(1, call_count)
 
         created_at_iso = _to_iso_string(created_at_raw) or (start_time or "")
+
+        if not usage_events and total_tokens > 0:
+            usage_events = [{
+                "timestamp": created_at_iso,
+                "input_tokens": input_tokens,
+                "cached_input_tokens": cached_input,
+                "output_tokens": output,
+                "reasoning_output_tokens": reasoning_output,
+                "total_tokens": total_tokens,
+            }]
 
         cost = calculate_cost(model, uncached_input, cached_input, output)
         total_input = uncached_input + cached_input
@@ -335,6 +518,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
             "created_at": created_at_iso,
             "start_time": start_time,
             "end_time": end_time,
+            "usage_events": usage_events,
         })
 
     # 4. Handle any orphan rollout files not indexed in threads table
@@ -374,6 +558,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
             "created_at": created_at_iso,
             "start_time": parsed["start_time"],
             "end_time": parsed["end_time"],
+            "usage_events": list(parsed.get("usage_events") or []),
         })
 
     # Sort sessions by created_at descending

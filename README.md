@@ -9,6 +9,9 @@ A local real-time dashboard that visualizes token usage and API inference costs 
 - 🔍 **Per-model granularity table** with 12 columns: uncached input, cached input, output, reasoning tokens, cache hit %, API rates, cost with/without caching, net savings
 - 🔄 **Live auto-refresh** (10s/30s/60s) with AbortController cancellation
 - 🔽 **Tool filter dropdown**: All Tools, OpenAI Codex, AGY (Google Antigravity)
+- 🗓️ **Time filter dropdown**: All time, This month, Past 30 days, Past 7 days, Past 24h
+- 📊 **Analytics snapshot**: API calls, averages, peak spend day, top-cost sessions, period comparison, and monthly run-rate projection
+- ⚡ **Efficient live polling**: cached parser work for unchanged files plus parallel all-tool parsing
 - 🔎 **Session search** — filter across titles, models, and session IDs
 
 ## Quickstart
@@ -38,9 +41,9 @@ python test_server.py    # API endpoint tests
 
 | Endpoint | Description |
 |:---------|:------------|
-| `GET /api/usage?tool=all` | All tools aggregated |
-| `GET /api/usage?tool=codex` | Codex only |
-| `GET /api/usage?tool=agy` | AGY only |
+| `GET /api/usage?tool=all&time_range=all` | All tools aggregated; includes `analytics` |
+| `GET /api/usage?tool=codex&time_range=30d` | Codex usage from the past 30 days |
+| `GET /api/usage?tool=agy&time_range=month` | AGY usage from the current calendar month |
 | `GET /api/pricing` | Model pricing rates |
 | `GET /api/health` | Health check |
 

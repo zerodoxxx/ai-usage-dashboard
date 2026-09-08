@@ -44,11 +44,15 @@ def api_usage(
     tool: str = Query(
         default="all",
         description="Filter metrics by tool: 'all', 'codex', 'agy', or 'antigravity'.",
-    )
+    ),
+    time_range: str = Query(
+        default="all",
+        description="Filter usage by time: 'all', 'month', '30d', '7d', or '24h'.",
+    ),
 ) -> dict[str, Any]:
     """Return real-time usage metrics, summaries, model breakdowns, timelines, and sessions."""
     try:
-        return get_tool_usage(tool)
+        return get_tool_usage(tool, time_range=time_range)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

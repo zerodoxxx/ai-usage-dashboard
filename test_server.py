@@ -79,6 +79,7 @@ def main() -> None:
     assert "odo-total-tokens" in html
     assert "chart-tokens" in html
     assert "models-table-body" in html
+    assert "time-range-select" in html
     print("✓ GET / (Dashboard HTML) passed")
 
     # 3. Test Static Assets
@@ -101,6 +102,9 @@ def main() -> None:
     assert status == 200, f"Expected 200, got {status}"
     assert usage_all["tool"] == "all"
     assert "summary" in usage_all and "models" in usage_all and "timeline" in usage_all and "sessions" in usage_all
+    assert "analytics" in usage_all
+    assert {"top_sessions", "daily_calls", "monthly_projection_usd", "comparison"}.issubset(usage_all["analytics"])
+    assert all("usage_events" not in session for session in usage_all["sessions"] if isinstance(session, dict))
     s = usage_all["summary"]
     assert s["total_tokens"] > 0
     assert s["cost_cached_usd"] > 0
@@ -112,16 +116,29 @@ def main() -> None:
     assert usage_codex["tool"] == "codex"
     print(f"✓ GET /api/usage?tool=codex passed (Codex tokens: {usage_codex['summary']['total_tokens']:,})")
 
-    # 7. Test /api/usage?tool=agy
+    # 7. Test time-range filtering
+    status, usage_7d = fetch_url("/api/usage?tool=all&time_range=7d")
+    assert status == 200, f"Expected 200, got {status}"
+    assert usage_7d["time_range"] == "7d"
+    assert usage_7d["summary"]["session_count"] <= usage_all["summary"]["session_count"]
+    assert usage_7d["analytics"]["comparison"]["label"] == "previous 7 days"
+    print(f"✓ GET /api/usage?time_range=7d passed (Sessions: {usage_7d['summary']['session_count']})")
+
+    # 8. Test /api/usage?tool=agy
     status, usage_agy = fetch_url("/api/usage?tool=agy")
     assert status == 200, f"Expected 200, got {status}"
     assert usage_agy["tool"] == "antigravity"
     print(f"✓ GET /api/usage?tool=agy passed (AGY tokens: {usage_agy['summary']['total_tokens']:,})")
 
-    # 8. Test invalid tool
+    # 9. Test invalid tool
     status, err = fetch_url("/api/usage?tool=invalid_tool")
     assert status == 400, f"Expected 400, got {status}: {err}"
     print("✓ GET /api/usage with invalid tool properly rejected with HTTP 400")
+
+    # 10. Test invalid time range
+    status, err = fetch_url("/api/usage?time_range=invalid_range")
+    assert status == 400, f"Expected 400, got {status}: {err}"
+    print("✓ GET /api/usage with invalid time range properly rejected with HTTP 400")
 
     print("\n========================================")
     print("  ALL API & DASHBOARD TESTS PASSED!     ")

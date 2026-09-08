@@ -27,11 +27,19 @@
       </div>
 
       <div class="header-controls">
-        <div class="control-group">
+        <div class="control-group filter-controls" aria-label="Usage filters">
           <select id="tool-select" class="select-control tool-select-control" title="Select AI Tool Filter">
             <option value="all" selected>All AI Tools (Combined)</option>
             <option value="codex">OpenAI Codex</option>
             <option value="agy">AGY (Google Antigravity)</option>
+          </select>
+
+          <select id="time-range-select" class="select-control time-range-select" title="Select Usage Time Range" aria-label="Select Usage Time Range">
+            <option value="all" selected>All time</option>
+            <option value="month">This month</option>
+            <option value="30d">Past 30 days</option>
+            <option value="7d">Past 7 days</option>
+            <option value="24h">Past 24h</option>
           </select>
         </div>
 
@@ -76,7 +84,7 @@
           <div id="odo-total-tokens" class="odometer-container">0</div>
         </div>
         <div class="metric-subtext">
-          <span>Cumulative audit</span>
+          <span id="card-tokens-subtext">Cumulative audit</span>
         </div>
       </div>
 
@@ -151,6 +159,84 @@
       </div>
     </section>
 
+    <!-- Analytics Snapshot -->
+    <section class="section-card analytics-section" aria-label="Analytics Snapshot">
+      <div class="section-header">
+        <div class="section-title">
+          <span>Analytics Snapshot</span>
+          <span id="analytics-window-badge" class="counter-badge">All time</span>
+        </div>
+        <span class="analytics-note">Derived from the selected tool and time range</span>
+      </div>
+
+      <div class="analytics-grid">
+        <div class="analytics-stat">
+          <span class="analytics-label">API Calls</span>
+          <strong id="analytics-call-count" class="analytics-value">0</strong>
+          <span class="analytics-subtext">Model requests recorded</span>
+        </div>
+        <div class="analytics-stat">
+          <span class="analytics-label">Avg. Cost / Session</span>
+          <strong id="analytics-avg-cost" class="analytics-value">$0.0000</strong>
+          <span class="analytics-subtext">Cached-rate estimate</span>
+        </div>
+        <div class="analytics-stat">
+          <span class="analytics-label">Avg. Tokens / Session</span>
+          <strong id="analytics-avg-tokens" class="analytics-value">0</strong>
+          <span class="analytics-subtext">Across filtered sessions</span>
+        </div>
+        <div class="analytics-stat">
+          <span class="analytics-label">Projected Monthly Cost</span>
+          <strong id="analytics-monthly-projection" class="analytics-value">$0.0000</strong>
+          <span id="analytics-projection-basis" class="analytics-subtext">Based on current usage</span>
+        </div>
+        <div class="analytics-stat">
+          <span class="analytics-label">Peak Cost Day</span>
+          <strong id="analytics-peak-day-cost" class="analytics-value">$0.0000</strong>
+          <span id="analytics-peak-day-detail" class="analytics-subtext">No daily usage yet</span>
+        </div>
+      </div>
+
+      <div class="analytics-detail-grid">
+        <div class="insight-card">
+          <div class="insight-header">
+            <div>
+              <div class="insight-title">Top Sessions by Cost</div>
+              <div class="insight-subtitle">Highest estimated spend in the selected range</div>
+            </div>
+          </div>
+          <div class="table-responsive insight-table-wrap">
+            <table class="data-table insight-table">
+              <thead>
+                <tr>
+                  <th>Session</th>
+                  <th>Tool</th>
+                  <th>Model</th>
+                  <th class="cell-right">Tokens</th>
+                  <th class="cell-right">Est. Cost</th>
+                </tr>
+              </thead>
+              <tbody id="top-sessions-table-body">
+                <tr><td colspan="5" class="empty-state">Loading analytics...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="insight-card comparison-card">
+          <div class="insight-header">
+            <div>
+              <div class="insight-title">Period Comparison</div>
+              <div id="comparison-subtitle" class="insight-subtitle">Select a rolling range to compare usage</div>
+            </div>
+          </div>
+          <div id="comparison-content" class="comparison-content">
+            <div class="comparison-empty">No comparison available for All time.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- Charts Section -->
     <section class="charts-grid" aria-label="Visual Trends">
       <!-- Chart 1: Token Breakdown per Model -->
@@ -171,7 +257,7 @@
         <div class="chart-header">
           <div>
             <div class="chart-title">Daily Cost & Token Trend</div>
-            <div class="chart-subtitle">Timeline tracking daily API spend and token volume</div>
+            <div class="chart-subtitle">Daily API spend, token volume, and call count</div>
           </div>
         </div>
         <div class="chart-canvas-wrap">

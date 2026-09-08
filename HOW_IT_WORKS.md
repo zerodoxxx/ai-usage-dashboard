@@ -84,7 +84,7 @@ disk files
                                                         │
                                                  src/app.py (FastAPI)
                                                         │
-                                                 GET /api/usage?tool=all
+                                                        GET /api/usage?tool=all&time_range=all
                                                         │
                                                  src/templates/index.html
                                                  src/static/js/dashboard.js
@@ -98,9 +98,17 @@ disk files
 
 Codex rollout files can be large (2–4 MB each). Re-parsing 50–100 files on every 10-second poll would be slow and wasteful.
 
-**Solution:** `src/parsers/codex.py` maintains an in-memory dictionary `_ROLLOUT_PARSE_CACHE` keyed by `(file_path, mtime, size)`. If a file hasn't been modified since the last parse, the cached result is returned immediately. Only new or modified files trigger actual disk reads.
+**Solution:** `src/parsers/codex.py` maintains an in-memory dictionary `_ROLLOUT_PARSE_CACHE` keyed by `(file_path, mtime_ns, size)`. If a rollout file hasn't been modified since the last parse, the cached result is returned immediately. Only new or modified files trigger actual JSONL reads.
+
+AGY has a snapshot cache keyed by a lightweight signature of its settings, SQLite, and transcript files. A changed file invalidates the AGY snapshot; unchanged polls reuse a deep-copied result. When the dashboard requests all tools, the Codex and AGY parsers run concurrently, so the request is bounded by the slower parser instead of the sum of both parser times.
 
 This means after the first load, polling responses are nearly instant.
+
+## How Time Windows Stay Accurate
+
+Each parsed session retains internal per-call usage events. Codex events come from incremental token usage records. AGY transcripts do not expose token counts directly, so the parser estimates the session total and allocates it across model-response events according to their character weights. The API strips these internal records from its response, but the aggregator uses them when applying `month`, `30d`, `7d`, and `24h` windows.
+
+That means a long-running conversation is counted by the calls that actually occurred in the selected window, even when the session itself was created much earlier. Older or incomplete records fall back to the best session-level timestamp available.
 
 ---
 
@@ -134,12 +142,13 @@ This lets you see exactly how much you'd be paying if OpenAI/Google didn't have 
 
 ## The Frontend: How the Dashboard Updates
 
-1. **On load:** `dashboard.js` calls `GET /api/pricing` (once) then `GET /api/usage?tool=all`
-2. **The API response** contains: `summary` (odometer values), `models` (per-model table rows), `timeline` (chart data), `sessions` (recent activity list)
+1. **On load:** `dashboard.js` calls `GET /api/pricing` (once) then `GET /api/usage?tool=all&time_range=all`
+2. **The API response** contains: `summary` (odometer values), `models` (per-model table rows), `timeline` (chart data), `sessions` (recent activity list), and `analytics` (derived insights for the selected window)
 3. **Odometers** (`odometer.js`): Each number is broken into digit characters. CSS 3D `translateY` shifts a vertical strip of 0–9 digits to land on the right number. Digits animate with staggered delays and `cubic-bezier(0.2, 0.9, 0.3, 1)` easing — right-to-left, like a real counter.
-4. **Charts** (Chart.js): Token breakdown (stacked bar) and daily cost + token trend (dual-axis line + bar)
+4. **Charts** (Chart.js): Token breakdown (stacked bar) and daily cost + token + API-call trend (multi-axis line + bar)
 5. **Auto-refresh:** A configurable `setInterval` (10s / 30s / 60s) re-calls `GET /api/usage`. Each user-initiated action (tool switch, manual refresh) creates a new `AbortController`, cancelling any in-flight request before starting a fresh one.
 6. **Session search:** Client-side filtering on `state.allSessions` — no additional server calls.
+7. **Time filtering:** The header time selector requests one of `all`, `month`, `30d`, `7d`, or `24h`. The server slices per-call events where available, then rebuilds the summary, model, timeline, session, and analytics results together.
 
 ---
 
@@ -152,7 +161,7 @@ This lets you see exactly how much you'd be paying if OpenAI/Google didn't have 
 | `src/pricing.py` | 14 model pricing dictionaries + cost calculator |
 | `src/parsers/codex.py` | Reads Codex rollout JSONL + SQLite, returns structured metrics dict |
 | `src/parsers/agy.py` | Reads AGY transcripts + DBs, estimates tokens, returns structured metrics dict |
-| `src/parsers/aggregator.py` | Calls both parsers, merges by canonical model name, sorts timeline + sessions |
+| `src/parsers/aggregator.py` | Runs parsers, merges by canonical model name, slices time windows, rebuilds aggregates, and derives analytics |
 | `src/static/js/odometer.js` | `RollingOdometer` class — zero-dependency vertical digit animation |
 | `src/static/js/dashboard.js` | All frontend logic: state, polling, Chart.js, table rendering, search |
 | `src/static/css/dashboard.css` | Dark-mode styles — frosted glass cards, badge colours, table layout |
