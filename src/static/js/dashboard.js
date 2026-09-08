@@ -242,8 +242,26 @@
         throw new Error(`Failed to fetch pricing: ${res.status} ${res.statusText}`);
       }
       state.pricingData = await res.json();
+      updatePricingStatus(state.pricingData.__meta__ || {});
     } catch (e) {
       console.warn('Failed to load pricing table:', e);
+      updatePricingStatus({ source: 'unavailable', stale: true, error: e.message });
+    }
+  }
+
+  function updatePricingStatus(metadata) {
+    const badge = elements.pricingStatus;
+    if (!badge) return;
+    const source = String(metadata.source || 'unavailable');
+    if (source === 'openai' && !metadata.stale) {
+      badge.textContent = 'Pricing: official · fresh';
+      badge.title = metadata.fetched_at ? `Fetched ${metadata.fetched_at}` : '';
+    } else if (source === 'openai-cache' || source === 'bundled') {
+      badge.textContent = `Pricing: ${source === 'bundled' ? 'bundled' : 'cached'} · stale`;
+      badge.title = metadata.error || 'Using last-known-good rates';
+    } else {
+      badge.textContent = 'Pricing: unavailable';
+      badge.title = metadata.error || 'Pricing metadata unavailable';
     }
   }
 
@@ -252,24 +270,23 @@
    */
   function getModelRates(modelName) {
     if (!state.pricingData) {
-      return { uncached_input: 0.20, cached_input: 0.02, output: 1.20 };
+      return null;
     }
     if (state.pricingData[modelName]) {
       return state.pricingData[modelName];
     }
     const norm = (modelName || '').toLowerCase().trim();
     const comparable = (value) => String(value || '').toLowerCase().trim().replace(/[\s_.]+/g, '-');
-    const sortedPricing = Object.entries(state.pricingData).sort((a, b) => b[0].length - a[0].length);
+    const sortedPricing = Object.entries(state.pricingData)
+      .filter(([k]) => !String(k).startsWith('__'))
+      .sort((a, b) => b[0].length - a[0].length);
     for (const [k, v] of sortedPricing) {
       if (comparable(k) === comparable(norm)) return v;
     }
     for (const [k, v] of sortedPricing) {
       if (comparable(norm).includes(comparable(k))) return v;
     }
-    if (norm.includes('gemini')) {
-      return state.pricingData['Gemini 3.8 Flash (High)'] || { uncached_input: 0.10, cached_input: 0.025, output: 0.40 };
-    }
-    return state.pricingData['gpt-5.6-luna'] || { uncached_input: 0.20, cached_input: 0.02, output: 1.20 };
+    return null;
   }
 
   /**
@@ -571,7 +588,9 @@
       const badge = providerBadge(m.tool || (/gpt|o1|o3/i.test(modelName) ? 'codex' : 'antigravity'));
 
       const rates = getModelRates(modelName);
-      const ratesStr = `$${(rates?.uncached_input ?? 0).toFixed(2)} / $${(rates?.cached_input ?? 0).toFixed(3)} / $${(rates?.output ?? 0).toFixed(2)}`;
+      const ratesStr = rates
+        ? `$${(rates.uncached_input ?? 0).toFixed(2)} / $${(rates.cached_input ?? 0).toFixed(3)} / $${(rates.output ?? 0).toFixed(2)}`
+        : 'N/A';
 
       const hitRate = Number(m.cache_hit_rate) || 0;
       let hitRateClass = 'hit-rate-low';
@@ -1101,6 +1120,7 @@
     elements.chartCostCanvas = document.getElementById('chart-cost');
 
     elements.modelsCountBadge = document.getElementById('models-count-badge');
+    elements.pricingStatus = document.getElementById('pricing-status');
     elements.modelsTableBody = document.getElementById('models-table-body');
 
     elements.sessionsCountBadge = document.getElementById('sessions-count-badge');

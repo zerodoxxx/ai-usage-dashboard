@@ -63,7 +63,7 @@ python test_server.py    # API endpoint tests
 | `GET /api/usage?tool=codex&time_range=30d` | Codex usage from the past 30 days |
 | `GET /api/usage?tool=agy&time_range=month` | AGY usage from the current calendar month |
 | `GET /api/usage?tool=claude-code&time_range=7d` | Claude Code usage from the past 7 days |
-| `GET /api/pricing` | Model pricing rates |
+| `GET /api/pricing` | Active model rates plus `__meta__` source/freshness; OpenAI rates refresh from the official pricing table |
 | `GET /api/health` | Health check |
 
 ## Project Structure

@@ -9,11 +9,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from ..pricing import MODEL_PRICING, calculate_cost_strict
+from ..pricing import MODEL_PRICING, PRICING_CATALOG, calculate_cost_strict
 from .agy import AntigravitySource
 from .claude import ClaudeCodeSource
 from .codex import CodexSource
-from .contracts import UsageSession
+from .contracts import CostEstimate, UsageSession
 from .source_registry import SOURCE_REGISTRY, SourceRegistry, normalize_source_key
 
 _CANONICAL_MODELS: dict[str, str] = {k.lower(): k for k in MODEL_PRICING}
@@ -167,21 +167,16 @@ def _event_cost(
                 else max(0.0, baseline - actual)
             ),
         }
-    if event.get("cost_cached_usd") is not None:
-        actual = float(event.get("cost_cached_usd") or 0.0)
-        baseline = float(event.get("cost_uncached_usd") or actual)
-        return {
-            "cost_cached_usd": actual,
-            "cost_uncached_usd": baseline,
-            "savings_usd": float(event.get("savings_usd") or 0.0),
-        }
-
+    event_model = str(event.get("model") or session.get("model") or "")
+    event_provider = str(session.get("provider") or session.get("tool") or "") or None
+    if event_model.casefold().startswith("deepseek"):
+        event_provider = "deepseek"
     result = calculate_cost_strict(
-        str(event.get("model") or session.get("model") or ""),
+        event_model,
         uncached_input,
         cached_input,
         output,
-        provider=str(session.get("provider") or session.get("tool") or "") or None,
+        provider=event_provider,
         cache_write=_as_int(
             event.get("cache_write_tokens")
             or event.get("cache_creation_tokens")
@@ -192,6 +187,68 @@ def _event_cost(
         "cost_uncached_usd": float(result.get("cost_uncached_usd") or 0.0),
         "savings_usd": float(result.get("savings_usd") or 0.0),
     }
+
+
+def _refresh_estimated_session_cost(session: UsageSession) -> None:
+    """Reprice estimated data against the current catalog.
+
+    Parser snapshots can outlive a pricing refresh. Repricing here keeps the
+    dashboard current while preserving provider-reported costs verbatim.
+    """
+    if session.cost is not None and (
+        session.cost.source == "reported" or session.cost.reported_usd is not None
+    ):
+        return
+
+    provider = session.provider or session.tool
+    if str(session.model or "").casefold().startswith("deepseek"):
+        provider = "deepseek"
+    usage = session.usage
+    resolved = calculate_cost_strict(
+        session.model,
+        usage.uncached_input_tokens,
+        usage.cached_input_tokens,
+        usage.output_tokens,
+        provider=provider,
+        cache_write=usage.cache_write_tokens,
+    )
+    if resolved.get("status") == "known":
+        session.cost = CostEstimate(
+            cached_usd=resolved.get("cost_cached_usd") or 0.0,
+            uncached_usd=resolved.get("cost_uncached_usd") or 0.0,
+            savings_usd=resolved.get("savings_usd") or 0.0,
+            source="estimated",
+        )
+    else:
+        # Keep unknown models explicitly unpriced instead of retaining an old
+        # legacy fallback amount (historically Luna).
+        session.cost = None
+
+    for event in session.events:
+        if event.cost is not None and (
+            event.cost.source == "reported" or event.cost.reported_usd is not None
+        ):
+            continue
+        event_model = event.model or session.model
+        event_usage = event.usage
+        event_provider = "deepseek" if str(event_model or "").casefold().startswith("deepseek") else provider
+        event_result = calculate_cost_strict(
+            event_model,
+            event_usage.uncached_input_tokens,
+            event_usage.cached_input_tokens,
+            event_usage.output_tokens,
+            provider=event_provider,
+            cache_write=event_usage.cache_write_tokens,
+        )
+        if event_result.get("status") == "known":
+            event.cost = CostEstimate(
+                cached_usd=event_result.get("cost_cached_usd") or 0.0,
+                uncached_usd=event_result.get("cost_uncached_usd") or 0.0,
+                savings_usd=event_result.get("savings_usd") or 0.0,
+                source="estimated",
+            )
+        else:
+            event.cost = None
 
 
 def _timestamp_in_bounds(
@@ -733,7 +790,8 @@ def _canonical_model_name(name: Any) -> str:
     raw = str(name or "").strip()
     if not raw:
         return ""
-    return _CANONICAL_MODELS.get(raw.lower(), raw)
+    resolved = PRICING_CATALOG.resolve(raw)
+    return resolved.canonical_model if resolved.canonical_model else _CANONICAL_MODELS.get(raw.lower(), raw)
 
 def _serialize_extracted_session(session: UsageSession) -> dict[str, Any]:
     """Convert a normalized session into the dashboard's stable JSON shape.
@@ -743,6 +801,7 @@ def _serialize_extracted_session(session: UsageSession) -> dict[str, Any]:
     models remain explicitly unpriced instead of inheriting another model's
     rates.
     """
+    _refresh_estimated_session_cost(session)
     serialized = session.to_legacy_dict(include_events=True)
     if session.cost is not None:
         serialized["pricing_status"] = session.cost.source
