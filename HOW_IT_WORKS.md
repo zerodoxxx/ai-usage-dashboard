@@ -120,10 +120,25 @@ That means a long-running conversation is counted by the calls that actually occ
 
 File: `src/pricing.py`
 
-For each model, three rates are defined ($ per 1,000,000 tokens):
+For each model, rates are expressed in USD per 1,000,000 tokens:
 - `uncached_input` — tokens not served from cache
 - `cached_input` — tokens served from prompt cache (typically 90–95% cheaper)
 - `output` — generated completion tokens (including reasoning/thinking)
+- `cache_write` — optional prompt-cache creation tokens, when the provider bills them
+
+OpenAI Standard rates are refreshed from the official Markdown pricing table at
+`https://developers.openai.com/api/docs/pricing.md`. The refresh is TTL-based
+(24 hours by default), thread-safe, and persists a last-known-good snapshot at
+`$AI_USAGE_PRICING_CACHE`, `$XDG_CACHE_HOME/ai-usage-dashboard/openai-pricing.json`,
+or `~/.cache/ai-usage-dashboard/openai-pricing.json`. Offline startup uses the
+bundled catalog or that snapshot and reports `stale`/`error` metadata rather
+than failing usage collection. Local transcripts do not identify Batch, Flex,
+Fast, long-context, or regional-processing tiers, so Standard short-context
+rates are used for estimates. The server has one process-global active catalog;
+the default cache path should be used for normal operation. Custom cache paths
+are supported for tests or explicitly switching the active storage snapshot,
+and the payload always reactivates the matching rates before returning its
+metadata.
 
 **Cost formula (cached):**
 ```
@@ -146,7 +161,7 @@ This lets you see exactly how much you'd be paying if OpenAI/Google didn't have 
 
 ## The Frontend: How the Dashboard Updates
 
-1. **On load:** `dashboard.js` calls `GET /api/pricing` (once) then `GET /api/usage?tool=all&time_range=all`
+1. **On load:** `dashboard.js` calls `GET /api/pricing` (once) then `GET /api/usage?tool=all&time_range=all`. The pricing response retains legacy model keys and adds reserved `__meta__` provenance/freshness data.
 2. **The API response** contains: `summary` (odometer values), `models` (per-model table rows), `timeline` (chart data), `sessions` (recent activity list), and `analytics` (derived insights for the selected window)
 3. **Odometers** (`odometer.js`): Each number is broken into digit characters. CSS 3D `translateY` shifts a vertical strip of 0–9 digits to land on the right number. Digits animate with staggered delays and `cubic-bezier(0.2, 0.9, 0.3, 1)` easing — right-to-left, like a real counter.
 4. **Charts** (Chart.js): Token breakdown (stacked bar) and daily cost + token + API-call trend (multi-axis line + bar)
@@ -162,7 +177,7 @@ This lets you see exactly how much you'd be paying if OpenAI/Google didn't have 
 |:-----|:-----------|
 | `run.py` | CLI entry point — starts uvicorn, optionally opens browser |
 | `src/app.py` | FastAPI app — 4 endpoints: `/`, `/api/usage`, `/api/pricing`, `/api/health` |
-| `src/pricing.py` | 14 model pricing dictionaries + cost calculator |
+| `src/pricing.py` | Provider catalog, official OpenAI refresh/cache, and cost calculator |
 | `src/parsers/contracts.py` | Provider-neutral token, event, session, and cost contracts |
 | `src/parsers/source_registry.py` | Provider adapter registry with canonical-key and alias lookup |
 | `src/parsers/codex.py` | Reads Codex rollout JSONL + SQLite, returns structured metrics dict |

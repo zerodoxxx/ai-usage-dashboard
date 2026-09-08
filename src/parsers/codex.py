@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import UsageSession
-from ..pricing import calculate_cost
+from ..pricing import calculate_cost_strict
 
 logger = logging.getLogger(__name__)
 
@@ -495,7 +495,12 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
                 "total_tokens": total_tokens,
             }]
 
-        cost = calculate_cost(model, uncached_input, cached_input, output)
+        priced = calculate_cost_strict(model, uncached_input, cached_input, output, provider="codex")
+        cost = {
+            "cost_cached_usd": float(priced.get("cost_cached_usd") or 0.0),
+            "cost_uncached_usd": float(priced.get("cost_uncached_usd") or 0.0),
+            "savings_usd": float(priced.get("savings_usd") or 0.0),
+        }
         total_input = uncached_input + cached_input
         cache_hit_rate = round((cached_input / total_input * 100.0), 2) if total_input > 0 else 0.0
 
@@ -535,7 +540,18 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
         orphan_model = parsed.get("model") or "gpt-5.6-luna"
         created_at_iso = parsed["start_time"] or ""
 
-        cost = calculate_cost(orphan_model, parsed["uncached_input_tokens"], parsed["cached_input_tokens"], parsed["output_tokens"])
+        priced = calculate_cost_strict(
+            orphan_model,
+            parsed["uncached_input_tokens"],
+            parsed["cached_input_tokens"],
+            parsed["output_tokens"],
+            provider="codex",
+        )
+        cost = {
+            "cost_cached_usd": float(priced.get("cost_cached_usd") or 0.0),
+            "cost_uncached_usd": float(priced.get("cost_uncached_usd") or 0.0),
+            "savings_usd": float(priced.get("savings_usd") or 0.0),
+        }
         tot_in = parsed["uncached_input_tokens"] + parsed["cached_input_tokens"]
         c_hit_rate = round((parsed["cached_input_tokens"] / tot_in * 100.0), 2) if tot_in > 0 else 0.0
 
