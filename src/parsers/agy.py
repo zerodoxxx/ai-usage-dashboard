@@ -85,8 +85,13 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
     summaries: dict[str, dict[str, Any]] = {}
     db_path = base_dir / "conversation_summaries.db"
     if db_path.exists():
+        conn: sqlite3.Connection | None = None
         try:
-            conn = sqlite3.connect(db_path)
+            try:
+                uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
+                conn = sqlite3.connect(uri, uri=True)
+            except Exception:
+                conn = sqlite3.connect(str(db_path))
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute(
@@ -102,9 +107,14 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                     "title": title_val,
                     "last_modified_time": row["last_modified_time"],
                 }
-            conn.close()
         except Exception:
             pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     # 3. Scan brain/**/transcript.jsonl using os.walk
     brain_dir = base_dir / "brain"

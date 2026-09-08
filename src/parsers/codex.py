@@ -184,8 +184,13 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
     threads_data: list[dict[str, Any]] = []
 
     if db_path.exists():
+        conn: sqlite3.Connection | None = None
         try:
-            conn = sqlite3.connect(db_path)
+            try:
+                uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
+                conn = sqlite3.connect(uri, uri=True)
+            except Exception:
+                conn = sqlite3.connect(str(db_path))
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute(
@@ -196,9 +201,14 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
             )
             for row in cursor.fetchall():
                 threads_data.append(dict(row))
-            conn.close()
         except Exception:
             pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     sessions: list[dict[str, Any]] = []
     processed_rollout_paths: set[str] = set()

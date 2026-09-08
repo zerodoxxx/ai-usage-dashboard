@@ -18,6 +18,9 @@
     searchQuery: '',
   };
 
+  // Active in-flight abort controller for user-initiated fetches
+  let currentAbortController = null;
+
   // Odometer Instances
   let odometers = {
     totalTokens: null,
@@ -85,11 +88,21 @@
   }
 
   /**
-   * Initialize rolling odometers
+   * Initialize rolling odometers defensively
    */
   function initOdometers() {
-    odometers.totalTokens = new RollingOdometer({
-      element: '#odo-total-tokens',
+    const createOdometer = (selector, opts) => {
+      try {
+        const el = document.querySelector(selector);
+        if (!el || typeof RollingOdometer === 'undefined') return null;
+        return new RollingOdometer({ element: selector, ...opts });
+      } catch (err) {
+        console.warn(`Failed to initialize odometer for ${selector}:`, err);
+        return null;
+      }
+    };
+
+    odometers.totalTokens = createOdometer('#odo-total-tokens', {
       prefix: '',
       suffix: '',
       decimals: 0,
@@ -97,8 +110,7 @@
       duration: 850,
     });
 
-    odometers.totalCost = new RollingOdometer({
-      element: '#odo-total-cost',
+    odometers.totalCost = createOdometer('#odo-total-cost', {
       prefix: '$',
       suffix: '',
       decimals: 4,
@@ -106,8 +118,7 @@
       duration: 850,
     });
 
-    odometers.cachedTokens = new RollingOdometer({
-      element: '#odo-cached-tokens',
+    odometers.cachedTokens = createOdometer('#odo-cached-tokens', {
       prefix: '',
       suffix: '',
       decimals: 0,
@@ -115,8 +126,7 @@
       duration: 850,
     });
 
-    odometers.cacheRate = new RollingOdometer({
-      element: '#odo-cache-rate',
+    odometers.cacheRate = createOdometer('#odo-cache-rate', {
       prefix: '',
       suffix: '%',
       decimals: 2,
@@ -124,8 +134,7 @@
       duration: 850,
     });
 
-    odometers.outputTokens = new RollingOdometer({
-      element: '#odo-output-tokens',
+    odometers.outputTokens = createOdometer('#odo-output-tokens', {
       prefix: '',
       suffix: '',
       decimals: 0,
@@ -133,8 +142,7 @@
       duration: 850,
     });
 
-    odometers.sessions = new RollingOdometer({
-      element: '#odo-sessions',
+    odometers.sessions = createOdometer('#odo-sessions', {
       prefix: '',
       suffix: '',
       decimals: 0,
@@ -182,16 +190,30 @@
 
   /**
    * Fetch usage data from /api/usage?tool=...
+   * @param {boolean} [isUserInitiated=false]
    */
-  async function fetchUsageData() {
-    if (state.isFetching) return;
+  async function fetchUsageData(isUserInitiated = false) {
+    if (isUserInitiated) {
+      if (currentAbortController) {
+        currentAbortController.abort();
+        currentAbortController = null;
+      }
+      state.isFetching = false;
+    } else if (state.isFetching) {
+      return;
+    }
+
     state.isFetching = true;
+    const controller = new AbortController();
+    currentAbortController = controller;
 
     const refreshIcon = elements.refreshBtn ? elements.refreshBtn.querySelector('.refresh-icon') : null;
     if (refreshIcon) refreshIcon.classList.add('spin');
 
     try {
-      const res = await fetch(`/api/usage?tool=${encodeURIComponent(state.currentTool)}`);
+      const res = await fetch(`/api/usage?tool=${encodeURIComponent(state.currentTool)}`, {
+        signal: controller.signal,
+      });
       if (!res.ok) {
         const errorText = await res.text();
         throw new Error(`API error ${res.status}: ${errorText}`);
@@ -199,7 +221,7 @@
 
       const data = await res.json();
       state.currentUsageData = data;
-      state.allSessions = data.sessions || [];
+      state.allSessions = Array.isArray(data.sessions) ? data.sessions : [];
 
       // Update UI components
       updateMetricCards(data.summary || {});
@@ -215,13 +237,20 @@
         elements.lastSyncedBadge.textContent = `Synced ${timeStr}`;
       }
     } catch (err) {
+      if (err.name === 'AbortError') {
+        // Request was aborted by a new user-initiated fetch; silently exit
+        return;
+      }
       console.error('Failed to fetch usage metrics:', err);
       showToast(`Sync failed: ${err.message}`, 'error');
       if (elements.lastSyncedBadge) {
         elements.lastSyncedBadge.textContent = 'Sync error';
       }
     } finally {
-      state.isFetching = false;
+      if (currentAbortController === controller) {
+        currentAbortController = null;
+        state.isFetching = false;
+      }
       if (refreshIcon) {
         setTimeout(() => refreshIcon.classList.remove('spin'), 400);
       }
@@ -272,22 +301,25 @@
     const tbody = elements.modelsTableBody;
     if (!tbody) return;
 
+    const modelList = Array.isArray(models) ? models : [];
+
     if (elements.modelsCountBadge) {
-      elements.modelsCountBadge.textContent = `${models.length} Model${models.length === 1 ? '' : 's'}`;
+      elements.modelsCountBadge.textContent = `${modelList.length} Model${modelList.length === 1 ? '' : 's'}`;
     }
 
-    if (!models || models.length === 0) {
+    if (modelList.length === 0) {
       tbody.innerHTML = '<tr><td colspan="12" class="empty-state">No model usage data recorded.</td></tr>';
       return;
     }
 
     let rowsHtml = '';
-    models.forEach((m) => {
-      const isCodex = m.tool === 'codex' || /gpt|o1|o3/i.test(m.model);
+    modelList.forEach((m) => {
+      const modelName = String(m.model || 'unknown');
+      const isCodex = m.tool === 'codex' || /gpt|o1|o3/i.test(modelName);
       const badgeClass = isCodex ? 'badge-openai' : 'badge-agy';
       const badgeText = isCodex ? 'OpenAI' : 'Google AGY';
 
-      const rates = getModelRates(m.model);
+      const rates = getModelRates(modelName);
       const ratesStr = `$${rates.uncached_input.toFixed(2)} / $${rates.cached_input.toFixed(3)} / $${rates.output.toFixed(2)}`;
 
       const hitRate = Number(m.cache_hit_rate) || 0;
@@ -298,7 +330,7 @@
       rowsHtml += `
         <tr>
           <td>
-            <strong>${escapeHtml(m.model)}</strong>
+            <strong>${escapeHtml(modelName)}</strong>
             <span class="provider-badge ${badgeClass}" style="margin-left: 8px;">${badgeText}</span>
           </td>
           <td class="cell-mono cell-right">${(m.uncached_input || 0).toLocaleString()}</td>
@@ -328,23 +360,25 @@
     const tbody = elements.sessionsTableBody;
     if (!tbody) return;
 
-    const query = state.searchQuery.trim().toLowerCase();
-    let filtered = state.allSessions;
+    const query = String(state.searchQuery || '').trim().toLowerCase();
+    const sessionList = Array.isArray(state.allSessions) ? state.allSessions : [];
+    let filtered = sessionList;
 
     if (query) {
-      filtered = state.allSessions.filter((s) => {
-        const title = (s.title || '').toLowerCase();
-        const model = (s.model || '').toLowerCase();
-        const tool = (s.tool || '').toLowerCase();
-        const id = (s.id || '').toLowerCase();
+      filtered = sessionList.filter((s) => {
+        if (!s || typeof s !== 'object') return false;
+        const title = String(s.title || '').toLowerCase();
+        const model = String(s.model || '').toLowerCase();
+        const tool = String(s.tool || '').toLowerCase();
+        const id = String(s.id || '').toLowerCase();
         return title.includes(query) || model.includes(query) || tool.includes(query) || id.includes(query);
       });
     }
 
     if (elements.sessionsCountBadge) {
       elements.sessionsCountBadge.textContent = query
-        ? `${filtered.length} of ${state.allSessions.length} Sessions`
-        : `${state.allSessions.length} Sessions`;
+        ? `${filtered.length} of ${sessionList.length} Sessions`
+        : `${sessionList.length} Sessions`;
     }
 
     if (filtered.length === 0) {
@@ -357,7 +391,8 @@
     const displayList = filtered.slice(0, 100);
 
     displayList.forEach((s) => {
-      const isCodex = s.tool === 'codex';
+      const toolStr = String(s.tool || '');
+      const isCodex = toolStr === 'codex';
       const badgeClass = isCodex ? 'badge-codex' : 'badge-agy';
       const badgeText = isCodex ? 'Codex' : 'Antigravity';
 
@@ -367,17 +402,20 @@
       else if (hitRate >= 35) hitRateClass = 'hit-rate-mid';
 
       const dateStr = formatDateTime(s.created_at || s.start_time);
+      const titleStr = String(s.title || 'Untitled Session');
+      const idStr = String(s.id || '');
+      const modelStr = String(s.model || 'unknown');
 
       rowsHtml += `
         <tr>
           <td>
-            <strong>${escapeHtml(s.title || 'Untitled Session')}</strong>
-            <div class="text-muted" style="font-size: 11px; font-family: var(--font-mono);">${escapeHtml(s.id || '')}</div>
+            <strong>${escapeHtml(titleStr)}</strong>
+            <div class="text-muted" style="font-size: 11px; font-family: var(--font-mono);">${escapeHtml(idStr)}</div>
           </td>
           <td>
             <span class="provider-badge ${badgeClass}">${badgeText}</span>
           </td>
-          <td class="cell-mono">${escapeHtml(s.model || 'unknown')}</td>
+          <td class="cell-mono">${escapeHtml(modelStr)}</td>
           <td class="cell-mono cell-right"><strong>${(s.total_tokens || 0).toLocaleString()}</strong></td>
           <td class="cell-right">
             <span class="hit-rate-pill ${hitRateClass}">${hitRate.toFixed(1)}%</span>
@@ -423,6 +461,8 @@
       chartTokens.update();
       return;
     }
+
+    Chart.getChart(canvas)?.destroy();
 
     const ctx = canvas.getContext('2d');
     chartTokens = new Chart(ctx, {
@@ -537,6 +577,8 @@
       chartCost.update();
       return;
     }
+
+    Chart.getChart(canvas)?.destroy();
 
     const ctx = canvas.getContext('2d');
     chartCost = new Chart(ctx, {
@@ -688,7 +730,7 @@
     if (elements.toolSelect) {
       elements.toolSelect.addEventListener('change', (e) => {
         state.currentTool = e.target.value;
-        fetchUsageData();
+        fetchUsageData(true);
       });
     }
 
@@ -710,7 +752,7 @@
     // Refresh now button
     if (elements.refreshBtn) {
       elements.refreshBtn.addEventListener('click', () => {
-        fetchUsageData();
+        fetchUsageData(true);
       });
     }
 

@@ -17,9 +17,10 @@ if str(PROJECT_ROOT) not in sys.path:
 import uvicorn
 
 
-def print_banner(host: str, port: int, reload: bool, auto_open: bool) -> None:
+def print_banner(host: str, port: int, reload: bool, auto_open: bool, display_host: str | None = None) -> None:
     """Print an attractive, informative startup banner to the console."""
-    url = f"http://{host}:{port}"
+    target_host = display_host or ("127.0.0.1" if host in ("0.0.0.0", "::") else host)
+    url = f"http://{target_host}:{port}"
     cyan = "\033[96m"
     green = "\033[92m"
     yellow = "\033[93m"
@@ -71,14 +72,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable uvicorn auto-reload",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not (1 <= args.port <= 65535):
+        parser.error(f"Port must be between 1 and 65535 (received: {args.port})")
+    return args
 
 
 def main() -> None:
     """Run the server."""
     args = parse_args()
     reload_enabled = not args.no_reload
-    dashboard_url = f"http://{args.host}:{args.port}"
+    display_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
+    dashboard_url = f"http://{display_host}:{args.port}"
 
     if args.open:
         def _open_tab() -> None:
@@ -96,6 +101,7 @@ def main() -> None:
         port=args.port,
         reload=reload_enabled,
         auto_open=args.open,
+        display_host=display_host,
     )
 
     uvicorn.run(

@@ -111,7 +111,15 @@ def test_aggregator(codex_data: dict, agy_data: dict) -> None:
     c_sum = codex_data["summary"]
     a_sum = agy_data["summary"]
 
-    # Verify odometer math
+    # Verify odometer math (re-sync if live telemetry write occurred during test)
+    if s["total_tokens"] != c_sum["total_tokens"] + a_sum["total_tokens"]:
+        codex_data = parse_codex_usage()
+        agy_data = parse_agy_usage()
+        c_sum = codex_data["summary"]
+        a_sum = agy_data["summary"]
+        all_data = get_tool_usage("all")
+        s = all_data["summary"]
+
     assert s["total_tokens"] == c_sum["total_tokens"] + a_sum["total_tokens"]
     assert s["session_count"] == c_sum["session_count"] + a_sum["session_count"]
     assert s["call_count"] == c_sum["call_count"] + a_sum["call_count"]
