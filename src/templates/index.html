@@ -80,8 +80,9 @@
           <span class="metric-label">Total Tokens</span>
           <div class="metric-icon-wrap" title="Total Tokens Processed">⚡</div>
         </div>
-        <div class="metric-value-container">
-          <div id="odo-total-tokens" class="odometer-container">0</div>
+        <div id="metric-total-tokens-value" class="metric-value-container" aria-live="polite">
+          <div id="odo-total-tokens" class="odometer-container" aria-hidden="true">0</div>
+          <span id="metric-total-tokens-unit" class="metric-value-unit" aria-hidden="true"></span>
         </div>
         <div class="metric-subtext">
           <span id="card-tokens-subtext">Cumulative audit</span>
@@ -108,8 +109,9 @@
           <span class="metric-label">Cached Input</span>
           <div class="metric-icon-wrap" title="Prompt Cache Hits">📦</div>
         </div>
-        <div class="metric-value-container">
-          <div id="odo-cached-tokens" class="odometer-container">0</div>
+        <div id="metric-cached-tokens-value" class="metric-value-container" aria-live="polite">
+          <div id="odo-cached-tokens" class="odometer-container" aria-hidden="true">0</div>
+          <span id="metric-cached-tokens-unit" class="metric-value-unit" aria-hidden="true"></span>
         </div>
         <div class="metric-subtext">
           <span id="card-cached-share">0% of input</span>
@@ -136,8 +138,9 @@
           <span class="metric-label">Output Tokens</span>
           <div class="metric-icon-wrap" title="Model Completions">💬</div>
         </div>
-        <div class="metric-value-container">
-          <div id="odo-output-tokens" class="odometer-container">0</div>
+        <div id="metric-output-tokens-value" class="metric-value-container" aria-live="polite">
+          <div id="odo-output-tokens" class="odometer-container" aria-hidden="true">0</div>
+          <span id="metric-output-tokens-unit" class="metric-value-unit" aria-hidden="true"></span>
         </div>
         <div class="metric-subtext">
           <span id="card-reasoning-subtext">Incl. reasoning</span>

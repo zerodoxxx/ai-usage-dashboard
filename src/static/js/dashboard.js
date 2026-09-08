@@ -51,6 +51,77 @@
   }
 
   /**
+   * Pick a short, single-line representation for the summary token cards.
+   * The exact value remains available through the card's accessible label/title.
+   */
+  function getCompactMetricParts(num) {
+    const numericValue = Number(num);
+    const value = Number.isFinite(numericValue) ? numericValue : 0;
+    const absoluteValue = Math.abs(value);
+    const units = [
+      { threshold: 1e3, suffix: 'K' },
+      { threshold: 1e6, suffix: 'M' },
+      { threshold: 1e9, suffix: 'B' },
+      { threshold: 1e12, suffix: 'T' },
+    ];
+
+    let unitIndex = -1;
+    units.forEach((unit, index) => {
+      if (absoluteValue >= unit.threshold) unitIndex = index;
+    });
+
+    if (unitIndex >= 0) {
+      let unit = units[unitIndex];
+      let scaledValue = value / unit.threshold;
+      let roundedValue = Number(scaledValue.toFixed(1));
+
+      // Avoid awkward values such as 1,000.0K at a unit boundary.
+      if (Math.abs(roundedValue) >= 1000 && unitIndex < units.length - 1) {
+        unit = units[unitIndex + 1];
+        scaledValue = value / unit.threshold;
+        roundedValue = Number(scaledValue.toFixed(1));
+      }
+
+      return {
+        value: roundedValue,
+        decimals: 1,
+        formatCommas: false,
+        suffix: unit.suffix,
+      };
+    }
+
+    return {
+      value,
+      decimals: 0,
+      formatCommas: true,
+      suffix: '',
+    };
+  }
+
+  /**
+   * Update a token metric with compact display text while preserving the full value.
+   */
+  function updateCompactMetric(odometer, unitElement, valueContainer, rawValue, label) {
+    if (!odometer) return;
+
+    const numericValue = Number(rawValue);
+    const value = Number.isFinite(numericValue) ? numericValue : 0;
+    const parts = getCompactMetricParts(value);
+    const fullValue = Math.round(value).toLocaleString();
+
+    odometer.decimals = parts.decimals;
+    odometer.formatCommas = parts.formatCommas;
+    odometer.update(parts.value);
+
+    if (unitElement) unitElement.textContent = parts.suffix;
+    if (valueContainer) {
+      const accessibleValue = `${fullValue} ${label}`;
+      valueContainer.title = accessibleValue;
+      valueContainer.setAttribute('aria-label', accessibleValue);
+    }
+  }
+
+  /**
    * Format date strings cleanly
    */
   function formatDateTime(isoString) {
@@ -279,12 +350,31 @@
     const reasoning = summary.reasoning_output || 0;
     const callCount = summary.call_count || 0;
 
-    // Roll Odometers
-    if (odometers.totalTokens) odometers.totalTokens.update(totalTokens);
+    // Roll Odometers. Token totals use compact units so large values remain readable
+    // within the fixed-width summary cards; tables retain the exact values.
+    updateCompactMetric(
+      odometers.totalTokens,
+      elements.metricTotalTokensUnit,
+      elements.metricTotalTokensValue,
+      totalTokens,
+      'total tokens',
+    );
     if (odometers.totalCost) odometers.totalCost.update(totalCost);
-    if (odometers.cachedTokens) odometers.cachedTokens.update(cachedTokens);
+    updateCompactMetric(
+      odometers.cachedTokens,
+      elements.metricCachedTokensUnit,
+      elements.metricCachedTokensValue,
+      cachedTokens,
+      'cached input tokens',
+    );
     if (odometers.cacheRate) odometers.cacheRate.update(cacheHitRate);
-    if (odometers.outputTokens) odometers.outputTokens.update(outputTokens);
+    updateCompactMetric(
+      odometers.outputTokens,
+      elements.metricOutputTokensUnit,
+      elements.metricOutputTokensValue,
+      outputTokens,
+      'output tokens',
+    );
     if (odometers.sessions) odometers.sessions.update(sessionCount);
 
     // Update Subtexts
@@ -977,6 +1067,13 @@
     elements.refreshInterval = document.getElementById('refresh-interval');
     elements.refreshBtn = document.getElementById('refresh-btn');
     elements.lastSyncedBadge = document.getElementById('last-synced-badge');
+
+    elements.metricTotalTokensValue = document.getElementById('metric-total-tokens-value');
+    elements.metricTotalTokensUnit = document.getElementById('metric-total-tokens-unit');
+    elements.metricCachedTokensValue = document.getElementById('metric-cached-tokens-value');
+    elements.metricCachedTokensUnit = document.getElementById('metric-cached-tokens-unit');
+    elements.metricOutputTokensValue = document.getElementById('metric-output-tokens-value');
+    elements.metricOutputTokensUnit = document.getElementById('metric-output-tokens-unit');
 
     elements.cardSavingsText = document.getElementById('card-savings-text');
     elements.cardTokensSubtext = document.getElementById('card-tokens-subtext');
