@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project is a local-only web dashboard that reads telemetry files already written to your disk by two AI coding tools — **OpenAI Codex** and **Google Antigravity (AGY)** — and presents them as live token metrics, API inference cost estimates, and interactive charts.
+This project is a local-only web dashboard that reads telemetry files already written to your disk by AI coding tools. Built-in adapters support **OpenAI Codex** and **Google Antigravity (AGY)**, and the provider-neutral extraction contract allows additional tools such as Claude Code to be registered without changing aggregation logic.
 
 No API keys, no cloud connections, no subscriptions. Everything runs locally.
 
@@ -159,9 +159,11 @@ This lets you see exactly how much you'd be paying if OpenAI/Google didn't have 
 | `run.py` | CLI entry point — starts uvicorn, optionally opens browser |
 | `src/app.py` | FastAPI app — 4 endpoints: `/`, `/api/usage`, `/api/pricing`, `/api/health` |
 | `src/pricing.py` | 14 model pricing dictionaries + cost calculator |
+| `src/parsers/contracts.py` | Provider-neutral token, event, session, and cost contracts |
+| `src/parsers/source_registry.py` | Provider adapter registry with canonical-key and alias lookup |
 | `src/parsers/codex.py` | Reads Codex rollout JSONL + SQLite, returns structured metrics dict |
 | `src/parsers/agy.py` | Reads AGY transcripts + DBs, estimates tokens, returns structured metrics dict |
-| `src/parsers/aggregator.py` | Runs parsers, merges by canonical model name, slices time windows, rebuilds aggregates, and derives analytics |
+| `src/parsers/aggregator.py` | Runs registered adapters, prices normalized sessions, slices time windows, and derives analytics |
 | `src/static/js/odometer.js` | `RollingOdometer` class — zero-dependency vertical digit animation |
 | `src/static/js/dashboard.js` | All frontend logic: state, polling, Chart.js, table rendering, search |
 | `src/static/css/dashboard.css` | Dark-mode styles — frosted glass cards, badge colours, table layout |
@@ -174,12 +176,15 @@ This lets you see exactly how much you'd be paying if OpenAI/Google didn't have 
 ## Extending It
 
 ### Add a new AI tool
-1. Create `src/parsers/<toolname>.py` returning the same schema as `codex.py` and `agy.py`
-2. Add a case to `src/parsers/aggregator.py → get_tool_usage()`
-3. Add an `<option>` to the `<select id="tool-select">` in `index.html`
+1. Create `src/parsers/<toolname>.py` implementing the `UsageSource` protocol and return normalized `UsageSession` objects from `extract_sessions()`.
+2. Register the adapter in `DEFAULT_SOURCE_REGISTRY`; the aggregator automatically includes it in `tool=all` and resolves its aliases.
+3. If the tool has known prices, register its provider-scoped models in `PricingCatalog`. Unknown models remain explicitly unpriced rather than receiving another provider's fallback rate.
+4. Add an `<option>` to the `<select id="tool-select">` in `index.html` when it should be selectable in the current UI.
+
+New adapters should own only provider-specific discovery and decoding. Token normalization, cost enrichment, time slicing, model/timeline aggregation, and API serialization are shared. The built-in adapters retain their mature legacy parser wrappers during migration, while exposing normalized sessions to the shared pipeline. The contracts include cache-read and cache-write counts plus reported-versus-estimated cost provenance for providers with different billing formats.
 
 ### Add a new model's pricing
-Edit `MODEL_PRICING` in `src/pricing.py` — add a dict with `uncached_input`, `cached_input`, `output` keys ($/1M tokens). Optionally add an alias to `_ALIASES` for fuzzy matching.
+Register a provider/model entry in `PricingCatalog` with `uncached_input`, `cached_input`, and `output` rates ($/1M tokens). Optional `cache_write` or `cache_creation` rates are supported. `MODEL_PRICING`, `get_pricing()`, and `calculate_cost()` remain available for backward compatibility.
 
 ### Change the polling interval default
 Edit `state.autoRefreshInterval` in `dashboard.js` (line ~12). Value is in milliseconds.

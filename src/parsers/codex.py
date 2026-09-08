@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .contracts import UsageSession
 from ..pricing import calculate_cost
 
 logger = logging.getLogger(__name__)
@@ -685,3 +686,56 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
         "timeline": timeline_list,
         "sessions": sessions,
     }
+
+
+def _legacy_sessions_to_contract(
+    result: dict[str, Any],
+) -> list[UsageSession]:
+    """Convert the compatibility parser's sessions to normalized contracts.
+
+    Keeping this conversion at the adapter boundary means the mature rollout
+    parsing and reconciliation code above can continue to handle malformed,
+    partially-written, and historical Codex logs exactly as it does today.
+    Cost values are retained with their existing estimated-cost provenance by
+    ``UsageSession.from_legacy_dict``.
+    """
+    sessions: list[UsageSession] = []
+    for raw_session in result.get("sessions", []):
+        if not isinstance(raw_session, dict):
+            continue
+        session = UsageSession.from_legacy_dict(raw_session)
+        session.provider = "codex"
+        session.tool = "codex"
+        # Session-level model is authoritative for Codex rollout records. A
+        # legacy event does not always include it, so fill it for consumers
+        # that aggregate events by model.
+        for event in session.events:
+            if event.model is None:
+                event.model = session.model
+        sessions.append(session)
+    return sessions
+
+
+class CodexSource:
+    """Provider adapter for Codex state and rollout files.
+
+    ``extract_sessions`` is the provider-neutral entry point. The legacy
+    ``parse_codex_usage`` function remains available for existing API callers.
+    """
+
+    key = "codex"
+    provider = key
+    aliases = ("openai-codex", "codex-cli")
+    default_source_path = Path.home() / ".codex"
+    default_root = default_source_path
+    # ``default_path`` is a convenient spelling for registry/discovery code
+    # that treats source paths generically.
+    default_path = default_source_path
+
+    def extract_sessions(self, root: str | Path | None = None) -> list[UsageSession]:
+        source_root = root if root is not None else self.default_source_path
+        return _legacy_sessions_to_contract(parse_codex_usage(source_root))
+
+
+# Explicit alias for callers that name adapters after the provider/tool.
+CodexUsageSource = CodexSource
