@@ -75,7 +75,7 @@
     toast.className = `toast ${type === 'error' ? 'toast-error' : ''}`;
     toast.innerHTML = `
       <span>${type === 'error' ? '⚠️' : 'ℹ️'}</span>
-      <span>${message}</span>
+      <span>${escapeHtml(String(message))}</span>
     `;
 
     container.appendChild(toast);
@@ -157,9 +157,10 @@
   async function fetchPricing() {
     try {
       const res = await fetch('/api/pricing');
-      if (res.ok) {
-        state.pricingData = await res.json();
+      if (!res.ok) {
+        throw new Error(`Failed to fetch pricing: ${res.status} ${res.statusText}`);
       }
+      state.pricingData = await res.json();
     } catch (e) {
       console.warn('Failed to load pricing table:', e);
     }
@@ -320,7 +321,7 @@
       const badgeText = isCodex ? 'OpenAI' : 'Google AGY';
 
       const rates = getModelRates(modelName);
-      const ratesStr = `$${rates.uncached_input.toFixed(2)} / $${rates.cached_input.toFixed(3)} / $${rates.output.toFixed(2)}`;
+      const ratesStr = `$${(rates?.uncached_input ?? 0).toFixed(2)} / $${(rates?.cached_input ?? 0).toFixed(3)} / $${(rates?.output ?? 0).toFixed(2)}`;
 
       const hitRate = Number(m.cache_hit_rate) || 0;
       let hitRateClass = 'hit-rate-low';
@@ -361,7 +362,9 @@
     if (!tbody) return;
 
     const query = String(state.searchQuery || '').trim().toLowerCase();
-    const sessionList = Array.isArray(state.allSessions) ? state.allSessions : [];
+    const sessionList = (Array.isArray(state.allSessions) ? state.allSessions : []).filter(
+      (s) => s && typeof s === 'object'
+    );
     let filtered = sessionList;
 
     if (query) {
@@ -391,6 +394,7 @@
     const displayList = filtered.slice(0, 100);
 
     displayList.forEach((s) => {
+      if (!s || typeof s !== 'object') return;
       const toolStr = String(s.tool || '');
       const isCodex = toolStr === 'codex';
       const badgeClass = isCodex ? 'badge-codex' : 'badge-agy';
@@ -717,7 +721,7 @@
 
     if (elements.autoRefreshToggle && elements.autoRefreshToggle.checked) {
       state.refreshTimer = setInterval(() => {
-        fetchUsageData();
+        fetchUsageData().catch((err) => console.error('Error in auto-refresh fetchUsageData:', err));
       }, state.autoRefreshInterval);
     }
   }
@@ -730,7 +734,7 @@
     if (elements.toolSelect) {
       elements.toolSelect.addEventListener('change', (e) => {
         state.currentTool = e.target.value;
-        fetchUsageData(true);
+        fetchUsageData(true).catch((err) => console.error('Error fetching usage data on tool select:', err));
       });
     }
 
@@ -752,7 +756,7 @@
     // Refresh now button
     if (elements.refreshBtn) {
       elements.refreshBtn.addEventListener('click', () => {
-        fetchUsageData(true);
+        fetchUsageData(true).catch((err) => console.error('Error on manual refresh:', err));
       });
     }
 
@@ -802,8 +806,16 @@
     setupEventListeners();
 
     // Fetch initial pricing metadata and first usage batch
-    await fetchPricing();
-    await fetchUsageData();
+    try {
+      await fetchPricing();
+    } catch (err) {
+      console.warn('Initial fetchPricing error:', err);
+    }
+    try {
+      await fetchUsageData();
+    } catch (err) {
+      console.error('Initial fetchUsageData error:', err);
+    }
 
     // Start auto-refresh timer
     setupAutoRefresh();
@@ -811,8 +823,10 @@
 
   // Execute on DOM ready
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
+    document.addEventListener('DOMContentLoaded', () => {
+      init().catch((err) => console.error('Initialization error:', err));
+    });
   } else {
-    init();
+    init().catch((err) => console.error('Initialization error:', err));
   }
 })();

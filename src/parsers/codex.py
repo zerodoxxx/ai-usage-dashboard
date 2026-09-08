@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -12,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from ..pricing import calculate_cost
+
+logger = logging.getLogger(__name__)
+
+_ROLLOUT_PARSE_CACHE: dict[tuple[str, float, int], dict[str, Any]] = {}
 
 
 def _to_iso_string(ts: int | float | str | None) -> str:
@@ -33,11 +38,21 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
 
     Extracts incremental and cumulative token usage, timestamps, and call counts.
     """
+    cache_key = None
+    try:
+        stat = file_path.stat()
+        cache_key = (str(file_path.resolve()), stat.st_mtime, stat.st_size)
+        if cache_key in _ROLLOUT_PARSE_CACHE:
+            return dict(_ROLLOUT_PARSE_CACHE[cache_key])
+    except OSError as e:
+        logger.debug("Failed to stat rollout file %s: %s", file_path, e)
+
     call_count = 0
+    extracted_model: str | None = None
     first_timestamp: str | None = None
     last_timestamp: str | None = None
 
-    last_cumulative: dict[str, int] | None = None
+    last_cumulative: dict[str, Any] | None = None
     sum_incremental = {
         "input_tokens": 0,
         "cached_input_tokens": 0,
@@ -52,9 +67,14 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
                 line_str = line.strip()
                 if not line_str:
                     continue
+                if "token" not in line_str and "session_meta" not in line_str:
+                    continue
                 try:
                     record = json.loads(line_str)
                 except Exception:
+                    continue
+
+                if not isinstance(record, dict):
                     continue
 
                 ts = record.get("timestamp")
@@ -64,17 +84,30 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
                     last_timestamp = str(ts)
 
                 rec_type = record.get("type")
-                payload = record.get("payload") or {}
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    payload = {}
+
+                if rec_type == "session_meta" and isinstance(payload, dict):
+                    prov = payload.get("provenance")
+                    if isinstance(prov, dict):
+                        extracted_model = prov.get("model")
+                    if not extracted_model:
+                        extracted_model = payload.get("model")
+                    if extracted_model:
+                        extracted_model = str(extracted_model).strip()
 
                 # Format 1: token_usage_record
-                if rec_type == "token_usage_record":
+                elif rec_type == "token_usage_record":
                     call_count += 1
-                    u = payload.get("usage") or {}
-                    sum_incremental["input_tokens"] += u.get("input_tokens", 0)
-                    sum_incremental["cached_input_tokens"] += u.get("cached_input_tokens", 0)
-                    sum_incremental["output_tokens"] += u.get("output_tokens", 0)
-                    sum_incremental["reasoning_output_tokens"] += u.get("reasoning_output_tokens", 0)
-                    sum_incremental["total_tokens"] += u.get("total_tokens", 0)
+                    u = payload.get("usage")
+                    if not isinstance(u, dict):
+                        u = {}
+                    sum_incremental["input_tokens"] += u.get("input_tokens") or 0
+                    sum_incremental["cached_input_tokens"] += u.get("cached_input_tokens") or 0
+                    sum_incremental["output_tokens"] += u.get("output_tokens") or 0
+                    sum_incremental["reasoning_output_tokens"] += u.get("reasoning_output_tokens") or 0
+                    sum_incremental["total_tokens"] += u.get("total_tokens") or 0
 
                     thread_cum = payload.get("thread_token_usage") or payload.get("turn_token_usage")
                     if isinstance(thread_cum, dict) and thread_cum:
@@ -82,27 +115,30 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
 
                 # Format 2: event_msg with payload.type == 'token_count'
                 elif rec_type == "event_msg" and payload.get("type") == "token_count":
-                    call_count += 1
-                    info = payload.get("info") or {}
-                    last_u = info.get("last_token_usage") or {}
-                    sum_incremental["input_tokens"] += last_u.get("input_tokens", 0)
-                    sum_incremental["cached_input_tokens"] += last_u.get("cached_input_tokens", 0)
-                    sum_incremental["output_tokens"] += last_u.get("output_tokens", 0)
-                    sum_incremental["reasoning_output_tokens"] += last_u.get("reasoning_output_tokens", 0)
-                    sum_incremental["total_tokens"] += last_u.get("total_tokens", 0)
+                    info = payload.get("info")
+                    if not isinstance(info, dict):
+                        info = {}
+                    last_u = info.get("last_token_usage")
+                    if not isinstance(last_u, dict):
+                        last_u = {}
+                    sum_incremental["input_tokens"] += last_u.get("input_tokens") or 0
+                    sum_incremental["cached_input_tokens"] += last_u.get("cached_input_tokens") or 0
+                    sum_incremental["output_tokens"] += last_u.get("output_tokens") or 0
+                    sum_incremental["reasoning_output_tokens"] += last_u.get("reasoning_output_tokens") or 0
+                    sum_incremental["total_tokens"] += last_u.get("total_tokens") or 0
 
                     tot_u = info.get("total_token_usage")
                     if isinstance(tot_u, dict) and tot_u:
                         last_cumulative = tot_u
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Error reading rollout file %s: %s", file_path, e)
 
     if last_cumulative:
-        input_tokens = int(last_cumulative.get("input_tokens", 0))
-        cached_input_tokens = int(last_cumulative.get("cached_input_tokens", 0))
-        output_tokens = int(last_cumulative.get("output_tokens", 0))
-        reasoning_output_tokens = int(last_cumulative.get("reasoning_output_tokens", 0))
-        total_tokens = int(last_cumulative.get("total_tokens", input_tokens + output_tokens))
+        input_tokens = int(last_cumulative.get("input_tokens") or 0)
+        cached_input_tokens = int(last_cumulative.get("cached_input_tokens") or 0)
+        output_tokens = int(last_cumulative.get("output_tokens") or 0)
+        reasoning_output_tokens = int(last_cumulative.get("reasoning_output_tokens") or 0)
+        total_tokens = int(last_cumulative.get("total_tokens") or (input_tokens + output_tokens))
     else:
         input_tokens = sum_incremental["input_tokens"]
         cached_input_tokens = sum_incremental["cached_input_tokens"]
@@ -112,7 +148,7 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
 
     uncached_input_tokens = max(0, input_tokens - cached_input_tokens)
 
-    return {
+    result = {
         "call_count": call_count,
         "input_tokens": input_tokens,
         "cached_input_tokens": cached_input_tokens,
@@ -122,7 +158,11 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
         "total_tokens": total_tokens,
         "start_time": first_timestamp,
         "end_time": last_timestamp,
+        "model": extracted_model,
     }
+    if cache_key is not None:
+        _ROLLOUT_PARSE_CACHE[cache_key] = result
+    return dict(result)
 
 
 def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
@@ -193,6 +233,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
                 conn = sqlite3.connect(str(db_path))
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
+            cursor.execute("PRAGMA query_only = ON;")
             cursor.execute(
                 """
                 SELECT id, title, model, reasoning_effort, tokens_used, created_at, rollout_path
@@ -201,8 +242,9 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
             )
             for row in cursor.fetchall():
                 threads_data.append(dict(row))
-        except Exception:
-            pass
+            cursor.close()
+        except Exception as e:
+            logger.warning("Error querying Codex SQLite database %s: %s", db_path, e)
         finally:
             if conn is not None:
                 try:
@@ -303,7 +345,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
         # Extract UUID or basename
         match = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", rpath.name)
         orphan_id = match.group(1) if match else rpath.stem
-        orphan_model = "gpt-5.6-luna"
+        orphan_model = parsed.get("model") or "gpt-5.6-luna"
         created_at_iso = parsed["start_time"] or ""
 
         cost = calculate_cost(orphan_model, parsed["uncached_input_tokens"], parsed["cached_input_tokens"], parsed["output_tokens"])

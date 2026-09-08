@@ -42,6 +42,11 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
         "cached_input": 7.50,
         "output": 60.00,
     },
+    "o1-mini": {
+        "uncached_input": 1.10,
+        "cached_input": 0.55,
+        "output": 4.40,
+    },
     "o3-mini": {
         "uncached_input": 1.10,
         "cached_input": 0.55,
@@ -105,7 +110,7 @@ _ALIASES: list[tuple[str, str]] = [
     ("gpt-5.5", "gpt-5.6-luna"),
     ("o3-mini", "o3-mini"),
     ("o3", "o3-mini"),
-    ("o1-mini", "o1"),
+    ("o1-mini", "o1-mini"),
     ("o1-preview", "o1"),
     ("o1", "o1"),
     ("gpt-4o-mini", "gpt-4o-mini"),
@@ -141,8 +146,8 @@ def get_pricing(model_name: str | None) -> dict[str, float]:
             return dict(MODEL_PRICING[target])
 
     # 3. Partial substring matching against canonical keys
-    for key_lower, canonical_key in _NORMALIZED_MAP.items():
-        if key_lower in raw_norm or raw_norm in key_lower:
+    for key_lower, canonical_key in sorted(_NORMALIZED_MAP.items(), key=lambda x: len(x[0]), reverse=True):
+        if key_lower in raw_norm:
             return dict(MODEL_PRICING[canonical_key])
 
     # 4. Fallback if "gemini" is present anywhere
@@ -155,9 +160,9 @@ def get_pricing(model_name: str | None) -> dict[str, float]:
 
 def calculate_cost(
     model_name: str | None,
-    uncached_input: int,
-    cached_input: int,
-    output: int,
+    uncached_input: int | None,
+    cached_input: int | None,
+    output: int | None,
 ) -> dict[str, float]:
     """Calculate the estimated USD cost of token usage with and without caching.
 
@@ -178,9 +183,9 @@ def calculate_cost(
     cached_rate = rates["cached_input"] / 1_000_000.0
     output_rate = rates["output"] / 1_000_000.0
 
-    u_in = max(0, uncached_input)
-    c_in = max(0, cached_input)
-    out = max(0, output)
+    u_in = max(0, uncached_input or 0)
+    c_in = max(0, cached_input or 0)
+    out = max(0, output or 0)
 
     cost_cached = (u_in * uncached_rate) + (c_in * cached_rate) + (out * output_rate)
     cost_uncached = ((u_in + c_in) * uncached_rate) + (out * output_rate)
