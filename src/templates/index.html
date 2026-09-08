@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Tools Usage & Cost Visualizer</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='25' fill='%236366f1'/><path d='M30 70 L50 30 L70 70 Z' fill='none' stroke='white' stroke-width='10' stroke-linejoin='round'/></svg>">
+  <link rel="stylesheet" href="/static/css/dashboard.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <div class="dashboard-container">
+    <!-- Header Bar -->
+    <header class="dashboard-header">
+      <div class="brand-section">
+        <div class="brand-logo-icon">AI</div>
+        <div class="brand-titles">
+          <h1>
+            AI Usage & Cost Visualizer
+            <span class="live-badge">
+              <span class="pulse-dot"></span>
+              Live Telemetry
+            </span>
+          </h1>
+          <div class="subtitle">Real-time local auditing & cost breakdown for Codex & Antigravity (AGY)</div>
+        </div>
+      </div>
+
+      <div class="header-controls">
+        <div class="control-group">
+          <select id="tool-select" class="select-control tool-select-control" title="Select AI Tool Filter">
+            <option value="all" selected>All AI Tools (Combined)</option>
+            <option value="codex">OpenAI Codex</option>
+            <option value="agy">AGY (Google Antigravity)</option>
+          </select>
+        </div>
+
+        <div class="control-group">
+          <label class="toggle-wrapper" title="Toggle Auto-Refresh">
+            <span class="switch">
+              <input type="checkbox" id="auto-refresh-toggle" checked>
+              <span class="slider"></span>
+            </span>
+            <span>Auto Refresh</span>
+          </label>
+
+          <select id="refresh-interval" class="select-control" title="Auto Refresh Interval">
+            <option value="10000">10s</option>
+            <option value="30000" selected>30s</option>
+            <option value="60000">60s</option>
+          </select>
+        </div>
+
+        <div class="control-group">
+          <button id="refresh-btn" class="btn-refresh" title="Trigger Instant Refresh">
+            <svg class="refresh-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+            </svg>
+            Refresh Now
+          </button>
+        </div>
+
+        <span id="last-synced-badge" class="synced-badge">Syncing...</span>
+      </div>
+    </header>
+
+    <!-- 6 Odometer Metric Cards -->
+    <section class="metrics-grid" aria-label="Key Usage Metrics">
+      <!-- Card 1: Total Tokens -->
+      <div class="metric-card card-tokens">
+        <div class="metric-header">
+          <span class="metric-label">Total Tokens</span>
+          <div class="metric-icon-wrap" title="Total Tokens Processed">⚡</div>
+        </div>
+        <div class="metric-value-container">
+          <div id="odo-total-tokens" class="odometer-container">0</div>
+        </div>
+        <div class="metric-subtext">
+          <span>Cumulative audit</span>
+        </div>
+      </div>
+
+      <!-- Card 2: Total Cost -->
+      <div class="metric-card card-cost">
+        <div class="metric-header">
+          <span class="metric-label">Est. API Cost</span>
+          <div class="metric-icon-wrap" title="Estimated API Spend">💰</div>
+        </div>
+        <div class="metric-value-container">
+          <div id="odo-total-cost" class="odometer-container">$0.00</div>
+        </div>
+        <div class="metric-subtext">
+          <span id="card-savings-text" class="text-success">Saved $0.00 cached</span>
+        </div>
+      </div>
+
+      <!-- Card 3: Cached Input Tokens -->
+      <div class="metric-card card-cached">
+        <div class="metric-header">
+          <span class="metric-label">Cached Input</span>
+          <div class="metric-icon-wrap" title="Prompt Cache Hits">📦</div>
+        </div>
+        <div class="metric-value-container">
+          <div id="odo-cached-tokens" class="odometer-container">0</div>
+        </div>
+        <div class="metric-subtext">
+          <span id="card-cached-share">0% of input</span>
+        </div>
+      </div>
+
+      <!-- Card 4: Cache Hit Rate -->
+      <div class="metric-card card-rate">
+        <div class="metric-header">
+          <span class="metric-label">Cache Hit Rate</span>
+          <div class="metric-icon-wrap" title="Prompt Cache Efficiency">🎯</div>
+        </div>
+        <div class="metric-value-container">
+          <div id="odo-cache-rate" class="odometer-container">0.00%</div>
+        </div>
+        <div class="metric-subtext">
+          <span>Prompt cache reuse</span>
+        </div>
+      </div>
+
+      <!-- Card 5: Output Tokens -->
+      <div class="metric-card card-output">
+        <div class="metric-header">
+          <span class="metric-label">Output Tokens</span>
+          <div class="metric-icon-wrap" title="Model Completions">💬</div>
+        </div>
+        <div class="metric-value-container">
+          <div id="odo-output-tokens" class="odometer-container">0</div>
+        </div>
+        <div class="metric-subtext">
+          <span id="card-reasoning-subtext">Incl. reasoning</span>
+        </div>
+      </div>
+
+      <!-- Card 6: Active Sessions -->
+      <div class="metric-card card-sessions">
+        <div class="metric-header">
+          <span class="metric-label">Active Sessions</span>
+          <div class="metric-icon-wrap" title="Tracked Conversation Sessions">📂</div>
+        </div>
+        <div class="metric-value-container">
+          <div id="odo-sessions" class="odometer-container">0</div>
+        </div>
+        <div class="metric-subtext">
+          <span id="card-calls-subtext">0 API calls recorded</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Charts Section -->
+    <section class="charts-grid" aria-label="Visual Trends">
+      <!-- Chart 1: Token Breakdown per Model -->
+      <div class="chart-card">
+        <div class="chart-header">
+          <div>
+            <div class="chart-title">Token Distribution by Model</div>
+            <div class="chart-subtitle">Breakdown of cached vs uncached input, output & reasoning</div>
+          </div>
+        </div>
+        <div class="chart-canvas-wrap">
+          <canvas id="chart-tokens"></canvas>
+        </div>
+      </div>
+
+      <!-- Chart 2: Cost & Daily Trend -->
+      <div class="chart-card">
+        <div class="chart-header">
+          <div>
+            <div class="chart-title">Daily Cost & Token Trend</div>
+            <div class="chart-subtitle">Timeline tracking daily API spend and token volume</div>
+          </div>
+        </div>
+        <div class="chart-canvas-wrap">
+          <canvas id="chart-cost"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <!-- Per-Model Granularity Table -->
+    <section class="section-card" aria-label="Per-Model Granularity Table">
+      <div class="section-header">
+        <div class="section-title">
+          <span>Per-Model Granularity Table</span>
+          <span id="models-count-badge" class="counter-badge">0 Models</span>
+        </div>
+      </div>
+
+      <div class="table-responsive">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Model & Provider</th>
+              <th class="cell-right">Uncached Input</th>
+              <th class="cell-right">Cached Input</th>
+              <th class="cell-right">Total Input</th>
+              <th class="cell-right">Output</th>
+              <th class="cell-right">Reasoning / Thoughts</th>
+              <th class="cell-right">Total Tokens</th>
+              <th class="cell-right">Cache Hit %</th>
+              <th class="cell-right">API Rates ($/1M In / Cache / Out)</th>
+              <th class="cell-right">Est. Cost (Cached)</th>
+              <th class="cell-right">Est. Cost (Uncached)</th>
+              <th class="cell-right">Net Savings ($)</th>
+            </tr>
+          </thead>
+          <tbody id="models-table-body">
+            <tr>
+              <td colspan="12" class="empty-state">Loading model metrics...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="table-footnote">
+        <span>ℹ️ Calculation Formula:</span>
+        <code>API Cost = (Uncached Input × Rate + Cached Input × Rate + Output × Rate) / 1,000,000</code>
+      </div>
+    </section>
+
+    <!-- Recent Sessions Explorer -->
+    <section class="section-card" aria-label="Recent Sessions Explorer">
+      <div class="section-header">
+        <div class="section-title">
+          <span>Recent Sessions Explorer</span>
+          <span id="sessions-count-badge" class="counter-badge">0 Sessions</span>
+        </div>
+
+        <div class="control-group">
+          <div class="search-box">
+            <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="11" cy="11" r="8"></circle>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            </svg>
+            <input type="text" id="sessions-search" class="search-input" placeholder="Search sessions by title, model, or ID...">
+          </div>
+        </div>
+      </div>
+
+      <div class="table-responsive">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Session Title</th>
+              <th>Tool</th>
+              <th>Model</th>
+              <th class="cell-right">Total Tokens</th>
+              <th class="cell-right">Cache Hit %</th>
+              <th class="cell-right">Est. Cost</th>
+              <th class="cell-right">Date / Time</th>
+            </tr>
+          </thead>
+          <tbody id="sessions-table-body">
+            <tr>
+              <td colspan="7" class="empty-state">Loading sessions...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <div id="toast-container" class="toast-container"></div>
+
+  <!-- Scripts -->
+  <script src="/static/js/odometer.js"></script>
+  <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
