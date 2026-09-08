@@ -58,6 +58,8 @@ def get_tool_usage(
     # Aggregating all tools
     codex_data = parse_codex_usage(codex_dir)
     agy_data = parse_agy_usage(agy_dir)
+    codex_data = codex_data if isinstance(codex_data, dict) else {}
+    agy_data = agy_data if isinstance(agy_data, dict) else {}
 
     # 1. Merge summaries
     c_sum = codex_data.get("summary") if isinstance(codex_data, dict) and isinstance(codex_data.get("summary"), dict) else {}

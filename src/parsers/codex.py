@@ -61,6 +61,7 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
         "total_tokens": 0,
     }
 
+    has_error = False
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
@@ -131,6 +132,7 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
                     if isinstance(tot_u, dict) and tot_u:
                         last_cumulative = tot_u
     except Exception as e:
+        has_error = True
         logger.warning("Error reading rollout file %s: %s", file_path, e)
 
     if last_cumulative:
@@ -149,7 +151,7 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
     uncached_input_tokens = max(0, input_tokens - cached_input_tokens)
 
     result = {
-        "call_count": call_count,
+        "call_count": max(1, call_count) if total_tokens > 0 else call_count,
         "input_tokens": input_tokens,
         "cached_input_tokens": cached_input_tokens,
         "uncached_input_tokens": uncached_input_tokens,
@@ -160,7 +162,7 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
         "end_time": last_timestamp,
         "model": extracted_model,
     }
-    if cache_key is not None:
+    if cache_key is not None and not has_error:
         _ROLLOUT_PARSE_CACHE[cache_key] = result
     return dict(result)
 

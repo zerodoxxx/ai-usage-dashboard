@@ -177,11 +177,12 @@
       return state.pricingData[modelName];
     }
     const norm = (modelName || '').toLowerCase().trim();
-    for (const [k, v] of Object.entries(state.pricingData)) {
+    const sortedPricing = Object.entries(state.pricingData).sort((a, b) => b[0].length - a[0].length);
+    for (const [k, v] of sortedPricing) {
       if (k.toLowerCase() === norm) return v;
     }
-    for (const [k, v] of Object.entries(state.pricingData)) {
-      if (norm.includes(k.toLowerCase()) || k.toLowerCase().includes(norm)) return v;
+    for (const [k, v] of sortedPricing) {
+      if (norm.includes(k.toLowerCase())) return v;
     }
     if (norm.includes('gemini')) {
       return state.pricingData['Gemini 3.8 Flash (High)'] || { uncached_input: 0.10, cached_input: 0.025, output: 0.40 };
@@ -450,11 +451,12 @@
     const canvas = elements.chartTokensCanvas;
     if (!canvas) return;
 
-    const labels = models.map((m) => m.model);
-    const uncachedData = models.map((m) => m.uncached_input || 0);
-    const cachedData = models.map((m) => m.cached_input || 0);
-    const outputData = models.map((m) => m.output || 0);
-    const reasoningData = models.map((m) => m.reasoning_output || 0);
+    const modelList = (Array.isArray(models) ? models : []).filter((m) => m && typeof m === 'object');
+    const labels = modelList.map((m) => m.model);
+    const uncachedData = modelList.map((m) => m.uncached_input || 0);
+    const cachedData = modelList.map((m) => m.cached_input || 0);
+    const outputData = modelList.map((m) => m.output || 0);
+    const reasoningData = modelList.map((m) => m.reasoning_output || 0);
 
     if (chartTokens) {
       chartTokens.data.labels = labels;
@@ -569,7 +571,8 @@
     const canvas = elements.chartCostCanvas;
     if (!canvas) return;
 
-    const sortedTimeline = [...timeline].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    const timelineList = (Array.isArray(timeline) ? timeline : []).filter((t) => t && typeof t === 'object');
+    const sortedTimeline = [...timelineList].sort((a, b) => String(a.date).localeCompare(String(b.date)));
     const labels = sortedTimeline.map((t) => t.date);
     const costData = sortedTimeline.map((t) => t.cost_cached_usd || 0);
     const tokenData = sortedTimeline.map((t) => t.total_tokens || 0);
