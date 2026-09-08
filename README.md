@@ -52,11 +52,13 @@ python test_server.py    # API endpoint tests
 ```
 src/
 ├── app.py             # FastAPI server
-├── pricing.py         # 14 model pricing rates
+├── pricing.py         # Provider-aware pricing catalog
 ├── parsers/
 │   ├── codex.py       # Codex JSONL + SQLite parser
 │   ├── agy.py         # AGY transcript + DB parser
-│   └── aggregator.py  # Multi-tool aggregator
+│   ├── contracts.py   # Normalized usage contracts
+│   ├── source_registry.py # Provider adapter registry
+│   └── aggregator.py  # Registration-driven aggregator
 ├── static/js/
 │   ├── odometer.js    # RollingOdometer (zero-dependency)
 │   └── dashboard.js   # UI controller

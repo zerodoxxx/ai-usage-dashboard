@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .contracts import UsageSession
 from ..pricing import calculate_cost
 
 logger = logging.getLogger(__name__)
@@ -614,3 +615,41 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
     }
     _cache_result(cache_key, result)
     return copy.deepcopy(result)
+
+
+def _legacy_sessions_to_contract(
+    result: dict[str, Any],
+) -> list[UsageSession]:
+    """Convert parsed AGY sessions into provider-neutral usage contracts."""
+    sessions: list[UsageSession] = []
+    for raw_session in result.get("sessions", []):
+        if not isinstance(raw_session, dict):
+            continue
+        session = UsageSession.from_legacy_dict(raw_session)
+        session.provider = "antigravity"
+        session.tool = "antigravity"
+        for event in session.events:
+            if event.model is None:
+                event.model = session.model
+        sessions.append(session)
+    return sessions
+
+
+class AntigravitySource:
+    """Provider adapter for Antigravity transcripts and metadata databases."""
+
+    key = "antigravity"
+    provider = key
+    aliases = ("agy", "antigravity-cli")
+    default_source_path = Path.home() / ".gemini" / "antigravity-cli"
+    default_root = default_source_path
+    default_path = default_source_path
+
+    def extract_sessions(self, root: str | Path | None = None) -> list[UsageSession]:
+        source_root = root if root is not None else self.default_source_path
+        return _legacy_sessions_to_contract(parse_agy_usage(source_root))
+
+
+# Short alias retained for callers that refer to the provider as AGY.
+AGYSource = AntigravitySource
+AntigravityUsageSource = AntigravitySource
