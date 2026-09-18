@@ -43,7 +43,7 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "o1-mini": {"uncached_input": 1.10, "cached_input": 0.55, "output": 4.40},
     "o3-mini": {"uncached_input": 1.10, "cached_input": 0.55, "output": 4.40},
     # Google Gemini / Antigravity (AGY)
-    "Gemini 3.8 Flash (High)": {"uncached_input": 0.10, "cached_input": 0.025, "output": 0.40},
+    "Gemini 3.8 Flash (High)": {"uncached_input": 0.75, "cached_input": 0.075, "output": 3.75},
     "Gemini 2.5 Flash": {"uncached_input": 0.30, "cached_input": 0.075, "output": 2.50},
     "Gemini 2.5 Pro": {"uncached_input": 1.25, "cached_input": 0.3125, "output": 10.00},
     "Gemini 1.5 Flash": {"uncached_input": 0.075, "cached_input": 0.01875, "output": 0.30},
