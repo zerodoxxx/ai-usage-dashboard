@@ -41,8 +41,7 @@ def _timestamp(value: Any) -> datetime | None:
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, datetime):
-        return (value.replace(tzinfo=timezone.utc) if value.tzinfo is None
-                else value.astimezone(timezone.utc))
+        return value.astimezone(timezone.utc)
     if isinstance(value, (int, float)):
         try:
             seconds = float(value)
@@ -63,8 +62,7 @@ def _timestamp(value: Any) -> datetime | None:
         pass
     try:
         parsed = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw)
-        return (parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None
-                else parsed.astimezone(timezone.utc))
+        return parsed.astimezone(timezone.utc)
     except (TypeError, ValueError, OverflowError):
         return None
 

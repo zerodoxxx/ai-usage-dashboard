@@ -1,6 +1,6 @@
 """Tests for DeepSeek peak/off-peak pricing and time-based resolution."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from src.pricing import (
     DEEPSEEK_OFF_PEAK_PRICING,
@@ -13,6 +13,7 @@ from src.pricing import (
     get_pricing_strict,
     is_deepseek_peak_utc,
     resolve_pricing_strict,
+    to_utc_datetime,
 )
 
 
@@ -268,4 +269,75 @@ def test_aggregator_refresh_estimated_session_cost_peak_and_off_peak() -> None:
     assert float(session_off.cost.uncached_usd) == 0.90
     assert session_off.events[0].cost is not None
     assert float(session_off.events[0].cost.cached_usd) == 0.753
+
+
+def test_to_utc_datetime_and_timezone_resolution() -> None:
+    # 1. Test aware datetime with explicit timezone offset (+05:30 IST and -04:00 EDT)
+    tz_ist = timezone(timedelta(hours=5, minutes=30))
+    # Wednesday 11:30 IST = 06:00 UTC -> Peak (06:00 - 10:00 UTC)
+    dt_ist_peak = datetime(2026, 9, 16, 11, 30, tzinfo=tz_ist)
+    assert is_deepseek_peak_utc(dt_ist_peak) is True
+    assert is_deepseek_peak_utc("2026-09-16T11:30:00+05:30") is True
+
+    # Wednesday 09:30 IST = 04:00 UTC -> Off-peak
+    dt_ist_off = datetime(2026, 9, 16, 9, 30, tzinfo=tz_ist)
+    assert is_deepseek_peak_utc(dt_ist_off) is False
+    assert is_deepseek_peak_utc("2026-09-16T09:30:00+05:30") is False
+
+    # EDT (-04:00)
+    tz_edt = timezone(timedelta(hours=-4))
+    # Wednesday 02:30 EDT = 06:30 UTC -> Peak
+    dt_edt_peak = datetime(2026, 9, 16, 2, 30, tzinfo=tz_edt)
+    assert is_deepseek_peak_utc(dt_edt_peak) is True
+    assert is_deepseek_peak_utc("2026-09-16T02:30:00-04:00") is True
+
+    # Wednesday 00:30 EDT = 04:30 UTC -> Off-peak
+    dt_edt_off = datetime(2026, 9, 16, 0, 30, tzinfo=tz_edt)
+    assert is_deepseek_peak_utc(dt_edt_off) is False
+    assert is_deepseek_peak_utc("2026-09-16T00:30:00-04:00") is False
+
+    # 2. Test to_utc_datetime resolves naive datetime and naive ISO string using system local time
+    local_tz = datetime.now().astimezone().tzinfo
+    naive_dt = datetime(2026, 9, 16, 12, 0, 0)
+    expected_utc = naive_dt.replace(tzinfo=local_tz).astimezone(timezone.utc)
+
+    utc_res = to_utc_datetime(naive_dt)
+    assert utc_res is not None
+    assert utc_res == expected_utc
+    assert utc_res.tzinfo == timezone.utc
+
+    utc_iso_res = to_utc_datetime("2026-09-16T12:00:00")
+    assert utc_iso_res is not None
+    assert utc_iso_res == expected_utc
+    assert utc_iso_res.tzinfo == timezone.utc
+
+    # 3. Dynamic test: naive datetime corresponding to peak and off-peak UTC
+    target_utc_peak = datetime(2026, 9, 16, 6, 30, tzinfo=timezone.utc)
+    local_peak = target_utc_peak.astimezone(local_tz)
+    naive_local_peak = datetime(
+        local_peak.year, local_peak.month, local_peak.day,
+        local_peak.hour, local_peak.minute, local_peak.second
+    )
+    assert is_deepseek_peak_utc(naive_local_peak) is True
+    assert is_deepseek_peak_utc(naive_local_peak.isoformat()) is True
+
+    target_utc_off = datetime(2026, 9, 16, 4, 30, tzinfo=timezone.utc)
+    local_off = target_utc_off.astimezone(local_tz)
+    naive_local_off = datetime(
+        local_off.year, local_off.month, local_off.day,
+        local_off.hour, local_off.minute, local_off.second
+    )
+    assert is_deepseek_peak_utc(naive_local_off) is False
+    assert is_deepseek_peak_utc(naive_local_off.isoformat()) is False
+
+
+def test_contracts_timestamp_naive_interpreted_as_local() -> None:
+    from src.parsers.contracts import _timestamp
+    local_tz = datetime.now().astimezone().tzinfo
+    naive_dt = datetime(2026, 9, 16, 12, 0, 0)
+    expected_utc = naive_dt.replace(tzinfo=local_tz).astimezone(timezone.utc)
+
+    assert _timestamp(naive_dt) == expected_utc
+    assert _timestamp("2026-09-16T12:00:00") == expected_utc
+
 

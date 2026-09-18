@@ -217,17 +217,15 @@ def normalize_provider(provider: str | None) -> str | None:
     return _PROVIDER_ALIASES.get(normalized, normalized or None)
 
 
-def is_deepseek_peak_utc(dt: Any) -> bool:
-    """Determine if a datetime or timestamp falls within DeepSeek peak hours.
+def to_utc_datetime(dt: Any) -> datetime | None:
+    """Resolve any timestamp, datetime, or date string to an aware UTC datetime.
 
-    Peak hours:
-        01:00 - 04:00 and 06:00 - 10:00 UTC, Monday through Friday.
-        (All other hours and weekends are off-peak).
-    If dt is None or cannot be parsed, default to True (peak) to ensure
-    usage and costs are never understated.
+    Naive datetimes and strings without timezone information are interpreted as
+    the user's local system time and converted to UTC via ``astimezone(timezone.utc)``.
+    Aware datetimes are converted directly to UTC.
     """
     if dt is None:
-        return True
+        return None
     parsed_dt: datetime | None = None
     if isinstance(dt, datetime):
         parsed_dt = dt
@@ -242,7 +240,7 @@ def is_deepseek_peak_utc(dt: Any) -> bool:
                 secs = val
             parsed_dt = datetime.fromtimestamp(secs, timezone.utc)
         except (ValueError, OverflowError, OSError):
-            return True
+            return None
     elif isinstance(dt, str):
         raw = dt.strip()
         try:
@@ -260,24 +258,45 @@ def is_deepseek_peak_utc(dt: Any) -> bool:
             try:
                 parsed_dt = datetime.fromisoformat(raw)
             except Exception:
-                return True
+                return None
     else:
-        return True
+        return None
 
     if not isinstance(parsed_dt, datetime):
-        return True
-    try:
-        if parsed_dt.tzinfo is None:
-            parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
-        else:
-            parsed_dt = parsed_dt.astimezone(timezone.utc)
+        return None
 
-        if parsed_dt.weekday() >= 5:
-            return False
-        t = parsed_dt.time()
-        return (time(1, 0) <= t < time(4, 0)) or (time(6, 0) <= t < time(10, 0))
+    try:
+        # If naive, astimezone(timezone.utc) interprets it as local time and converts to UTC
+        return parsed_dt.astimezone(timezone.utc)
     except Exception:
+        return None
+
+
+def is_deepseek_peak_utc(dt: Any) -> bool:
+    """Determine if a datetime or timestamp falls within DeepSeek peak hours.
+
+    Resolves user local time -> UTC before evaluating against peak windows.
+    Peak hours:
+        01:00 - 04:00 and 06:00 - 10:00 UTC, Monday through Friday.
+        (All other hours and weekends are off-peak).
+    If dt is None or cannot be parsed, default to True (peak) to ensure
+    usage and costs are never understated.
+    """
+    utc_dt = to_utc_datetime(dt)
+    if utc_dt is None:
         return True
+
+    # Monday is 0, Friday is 4, Saturday is 5, Sunday is 6
+    if utc_dt.weekday() >= 5:
+        return False
+
+    t = utc_dt.time()
+    # 01:00 - 04:00 and 06:00 - 10:00 UTC
+    if time(1, 0) <= t < time(4, 0):
+        return True
+    if time(6, 0) <= t < time(10, 0):
+        return True
+    return False
 
 
 class PricingCatalog:
@@ -1047,7 +1066,7 @@ __all__ = [
     "DEFAULT_MODEL", "DEFAULT_PRICING_CATALOG", "DEEPSEEK_OFF_PEAK_PRICING", "MODEL_PRICING", "PRICING_CATALOG",
     "PricingCatalog", "PricingEntry", "PricingRates", "PricingResolution",
     "calculate_cost", "calculate_cost_strict", "get_pricing", "get_pricing_strict",
-    "is_deepseek_peak_utc",
+    "is_deepseek_peak_utc", "to_utc_datetime",
     "normalize_provider", "resolve_cost_strict", "resolve_pricing_strict",
     "OPENAI_PRICING_URL", "OPENAI_PRICING_TTL_SECONDS", "pricing_cache_path",
     "parse_openai_standard_pricing", "refresh_openai_pricing", "pricing_metadata",
