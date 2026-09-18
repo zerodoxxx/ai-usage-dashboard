@@ -80,4 +80,4 @@ def test_current_claude_and_deepseek_models_have_pricing() -> None:
 
     flash = get_pricing_strict("deepseek-v4-flash", provider="deepseek")
     assert flash.status == "known"
-    assert flash.rates == PricingRates(0.44, 0.014, 1.32)
+    assert flash.rates == PricingRates(0.30, 0.006, 1.20)

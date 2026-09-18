@@ -19,7 +19,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any, Iterable, Literal, Mapping
@@ -64,7 +64,8 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "Claude Haiku 3.5": {"uncached_input": 0.80, "cached_input": 0.08, "output": 4.00},
     # DeepSeek V4. The official API publishes peak and off-peak rates; the
     # static catalog uses the latest peak rates so usage is not understated.
-    "deepseek-v4-flash": {"uncached_input": 0.44, "cached_input": 0.014, "output": 1.32},
+    "deepseek-v4-flash": {"uncached_input": 0.30, "cached_input": 0.006, "output": 1.20},
+    "deepseek-flash": {"uncached_input": 0.30, "cached_input": 0.006, "output": 1.20},
     "deepseek-v4-pro": {"uncached_input": 1.32, "cached_input": 0.044, "output": 3.96},
 }
 
@@ -99,7 +100,16 @@ _ALIASES: list[tuple[str, str]] = [
     ("claude-sonnet-4", "Claude Sonnet 4"), ("claude-haiku-4-5", "Claude Haiku 4.5"),
     ("claude-haiku-3-5", "Claude Haiku 3.5"),
     ("deepseek-chat", "deepseek-v4-flash"), ("deepseek-reasoner", "deepseek-v4-pro"),
+    ("deepseek-flash", "deepseek-v4-flash"),
 ]
+
+# DeepSeek off-peak rates (50% discount on peak rates):
+# Off-peak: uncached_input: $0.15, cached_input: $0.003, output: $0.60 per 1M tokens
+DEEPSEEK_OFF_PEAK_PRICING: dict[str, dict[str, float]] = {
+    "deepseek-v4-flash": {"uncached_input": 0.15, "cached_input": 0.003, "output": 0.60},
+    "deepseek-flash": {"uncached_input": 0.15, "cached_input": 0.003, "output": 0.60},
+    "deepseek-v4-pro": {"uncached_input": 0.66, "cached_input": 0.022, "output": 1.98},
+}
 
 Provider = str
 ResolutionStatus = Literal["known", "unpriced", "unknown", "ambiguous"]
@@ -145,6 +155,7 @@ class PricingEntry:
     model: str
     rates: PricingRates | None
     aliases: tuple[str, ...] = ()
+    off_peak_rates: PricingRates | None = None
 
 
 @dataclass(frozen=True)
@@ -162,6 +173,7 @@ class PricingResolution:
     status: ResolutionStatus
     matched_by: str | None = None
     candidates: tuple[tuple[Provider, str], ...] = ()
+    pricing_tier: str | None = None
 
     @property
     def priced(self) -> bool:
@@ -172,12 +184,15 @@ class PricingResolution:
         return self.status in ("known", "unpriced")
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "status": self.status, "priced": self.priced, "provider": self.provider,
             "canonical_model": self.canonical_model,
             "rates": self.rates.as_dict() if self.rates else None,
             "matched_by": self.matched_by, "candidates": list(self.candidates),
         }
+        if self.pricing_tier is not None:
+            data["pricing_tier"] = self.pricing_tier
+        return data
 
 
 def _optional_float(value: Any) -> float | None:
@@ -202,6 +217,69 @@ def normalize_provider(provider: str | None) -> str | None:
     return _PROVIDER_ALIASES.get(normalized, normalized or None)
 
 
+def is_deepseek_peak_utc(dt: Any) -> bool:
+    """Determine if a datetime or timestamp falls within DeepSeek peak hours.
+
+    Peak hours:
+        01:00 - 04:00 and 06:00 - 10:00 UTC, Monday through Friday.
+        (All other hours and weekends are off-peak).
+    If dt is None or cannot be parsed, default to True (peak) to ensure
+    usage and costs are never understated.
+    """
+    if dt is None:
+        return True
+    parsed_dt: datetime | None = None
+    if isinstance(dt, datetime):
+        parsed_dt = dt
+    elif isinstance(dt, (int, float)):
+        try:
+            val = float(dt)
+            if val > 1e14:
+                secs = val / 1_000_000.0
+            elif val > 1e11:
+                secs = val / 1_000.0
+            else:
+                secs = val
+            parsed_dt = datetime.fromtimestamp(secs, timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            return True
+    elif isinstance(dt, str):
+        raw = dt.strip()
+        try:
+            val = float(raw)
+            if val > 1e14:
+                secs = val / 1_000_000.0
+            elif val > 1e11:
+                secs = val / 1_000.0
+            else:
+                secs = val
+            parsed_dt = datetime.fromtimestamp(secs, timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            if raw.endswith(("Z", "z")):
+                raw = raw[:-1] + "+00:00"
+            try:
+                parsed_dt = datetime.fromisoformat(raw)
+            except Exception:
+                return True
+    else:
+        return True
+
+    if not isinstance(parsed_dt, datetime):
+        return True
+    try:
+        if parsed_dt.tzinfo is None:
+            parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+        else:
+            parsed_dt = parsed_dt.astimezone(timezone.utc)
+
+        if parsed_dt.weekday() >= 5:
+            return False
+        t = parsed_dt.time()
+        return (time(1, 0) <= t < time(4, 0)) or (time(6, 0) <= t < time(10, 0))
+    except Exception:
+        return True
+
+
 class PricingCatalog:
     """Registry for provider-scoped model rates and aliases."""
 
@@ -213,7 +291,7 @@ class PricingCatalog:
 
     def add_entry(self, entry: PricingEntry) -> PricingEntry:
         provider = normalize_provider(entry.provider) or entry.provider
-        normalized = PricingEntry(provider, entry.model, entry.rates, entry.aliases)
+        normalized = PricingEntry(provider, entry.model, entry.rates, entry.aliases, entry.off_peak_rates)
         self._entries[(provider, _normalize(entry.model))] = normalized
         return normalized
 
@@ -229,6 +307,7 @@ class PricingCatalog:
         output: float | None = None,
         cache_write: float | None = None,
         cache_creation: float | None = None,
+        off_peak_rates: PricingRates | Mapping[str, Any] | None = None,
     ) -> PricingEntry:
         """Register a model, including a known model with ``rates=None``.
 
@@ -243,7 +322,12 @@ class PricingCatalog:
                 float(uncached_input), float(cached_input), float(output), cache_write, cache_creation
             )
         parsed = rates if isinstance(rates, PricingRates) or rates is None else PricingRates.from_mapping(rates)
-        return self.add_entry(PricingEntry(provider, model, parsed, tuple(aliases)))
+        parsed_off_peak = (
+            off_peak_rates
+            if isinstance(off_peak_rates, PricingRates) or off_peak_rates is None
+            else PricingRates.from_mapping(off_peak_rates)
+        )
+        return self.add_entry(PricingEntry(provider, model, parsed, tuple(aliases), off_peak_rates=parsed_off_peak))
 
     def entries(self) -> tuple[PricingEntry, ...]:
         return tuple(self._entries.values())
@@ -261,7 +345,9 @@ class PricingCatalog:
         """Remove one exact provider/model entry, if present."""
         self._entries.pop((normalize_provider(provider) or provider, _normalize(model)), None)
 
-    def resolve(self, model_name: str | None, provider: str | None = None) -> PricingResolution:
+    def resolve(
+        self, model_name: str | None, provider: str | None = None, *, timestamp: Any = None
+    ) -> PricingResolution:
         """Resolve without fallback, returning a status for every outcome."""
         if not isinstance(model_name, str) or not model_name.strip():
             return PricingResolution(model_name, normalize_provider(provider), None, None, "unknown")
@@ -309,12 +395,25 @@ class PricingCatalog:
             return PricingResolution(raw, scoped_provider, None, None, status, candidates=candidates)
 
         entry, matched_by = matches[0]
-        status: ResolutionStatus = "known" if entry.rates is not None else "unpriced"
-        return PricingResolution(raw, entry.provider, entry.model, entry.rates, status, matched_by)
+        rates = entry.rates
+        pricing_tier: str | None = None
+        if entry.off_peak_rates is not None:
+            if is_deepseek_peak_utc(timestamp):
+                rates = entry.rates
+                pricing_tier = "peak"
+            else:
+                rates = entry.off_peak_rates
+                pricing_tier = "off-peak"
+        status: ResolutionStatus = "known" if rates is not None else "unpriced"
+        return PricingResolution(
+            raw, entry.provider, entry.model, rates, status, matched_by, pricing_tier=pricing_tier
+        )
 
-    def get_pricing(self, model_name: str | None, provider: str | None = None) -> PricingRates | None:
+    def get_pricing(
+        self, model_name: str | None, provider: str | None = None, *, timestamp: Any = None
+    ) -> PricingRates | None:
         """Return rates strictly, or ``None`` for unknown/unpriced models."""
-        return self.resolve(model_name, provider).rates
+        return self.resolve(model_name, provider, timestamp=timestamp).rates
 
 
 def _build_catalog() -> PricingCatalog:
@@ -332,7 +431,8 @@ def _build_catalog() -> PricingCatalog:
         aliases = tuple(alias for alias, target in _ALIASES if target == model)
         if provider == "claude":
             rates = {**rates, "cache_creation": rates["uncached_input"] * 1.25}
-        catalog.register(provider, model, rates, aliases=aliases)
+        off_peak = DEEPSEEK_OFF_PEAK_PRICING.get(model) if provider == "deepseek" else None
+        catalog.register(provider, model, rates, aliases=aliases, off_peak_rates=off_peak)
     return catalog
 
 
@@ -859,22 +959,24 @@ def active_pricing_payload(*, refresh: bool = True, cache_path: str | Path | Non
 
 
 def resolve_pricing_strict(
-    model_name: str | None, provider: str | None = None, *, catalog: PricingCatalog | None = None
+    model_name: str | None, provider: str | None = None, *, timestamp: Any = None, catalog: PricingCatalog | None = None
 ) -> PricingResolution:
     """Resolve a model without a default-model fallback."""
-    return (catalog or PRICING_CATALOG).resolve(model_name, provider)
+    return (catalog or PRICING_CATALOG).resolve(model_name, provider, timestamp=timestamp)
 
 
 def get_pricing_strict(
-    model_name: str | None, provider: str | None = None, *, catalog: PricingCatalog | None = None
+    model_name: str | None, provider: str | None = None, *, timestamp: Any = None, catalog: PricingCatalog | None = None
 ) -> PricingResolution:
     """Strict counterpart to :func:`get_pricing`; inspect ``status`` first."""
-    return resolve_pricing_strict(model_name, provider, catalog=catalog)
+    return resolve_pricing_strict(model_name, provider, timestamp=timestamp, catalog=catalog)
 
 
-def get_pricing(model_name: str | None, provider: str | None = None) -> dict[str, float]:
+def get_pricing(
+    model_name: str | None, provider: str | None = None, *, timestamp: Any = None
+) -> dict[str, float]:
     """Backward-compatible pricing lookup with the historical fallbacks."""
-    resolution = PRICING_CATALOG.resolve(model_name, provider)
+    resolution = PRICING_CATALOG.resolve(model_name, provider, timestamp=timestamp)
     if resolution.rates is not None:
         return resolution.rates.as_dict(include_optional=False)
     if isinstance(model_name, str) and "gemini" in model_name.casefold() and not provider:
@@ -911,23 +1013,23 @@ def _calculate_with_rates(
 def calculate_cost(
     model_name: str | None, uncached_input: int | None, cached_input: int | None, output: int | None,
     cache_write: int | None = None, cache_creation: int | None = None, *,
-    provider: str | None = None, catalog: PricingCatalog | None = None,
+    provider: str | None = None, timestamp: Any = None, catalog: PricingCatalog | None = None,
 ) -> dict[str, float]:
     """Calculate cost, preserving the original fallback behavior."""
     active_catalog = catalog or PRICING_CATALOG
-    rates = active_catalog.resolve(model_name, provider).rates
+    rates = active_catalog.resolve(model_name, provider, timestamp=timestamp).rates
     if rates is None:
-        rates = PricingRates.from_mapping(get_pricing(model_name, provider))
+        rates = PricingRates.from_mapping(get_pricing(model_name, provider, timestamp=timestamp))
     return _calculate_with_rates(rates, uncached_input, cached_input, output, cache_write, cache_creation)
 
 
 def calculate_cost_strict(
     model_name: str | None, uncached_input: int | None, cached_input: int | None, output: int | None, *,
     provider: str | None = None, cache_write: int | None = None, cache_creation: int | None = None,
-    catalog: PricingCatalog | None = None,
+    timestamp: Any = None, catalog: PricingCatalog | None = None,
 ) -> dict[str, Any]:
     """Calculate cost without fallback and include model-resolution status."""
-    resolution = resolve_pricing_strict(model_name, provider, catalog=catalog)
+    resolution = resolve_pricing_strict(model_name, provider, timestamp=timestamp, catalog=catalog)
     result: dict[str, Any] = resolution.as_dict()
     if resolution.rates is None:
         result.update({"cost_cached_usd": None, "cost_uncached_usd": None, "savings_usd": None})
@@ -942,9 +1044,10 @@ resolve_cost_strict = calculate_cost_strict
 
 
 __all__ = [
-    "DEFAULT_MODEL", "DEFAULT_PRICING_CATALOG", "MODEL_PRICING", "PRICING_CATALOG",
+    "DEFAULT_MODEL", "DEFAULT_PRICING_CATALOG", "DEEPSEEK_OFF_PEAK_PRICING", "MODEL_PRICING", "PRICING_CATALOG",
     "PricingCatalog", "PricingEntry", "PricingRates", "PricingResolution",
     "calculate_cost", "calculate_cost_strict", "get_pricing", "get_pricing_strict",
+    "is_deepseek_peak_utc",
     "normalize_provider", "resolve_cost_strict", "resolve_pricing_strict",
     "OPENAI_PRICING_URL", "OPENAI_PRICING_TTL_SECONDS", "pricing_cache_path",
     "parse_openai_standard_pricing", "refresh_openai_pricing", "pricing_metadata",

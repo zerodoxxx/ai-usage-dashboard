@@ -171,6 +171,7 @@ def _event_cost(
     event_provider = str(session.get("provider") or session.get("tool") or "") or None
     if event_model.casefold().startswith("deepseek"):
         event_provider = "deepseek"
+    event_ts = event.get("timestamp") or session.get("created_at") or session.get("start_time")
     result = calculate_cost_strict(
         event_model,
         uncached_input,
@@ -181,6 +182,7 @@ def _event_cost(
             event.get("cache_write_tokens")
             or event.get("cache_creation_tokens")
         ),
+        timestamp=event_ts,
     )
     return {
         "cost_cached_usd": float(result.get("cost_cached_usd") or 0.0),
@@ -211,6 +213,7 @@ def _refresh_estimated_session_cost(session: UsageSession) -> None:
         usage.output_tokens,
         provider=provider,
         cache_write=usage.cache_write_tokens,
+        timestamp=session.created_at or session.start_time or session.activity_at,
     )
     if resolved.get("status") == "known":
         session.cost = CostEstimate(
@@ -239,6 +242,7 @@ def _refresh_estimated_session_cost(session: UsageSession) -> None:
             event_usage.output_tokens,
             provider=event_provider,
             cache_write=event_usage.cache_write_tokens,
+            timestamp=event.timestamp or session.created_at,
         )
         if event_result.get("status") == "known":
             event.cost = CostEstimate(
@@ -815,6 +819,7 @@ def _serialize_extracted_session(session: UsageSession) -> dict[str, Any]:
         usage.output_tokens,
         provider=session.provider or session.tool,
         cache_write=usage.cache_write_tokens,
+        timestamp=session.created_at or session.start_time or session.activity_at,
     )
     serialized["pricing_status"] = resolved["status"]
     serialized["canonical_model"] = resolved.get("canonical_model")

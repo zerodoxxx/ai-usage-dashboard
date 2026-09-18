@@ -98,6 +98,7 @@ def _usage_event(
             output,
             provider=_pricing_provider(model),
             cache_write=cache_write,
+            timestamp=record.get("timestamp"),
         )
         if resolved.get("status") == "known":
             cost = CostEstimate(
