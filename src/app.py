@@ -47,7 +47,15 @@ def api_usage(
     ),
     time_range: str = Query(
         default="all",
-        description="Filter usage by time: 'all', 'month', '30d', '7d', or '24h'.",
+        description="Filter usage by time: 'all', 'month', '30d', '7d', '24h', or 'custom' (requires start/end YYYY-MM-DD).",
+    ),
+    start: str | None = Query(
+        default=None,
+        description="Inclusive custom-range start date (YYYY-MM-DD, UTC). Required when time_range=custom.",
+    ),
+    end: str | None = Query(
+        default=None,
+        description="Inclusive custom-range end date (YYYY-MM-DD, UTC). Required when time_range=custom.",
     ),
 ) -> dict[str, Any]:
     """Return real-time usage metrics, summaries, model breakdowns, timelines, and sessions."""
@@ -55,7 +63,7 @@ def api_usage(
         # Refresh before parsing so provider adapters and their snapshots use
         # the same active rates as the pricing endpoint.
         refresh_openai_pricing()
-        return get_tool_usage(tool, time_range=time_range)
+        return get_tool_usage(tool, time_range=time_range, start=start, end=end)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

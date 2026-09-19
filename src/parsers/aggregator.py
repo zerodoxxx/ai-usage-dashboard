@@ -17,7 +17,7 @@ from .contracts import CostEstimate, UsageSession
 from .source_registry import SOURCE_REGISTRY, SourceRegistry, normalize_source_key
 
 _CANONICAL_MODELS: dict[str, str] = {k.lower(): k for k in MODEL_PRICING}
-_TIME_RANGES = {"all", "month", "30d", "7d", "24h"}
+_TIME_RANGES = {"all", "month", "30d", "7d", "24h", "custom"}
 _PARSER_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="usage-parser")
 DEFAULT_SOURCE_REGISTRY = SOURCE_REGISTRY
 for _builtin_source in (CodexSource(), AntigravitySource(), ClaudeCodeSource()):
@@ -30,9 +30,38 @@ def _normalize_time_range(time_range: str | None) -> str:
     normalized = str(time_range or "all").strip().lower()
     if normalized not in _TIME_RANGES:
         raise ValueError(
-            f"Unsupported time range: {time_range!r}. Expected one of: all, month, 30d, 7d, 24h."
+            f"Unsupported time range: {time_range!r}. Expected one of: all, month, 30d, 7d, 24h, custom."
         )
     return normalized
+
+
+def _parse_custom_range(start: str | None, end: str | None) -> tuple[datetime, datetime]:
+    """Parse inclusive UTC YYYY-MM-DD bounds for ``time_range=custom``."""
+    if not start or not end:
+        raise ValueError(
+            "Custom time range requires both 'start' and 'end' query parameters (YYYY-MM-DD)."
+        )
+    try:
+        start_date = datetime.strptime(str(start).strip(), "%Y-%m-%d")
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid custom start date: {start!r}. Expected format YYYY-MM-DD."
+        )
+    try:
+        end_date = datetime.strptime(str(end).strip(), "%Y-%m-%d")
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid custom end date: {end!r}. Expected format YYYY-MM-DD."
+        )
+    start_dt = start_date.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+    end_dt = end_date.replace(
+        hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
+    )
+    if start_dt > end_dt:
+        raise ValueError(
+            f"Invalid custom range: start date {start!r} is after end date {end!r}."
+        )
+    return start_dt, end_dt
 
 
 def _coerce_timestamp(value: Any, local_tz) -> datetime | None:
@@ -72,13 +101,22 @@ def _coerce_timestamp(value: Any, local_tz) -> datetime | None:
         return None
 
 
-def _time_range_cutoff(time_range: str, now: datetime | None = None) -> tuple[datetime | None, datetime]:
+def _time_range_cutoff(
+    time_range: str,
+    now: datetime | None = None,
+    start: str | None = None,
+    end: str | None = None,
+) -> tuple[datetime | None, datetime]:
     """Return the inclusive lower bound and current time for a range.
 
     Calendar-month boundaries use the machine's local timezone. Relative ranges
-    are measured back from the current instant.
+    are measured back from the current instant. Custom ranges use inclusive UTC
+    day bounds derived from ``start``/``end`` (YYYY-MM-DD).
     """
     normalized = _normalize_time_range(time_range)
+    if normalized == "custom":
+        custom_start, custom_end = _parse_custom_range(start, end)
+        return custom_start, custom_end
     if now is None:
         current = datetime.now().astimezone()
     elif now.tzinfo is None:
@@ -377,9 +415,11 @@ def _filter_sessions(
     sessions: list[dict[str, Any]],
     time_range: str,
     now: datetime | None = None,
+    start: str | None = None,
+    end: str | None = None,
 ) -> list[dict[str, Any]]:
     """Filter sessions by per-call activity when available."""
-    cutoff, current = _time_range_cutoff(time_range, now)
+    cutoff, current = _time_range_cutoff(time_range, now, start, end)
     if cutoff is None:
         return list(sessions)
 
@@ -411,10 +451,33 @@ def _build_usage_data(sessions: list[dict[str, Any]], tool: str) -> dict[str, An
     )
 
     models_map: dict[str, dict[str, Any]] = {}
+    # Track pricing provenance per aggregated model so rows with no catalog
+    # rate can be surfaced as unpriced instead of silent $0.
+    model_statuses: dict[str, set[str]] = defaultdict(set)
+    model_providers: dict[str, set[str]] = defaultdict(set)
+    # Token provenance per aggregated model: "estimated" when every
+    # contributing session carries estimated token counts (AGY heuristic),
+    # "reported" when all counts are provider-reported (Codex/Claude),
+    # "mixed" when a canonical model merges both (tool=all view).
+    model_token_sources: dict[str, set[str]] = defaultdict(set)
     for session in sessions_combined:
         raw_model = str(session.get("model") or "unknown")
         model_key = _canonical_model_name(raw_model) if tool == "all" else raw_model
         tool_value = str(session.get("tool") or (tool if tool != "all" else "")).strip()
+        provider_hint = (
+            str(session.get("provider") or tool_value or "").strip() or None
+        )
+        status = str(session.get("pricing_status") or "").strip()
+        if status not in ("reported", "estimated", "known", "unpriced", "unknown", "ambiguous"):
+            resolved = PRICING_CATALOG.resolve(raw_model, provider_hint)
+            status = resolved.status
+        model_statuses[model_key].add(status)
+        session_token_source = str(session.get("token_source") or ("estimated" if session.get("estimated") else "reported"))
+        model_token_sources[model_key].add(session_token_source)
+        if tool_value:
+            model_providers[model_key].add(tool_value)
+        elif provider_hint:
+            model_providers[model_key].add(provider_hint)
 
         uncached_input = int(session.get("uncached_input") or 0)
         cached_input = int(session.get("cached_input") or 0)
@@ -473,6 +536,48 @@ def _build_usage_data(sessions: list[dict[str, Any]], tool: str) -> dict[str, An
         model["est_savings_usd"] = round(float(model.get("est_savings_usd") or 0.0), 6)
         if not model.get("tool"):
             model["tool"] = tool
+        # Flag models with no catalog rate. Never invent fallback rates:
+        # unpriced rows keep cost 0 and carry provider/model identity.
+        statuses = model_statuses.get(str(model.get("model")), set())
+        priced = any(s in ("reported", "estimated", "known") for s in statuses)
+        if not priced and not statuses:
+            resolved = PRICING_CATALOG.resolve(
+                str(model.get("model")), str(model.get("tool") or "") or None
+            )
+            statuses = {resolved.status}
+            priced = resolved.priced
+        unpriced = not priced
+        if unpriced:
+            model["est_cost_cached_usd"] = 0.0
+            model["est_cost_uncached_usd"] = 0.0
+            model["est_savings_usd"] = 0.0
+        if "reported" in statuses:
+            pricing_status = "reported" if priced else "unknown"
+        elif "estimated" in statuses or "known" in statuses:
+            pricing_status = "known"
+        elif "unpriced" in statuses:
+            pricing_status = "unpriced"
+        elif "ambiguous" in statuses:
+            pricing_status = "ambiguous"
+        else:
+            pricing_status = "unknown"
+        model["provider"] = str(model.get("tool") or "")
+        model["pricing_status"] = pricing_status
+        model["priced"] = priced
+        model["unpriced"] = unpriced
+        token_sources = model_token_sources.get(str(model.get("model")), set())
+        if token_sources == {"estimated"}:
+            model["token_source"] = "estimated"
+            model["estimated"] = True
+        elif token_sources == {"reported"}:
+            model["token_source"] = "reported"
+            model["estimated"] = False
+        elif token_sources:
+            model["token_source"] = "mixed"
+            model["estimated"] = False
+        else:
+            model["token_source"] = "reported"
+            model["estimated"] = False
         models_list.append(model)
     models_list.sort(key=lambda model: int(model.get("total_tokens") or 0), reverse=True)
 
@@ -580,7 +685,21 @@ def _build_usage_data(sessions: list[dict[str, Any]], tool: str) -> dict[str, An
         "cache_hit_rate": round((cached_input / total_input * 100.0), 2) if total_input > 0 else 0.0,
         "session_count": len(sessions_combined),
         "call_count": sum(int(s.get("call_count") or 0) for s in sessions_combined),
+        "unpriced_model_count": sum(1 for m in models_list if m.get("unpriced")),
+        "unpriced_models": sorted(
+            str(m.get("model") or "unknown") for m in models_list if m.get("unpriced")
+        ),
     }
+
+    unpriced_models = [
+        {
+            "model": str(m.get("model") or "unknown"),
+            "provider": str(m.get("provider") or m.get("tool") or ""),
+            "pricing_status": str(m.get("pricing_status") or "unknown"),
+        }
+        for m in models_list
+        if m.get("unpriced")
+    ]
 
     return {
         "tool": tool,
@@ -588,15 +707,18 @@ def _build_usage_data(sessions: list[dict[str, Any]], tool: str) -> dict[str, An
         "models": models_list,
         "timeline": timeline_list,
         "sessions": [_strip_usage_events(session) for session in sessions_combined],
+        "unpriced_models": unpriced_models,
     }
 
 
 def _previous_time_bounds(
     time_range: str,
     now: datetime | None = None,
+    start: str | None = None,
+    end: str | None = None,
 ) -> tuple[datetime | None, datetime | None]:
     """Return the immediately preceding equivalent comparison window."""
-    cutoff, current = _time_range_cutoff(time_range, now)
+    cutoff, current = _time_range_cutoff(time_range, now, start, end)
     if cutoff is None:
         return None, None
     if _normalize_time_range(time_range) == "month":
@@ -659,10 +781,12 @@ def _build_analytics(
     time_range: str,
     source_sessions: list[dict[str, Any]],
     now: datetime | None = None,
+    start: str | None = None,
+    end: str | None = None,
 ) -> dict[str, Any]:
     """Build secondary analytics from the already-filtered dashboard data."""
     normalized = _normalize_time_range(time_range)
-    cutoff, current = _time_range_cutoff(normalized, now)
+    cutoff, current = _time_range_cutoff(normalized, now, start, end)
     summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
     timeline = [t for t in list(data.get("timeline") or []) if isinstance(t, dict)]
     sessions = [s for s in list(data.get("sessions") or []) if isinstance(s, dict)]
@@ -681,6 +805,8 @@ def _build_analytics(
             "total_tokens": _as_int(session.get("total_tokens")),
             "call_count": _as_int(session.get("call_count")),
             "cost_cached_usd": round(float(session.get("cost_cached_usd") or 0.0), 6),
+            "estimated": bool(session.get("estimated")),
+            "token_source": str(session.get("token_source") or ("estimated" if session.get("estimated") else "reported")),
             "activity_at": str(
                 session.get("activity_at")
                 or session.get("created_at")
@@ -722,13 +848,17 @@ def _build_analytics(
         days_in_month = monthrange(current.year, current.month)[1]
         monthly_projection = current_cost / elapsed_days * days_in_month
         projection_basis = "current_month_run_rate"
+    elif normalized == "custom":
+        period_days = max((current - cutoff).total_seconds() / 86400.0, 1.0)
+        monthly_projection = current_cost / period_days * 30.0
+        projection_basis = "custom_run_rate"
     else:
         period_days = {"30d": 30.0, "7d": 7.0, "24h": 1.0}[normalized]
         monthly_projection = current_cost / period_days * 30.0
         projection_basis = f"{normalized}_run_rate"
 
     comparison = None
-    previous_start, previous_end = _previous_time_bounds(normalized, now)
+    previous_start, previous_end = _previous_time_bounds(normalized, now, start, end)
     if previous_start is not None and previous_end is not None:
         previous_sessions = _filter_sessions_between(
             source_sessions,
@@ -743,6 +873,10 @@ def _build_analytics(
             "7d": "previous 7 days",
             "24h": "previous 24 hours",
         }
+        if normalized == "custom":
+            inclusive_days = max((current.date() - cutoff.date()).days + 1, 1)
+            unit = "day" if inclusive_days == 1 else "days"
+            labels["custom"] = f"previous {inclusive_days} {unit}"
         comparison = _build_comparison(
             summary,
             previous_data["summary"],
@@ -772,6 +906,8 @@ def _filter_usage_data(
     data: dict[str, Any],
     time_range: str,
     now: datetime | None = None,
+    start: str | None = None,
+    end: str | None = None,
 ) -> dict[str, Any]:
     """Apply a time range and rebuild all derived metrics."""
     normalized = _normalize_time_range(time_range)
@@ -782,10 +918,10 @@ def _filter_usage_data(
         result["analytics"] = _build_analytics(result, normalized, source_sessions, now)
         return result
 
-    filtered_sessions = _filter_sessions(source_sessions, normalized, now)
+    filtered_sessions = _filter_sessions(source_sessions, normalized, now, start, end)
     result = _build_usage_data(filtered_sessions, str(data.get("tool") or "all"))
     result["time_range"] = normalized
-    result["analytics"] = _build_analytics(result, normalized, source_sessions, now)
+    result["analytics"] = _build_analytics(result, normalized, source_sessions, now, start, end)
     return result
 
 
@@ -804,9 +940,17 @@ def _serialize_extracted_session(session: UsageSession) -> dict[str, Any]:
     supplies tokens, the shared pricing catalog enriches it here. Unknown
     models remain explicitly unpriced instead of inheriting another model's
     rates.
+
+    Token provenance (estimated vs exact counts) is surfaced separately from
+    cost provenance: ``estimated``/``token_source`` describe the token
+    counts, while ``cost_source``/``pricing_status`` describe cost.
     """
     _refresh_estimated_session_cost(session)
     serialized = session.to_legacy_dict(include_events=True)
+    estimated = bool(session.metadata.get("estimated"))
+    token_source = str(session.metadata.get("token_source") or ("estimated" if estimated else "reported"))
+    serialized["estimated"] = estimated
+    serialized["token_source"] = token_source
     if session.cost is not None:
         serialized["pricing_status"] = session.cost.source
         return serialized
@@ -859,13 +1003,19 @@ def get_tool_usage(
     claude_dir: str | Path | None = None,
     source_dirs: Mapping[str, str | Path | None] | None = None,
     registry: SourceRegistry | None = None,
+    start: str | None = None,
+    end: str | None = None,
 ) -> dict[str, Any]:
     """Extract and aggregate usage through registered provider adapters.
 
     ``codex_dir`` and ``agy_dir`` remain for API compatibility. New providers
     receive paths through ``source_dirs`` and require no aggregator branches.
+    ``time_range=custom`` requires inclusive UTC ``start``/``end`` (YYYY-MM-DD).
     """
     time_range_normalized = _normalize_time_range(time_range)
+    if time_range_normalized == "custom":
+        # Validate early so callers get a 400 before expensive parsing.
+        _parse_custom_range(start, end)
     tool_normalized = normalize_source_key(tool or "all")
     active_registry = registry or DEFAULT_SOURCE_REGISTRY
 
@@ -905,4 +1055,6 @@ def get_tool_usage(
     return _filter_usage_data(
         {"tool": result_tool, "sessions": sessions},
         time_range_normalized,
+        start=start,
+        end=end,
     )
