@@ -151,6 +151,9 @@ def main() -> None:
     assert usage_all["tool"] == "all"
     assert "no-store" in headers.get("cache-control", "")
     assert "summary" in usage_all and "models" in usage_all and "timeline" in usage_all and "sessions" in usage_all
+    assert "hourly_timeline" in usage_all and "weekday_hour" in usage_all
+    assert len(usage_all["hourly_timeline"]) == 24
+    assert len(usage_all["weekday_hour"]) == 168
     assert "analytics" in usage_all
     assert {
         "top_sessions",

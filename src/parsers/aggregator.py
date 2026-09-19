@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Iterator
 
 from ..pricing import MODEL_PRICING, PRICING_CATALOG, calculate_cost_strict
 from .agy import AntigravitySource
@@ -17,6 +17,7 @@ from .source_registry import SOURCE_REGISTRY, SourceRegistry, normalize_source_k
 
 _CANONICAL_MODELS: dict[str, str] = {k.lower(): k for k in MODEL_PRICING}
 _TIME_RANGES = {"all", "month", "30d", "7d", "24h", "custom"}
+_WEEKDAY_LABELS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _PARSER_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="usage-parser")
 DEFAULT_SOURCE_REGISTRY = SOURCE_REGISTRY
 for _builtin_source in (CodexSource(), AntigravitySource(), ClaudeCodeSource()):
@@ -439,7 +440,166 @@ def _session_date(session: dict[str, Any], local_tz) -> str:
     return "unknown"
 
 
-def _build_usage_data(sessions: list[dict[str, Any]], tool: str) -> dict[str, Any]:
+def _session_activity_time(session: dict[str, Any], local_tz) -> datetime | None:
+    """Best timestamp for bucketing a session when it has no usage events."""
+    for key in ("activity_at", "created_at", "start_time", "end_time"):
+        parsed = _coerce_timestamp(session.get(key), local_tz)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _blank_day_row(date_key: str = "") -> dict[str, Any]:
+    """Zeroed daily timeline row used for quiet days in a selected window."""
+    return {
+        "date": date_key,
+        "uncached_input": 0,
+        "cached_input": 0,
+        "total_input": 0,
+        "output": 0,
+        "reasoning_output": 0,
+        "total_tokens": 0,
+        "call_count": 0,
+        "session_count": 0,
+        "cost_cached_usd": 0.0,
+        "cost_uncached_usd": 0.0,
+        "savings_usd": 0.0,
+    }
+
+
+def _blank_hour_row(hour: int) -> dict[str, Any]:
+    """Zeroed local-hour bucket; the hourly chart always receives 24 rows."""
+    return {
+        "hour": hour,
+        "label": f"{hour:02d}:00",
+        "uncached_input": 0,
+        "cached_input": 0,
+        "total_input": 0,
+        "output": 0,
+        "reasoning_output": 0,
+        "total_tokens": 0,
+        "call_count": 0,
+        "session_count": 0,
+        "cost_cached_usd": 0.0,
+        "cost_uncached_usd": 0.0,
+        "savings_usd": 0.0,
+    }
+
+
+def _blank_weekday_hour_row(weekday: int, hour: int) -> dict[str, Any]:
+    """Zeroed weekday×hour cell (Monday=0) for the activity heatmap."""
+    return {
+        "weekday": weekday,
+        "weekday_label": _WEEKDAY_LABELS[weekday],
+        "hour": hour,
+        "total_tokens": 0,
+        "call_count": 0,
+        "cost_cached_usd": 0.0,
+        "session_count": 0,
+    }
+
+
+def _round_cost_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Round monetary fields on an aggregate row to the dashboard precision."""
+    for key in ("cost_cached_usd", "cost_uncached_usd", "savings_usd"):
+        if key in row:
+            row[key] = round(float(row.get(key) or 0.0), 6)
+    return row
+
+
+def _add_token_metrics(
+    row: dict[str, Any],
+    uncached_input: int,
+    cached_input: int,
+    output: int,
+    reasoning_output: int,
+    total_tokens: int,
+    call_count: int,
+    cost: Mapping[str, float],
+) -> None:
+    """Add one usage point into a daily, hourly, or weekday-hour bucket."""
+    row["total_tokens"] = int(row.get("total_tokens") or 0) + total_tokens
+    row["call_count"] = int(row.get("call_count") or 0) + call_count
+    row["cost_cached_usd"] = float(row.get("cost_cached_usd") or 0.0) + float(
+        cost.get("cost_cached_usd") or 0.0
+    )
+    if "uncached_input" in row:
+        row["uncached_input"] = int(row.get("uncached_input") or 0) + uncached_input
+        row["cached_input"] = int(row.get("cached_input") or 0) + cached_input
+        row["total_input"] = int(row.get("total_input") or 0) + uncached_input + cached_input
+        row["output"] = int(row.get("output") or 0) + output
+        row["reasoning_output"] = int(row.get("reasoning_output") or 0) + reasoning_output
+        row["cost_uncached_usd"] = float(row.get("cost_uncached_usd") or 0.0) + float(
+            cost.get("cost_uncached_usd") or 0.0
+        )
+        row["savings_usd"] = float(row.get("savings_usd") or 0.0) + float(cost.get("savings_usd") or 0.0)
+
+
+def _local_calendar_date(value: datetime, local_tz) -> date:
+    """Normalize a timestamp to the aggregator's local calendar date."""
+    if value.tzinfo is None:
+        localized = value.replace(tzinfo=local_tz)
+    else:
+        localized = value.astimezone(local_tz)
+    return localized.date()
+
+
+def _iter_dates(start_day: date, end_day: date) -> Iterator[date]:
+    """Yield inclusive calendar dates from ``start_day`` through ``end_day``."""
+    cursor = start_day
+    while cursor <= end_day:
+        yield cursor
+        cursor += timedelta(days=1)
+
+
+def _timeline_span(
+    timeline_map: Mapping[str, Any],
+    window_start: datetime | None,
+    window_end: datetime | None,
+    local_tz,
+) -> tuple[date, date] | None:
+    """Choose the inclusive local date range that the daily timeline should cover."""
+    activity_dates: list[date] = []
+    for key in timeline_map:
+        try:
+            activity_dates.append(date.fromisoformat(str(key)))
+        except ValueError:
+            continue
+
+    if window_start is not None and window_end is not None:
+        start_day = _local_calendar_date(window_start, local_tz)
+        end_day = _local_calendar_date(window_end, local_tz)
+        if start_day > end_day:
+            start_day, end_day = end_day, start_day
+        return start_day, end_day
+
+    if not activity_dates:
+        return None
+    start_day = min(activity_dates)
+    end_day = (
+        _local_calendar_date(window_end, local_tz) if window_end is not None else max(activity_dates)
+    )
+    if start_day > end_day:
+        end_day = max(activity_dates)
+    return start_day, end_day
+
+
+def _day_has_usage(day: Mapping[str, Any]) -> bool:
+    """True when a timeline day contains tokens, calls, or spend."""
+    return (
+        _as_int(day.get("total_tokens")) > 0
+        or _as_int(day.get("call_count")) > 0
+        or float(day.get("cost_cached_usd") or 0.0) > 0.0
+    )
+
+
+def _build_usage_data(
+    sessions: list[dict[str, Any]],
+    tool: str,
+    *,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+) -> dict[str, Any]:
     """Rebuild dashboard aggregates from a session subset."""
     sessions_combined = [s for s in sessions if isinstance(s, dict)]
     sessions_combined.sort(
@@ -582,22 +742,74 @@ def _build_usage_data(sessions: list[dict[str, Any]], tool: str) -> dict[str, An
         models_list.append(model)
     models_list.sort(key=lambda model: int(model.get("total_tokens") or 0), reverse=True)
 
-    timeline_map: dict[str, dict[str, Any]] = defaultdict(lambda: {
-        "date": "",
-        "uncached_input": 0,
-        "cached_input": 0,
-        "total_input": 0,
-        "output": 0,
-        "reasoning_output": 0,
-        "total_tokens": 0,
-        "call_count": 0,
-        "session_count": 0,
-        "cost_cached_usd": 0.0,
-        "cost_uncached_usd": 0.0,
-        "savings_usd": 0.0,
-    })
-
+    timeline_map: dict[str, dict[str, Any]] = defaultdict(_blank_day_row)
     timeline_session_ids: dict[str, set[str]] = defaultdict(set)
+    hourly_map = {hour: _blank_hour_row(hour) for hour in range(24)}
+    hourly_session_ids: dict[int, set[str]] = defaultdict(set)
+    weekday_hour_map = {
+        (weekday, hour): _blank_weekday_hour_row(weekday, hour)
+        for weekday in range(7)
+        for hour in range(24)
+    }
+    weekday_session_ids: dict[tuple[int, int], set[str]] = defaultdict(set)
+    reference_now = window_end if window_end is not None else datetime.now().astimezone()
+    if reference_now.tzinfo is None:
+        reference_now = reference_now.replace(tzinfo=local_tz)
+
+    def record_point(
+        when: datetime,
+        session_key: str,
+        uncached_input: int,
+        cached_input: int,
+        output: int,
+        reasoning_output: int,
+        total_tokens: int,
+        call_count: int,
+        cost: Mapping[str, float],
+    ) -> None:
+        if not _is_plausible_usage_time(when, reference_now):
+            return
+        date_key = when.date().isoformat()
+        day = timeline_map[date_key]
+        day["date"] = date_key
+        _add_token_metrics(
+            day,
+            uncached_input,
+            cached_input,
+            output,
+            reasoning_output,
+            total_tokens,
+            call_count,
+            cost,
+        )
+        timeline_session_ids[date_key].add(session_key)
+
+        hour = when.hour
+        weekday = when.weekday()
+        _add_token_metrics(
+            hourly_map[hour],
+            uncached_input,
+            cached_input,
+            output,
+            reasoning_output,
+            total_tokens,
+            call_count,
+            cost,
+        )
+        hourly_session_ids[hour].add(session_key)
+        weekday_key = (weekday, hour)
+        _add_token_metrics(
+            weekday_hour_map[weekday_key],
+            uncached_input,
+            cached_input,
+            output,
+            reasoning_output,
+            total_tokens,
+            call_count,
+            cost,
+        )
+        weekday_session_ids[weekday_key].add(session_key)
+
     for session_index, session in enumerate(sessions_combined):
         session_key = str(session.get("id") or f"session-{session_index}")
         event_rows: list[tuple[dict[str, Any], datetime]] = []
@@ -612,9 +824,6 @@ def _build_usage_data(sessions: list[dict[str, Any]], tool: str) -> dict[str, An
 
         if event_rows:
             for event, event_time in event_rows:
-                date_key = event_time.date().isoformat()
-                day = timeline_map[date_key]
-                day["date"] = date_key
                 event_uncached, event_cached, event_output, event_reasoning, event_total = _event_metrics(event)
                 event_cost = _event_cost(
                     session,
@@ -623,44 +832,89 @@ def _build_usage_data(sessions: list[dict[str, Any]], tool: str) -> dict[str, An
                     event_cached,
                     event_output,
                 )
-                day["uncached_input"] += event_uncached
-                day["cached_input"] += event_cached
-                day["total_input"] += event_uncached + event_cached
-                day["output"] += event_output
-                day["reasoning_output"] += event_reasoning
-                day["total_tokens"] += event_total
-                day["call_count"] += 1
-                day["cost_cached_usd"] += event_cost["cost_cached_usd"]
-                day["cost_uncached_usd"] += event_cost["cost_uncached_usd"]
-                day["savings_usd"] += event_cost["savings_usd"]
-                timeline_session_ids[date_key].add(session_key)
+                record_point(
+                    event_time,
+                    session_key,
+                    event_uncached,
+                    event_cached,
+                    event_output,
+                    event_reasoning,
+                    event_total,
+                    1,
+                    event_cost,
+                )
+            continue
+
+        activity_time = _session_activity_time(session, local_tz)
+        session_cost = {
+            "cost_cached_usd": float(session.get("cost_cached_usd") or 0.0),
+            "cost_uncached_usd": float(session.get("cost_uncached_usd") or 0.0),
+            "savings_usd": float(session.get("savings_usd") or 0.0),
+        }
+        if activity_time is not None:
+            record_point(
+                activity_time,
+                session_key,
+                _as_int(session.get("uncached_input")),
+                _as_int(session.get("cached_input")),
+                _as_int(session.get("output")),
+                _as_int(session.get("reasoning_output")),
+                _as_int(session.get("total_tokens")),
+                _as_int(session.get("call_count")),
+                session_cost,
+            )
             continue
 
         date_key = _session_date(session, local_tz)
         if date_key == "unknown":
             continue
+        try:
+            parsed_day = date.fromisoformat(date_key)
+            dated = datetime(parsed_day.year, parsed_day.month, parsed_day.day, tzinfo=local_tz)
+        except ValueError:
+            continue
+        if not _is_plausible_usage_time(dated, reference_now):
+            continue
         day = timeline_map[date_key]
         day["date"] = date_key
-        day["uncached_input"] += _as_int(session.get("uncached_input"))
-        day["cached_input"] += _as_int(session.get("cached_input"))
-        day["total_input"] += _as_int(session.get("total_input"))
-        day["output"] += _as_int(session.get("output"))
-        day["reasoning_output"] += _as_int(session.get("reasoning_output"))
-        day["total_tokens"] += _as_int(session.get("total_tokens"))
-        day["call_count"] += _as_int(session.get("call_count"))
-        day["cost_cached_usd"] += float(session.get("cost_cached_usd") or 0.0)
-        day["cost_uncached_usd"] += float(session.get("cost_uncached_usd") or 0.0)
-        day["savings_usd"] += float(session.get("savings_usd") or 0.0)
+        _add_token_metrics(
+            day,
+            _as_int(session.get("uncached_input")),
+            _as_int(session.get("cached_input")),
+            _as_int(session.get("output")),
+            _as_int(session.get("reasoning_output")),
+            _as_int(session.get("total_tokens")),
+            _as_int(session.get("call_count")),
+            session_cost,
+        )
         timeline_session_ids[date_key].add(session_key)
 
-    timeline_list: list[dict[str, Any]] = []
-    for date_key in sorted(timeline_map.keys()):
-        day = timeline_map[date_key]
+    for date_key, day in timeline_map.items():
+        day["date"] = date_key
         day["session_count"] = len(timeline_session_ids.get(date_key, set()))
-        day["cost_cached_usd"] = round(float(day.get("cost_cached_usd") or 0.0), 6)
-        day["cost_uncached_usd"] = round(float(day.get("cost_uncached_usd") or 0.0), 6)
-        day["savings_usd"] = round(float(day.get("savings_usd") or 0.0), 6)
-        timeline_list.append(day)
+        _round_cost_fields(day)
+
+    span = _timeline_span(timeline_map, window_start, window_end, local_tz)
+    timeline_list: list[dict[str, Any]] = []
+    if span is not None:
+        start_day, end_day = span
+        for day in _iter_dates(start_day, end_day):
+            date_key = day.isoformat()
+            row = timeline_map.get(date_key)
+            timeline_list.append(_round_cost_fields(row) if row is not None else _blank_day_row(date_key))
+
+    hourly_timeline = []
+    for hour in range(24):
+        row = hourly_map[hour]
+        row["session_count"] = len(hourly_session_ids.get(hour, set()))
+        hourly_timeline.append(_round_cost_fields(row))
+
+    weekday_hour = []
+    for weekday in range(7):
+        for hour in range(24):
+            row = weekday_hour_map[(weekday, hour)]
+            row["session_count"] = len(weekday_session_ids.get((weekday, hour), set()))
+            weekday_hour.append(_round_cost_fields(row))
 
     uncached_input = sum(int(s.get("uncached_input") or 0) for s in sessions_combined)
     cached_input = sum(int(s.get("cached_input") or 0) for s in sessions_combined)
@@ -707,6 +961,8 @@ def _build_usage_data(sessions: list[dict[str, Any]], tool: str) -> dict[str, An
         "summary": summary,
         "models": models_list,
         "timeline": timeline_list,
+        "hourly_timeline": hourly_timeline,
+        "weekday_hour": weekday_hour,
         "sessions": [_strip_usage_events(session) for session in sessions_combined],
         "unpriced_models": unpriced_models,
     }
@@ -877,9 +1133,11 @@ def _build_analytics(
             ),
         })
 
+    usage_days = [day for day in timeline if _day_has_usage(day)]
     peak_day = None
-    if timeline:
-        peak = max(timeline, key=lambda item: float(item.get("cost_cached_usd") or 0.0))
+    peak_source = usage_days or timeline
+    if peak_source:
+        peak = max(peak_source, key=lambda item: float(item.get("cost_cached_usd") or 0.0))
         peak_day = {
             "date": str(peak.get("date") or ""),
             "cost_cached_usd": round(float(peak.get("cost_cached_usd") or 0.0), 6),
@@ -916,7 +1174,12 @@ def _build_analytics(
             previous_end,
             include_end=False,
         )
-        previous_data = _build_usage_data(previous_sessions, str(data.get("tool") or "all"))
+        previous_data = _build_usage_data(
+            previous_sessions,
+            str(data.get("tool") or "all"),
+            window_start=previous_start,
+            window_end=previous_end,
+        )
         labels = {
             "month": "previous calendar month",
             "30d": "previous 30 days",
@@ -936,7 +1199,7 @@ def _build_analytics(
     return {
         "window_start": cutoff.isoformat() if cutoff is not None else None,
         "window_end": current.isoformat(),
-        "active_days": len(timeline),
+        "active_days": len(usage_days),
         "daily_calls": daily_calls,
         "avg_tokens_per_session": round(
             _as_int(summary.get("total_tokens")) / len(sessions), 2
@@ -963,14 +1226,22 @@ def _filter_usage_data(
     """Apply a time range and rebuild all derived metrics."""
     normalized = _normalize_time_range(time_range)
     source_sessions = [s for s in list(data.get("sessions") or []) if isinstance(s, dict)]
+    cutoff, current = _time_range_cutoff(normalized, now, start, end)
     if normalized == "all":
-        result = _build_usage_data(source_sessions, str(data.get("tool") or "all"))
-        result["time_range"] = normalized
-        result["analytics"] = _build_analytics(result, normalized, source_sessions, now)
-        return result
-
-    filtered_sessions = _filter_sessions(source_sessions, normalized, now, start, end)
-    result = _build_usage_data(filtered_sessions, str(data.get("tool") or "all"))
+        result = _build_usage_data(
+            source_sessions,
+            str(data.get("tool") or "all"),
+            window_start=None,
+            window_end=current,
+        )
+    else:
+        filtered_sessions = _filter_sessions(source_sessions, normalized, now, start, end)
+        result = _build_usage_data(
+            filtered_sessions,
+            str(data.get("tool") or "all"),
+            window_start=cutoff,
+            window_end=current,
+        )
     result["time_range"] = normalized
     result["analytics"] = _build_analytics(result, normalized, source_sessions, now, start, end)
     return result

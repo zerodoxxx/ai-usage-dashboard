@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -22,6 +22,7 @@ from src.parsers.aggregator import (
     _filter_usage_data,
     _parse_custom_range,
     _projected_30d_cost,
+    _time_range_cutoff,
     get_tool_usage,
 )
 
@@ -206,6 +207,9 @@ def test_aggregator() -> None:
     print(f"✓ Total Savings:           ${s['savings_usd']:.4f}")
     print(f"✓ Total Timeline Days:     {len(all_data['timeline'])}")
     print(f"✓ Total Models Tracked:    {len(all_data['models'])}")
+    assert len(all_data["timeline"]) < 4000
+    assert len(all_data["hourly_timeline"]) == 24
+    assert len(all_data["weekday_hour"]) == 168
 
     # Verify single-tool routing
     single_c = get_tool_usage("codex")
@@ -298,6 +302,8 @@ def test_time_filters() -> None:
     }
     poisoned_all = _filter_usage_data(poisoned, "all", now=now)
     assert poisoned_all["analytics"]["projected_30d_usd"] == _projected_30d_cost(0.2, 1.0)
+    assert all(not str(day["date"]).startswith("0001") for day in poisoned_all["timeline"])
+    assert 1 <= len(poisoned_all["timeline"]) <= 2
     print("✓ Filter daily-average 30-day projection verified.")
 
     # A long-running session can span the boundary of a rolling window. The
@@ -340,23 +346,30 @@ def test_time_filters() -> None:
     assert rolling_result["summary"]["call_count"] == 1
     assert rolling_result["sessions"][0]["activity_at"] == "2026-09-08T12:00:00+00:00"
     assert "usage_events" not in rolling_result["sessions"][0]
-    assert [(day["date"], day["total_tokens"], day["call_count"]) for day in rolling_result["timeline"]] == [
-        ("2026-09-08", 220, 1)
+    assert _nonzero_timeline(rolling_result["timeline"]) == [
+        (_local_date("2026-09-08T12:00:00+00:00"), 220, 1)
     ]
+    _assert_continuous_timeline(rolling_result["timeline"])
+    _assert_timeline_covers_window(rolling_result["timeline"], "7d", now)
 
     month_result = _filter_usage_data(event_data, "month", now=now)
     assert month_result["summary"]["total_tokens"] == 330
     assert month_result["summary"]["call_count"] == 2
-    assert [(day["date"], day["total_tokens"], day["call_count"]) for day in month_result["timeline"]] == [
-        ("2026-09-01", 110, 1),
-        ("2026-09-08", 220, 1),
+    assert _nonzero_timeline(month_result["timeline"]) == [
+        (_local_date("2026-09-01T00:00:00+00:00"), 110, 1),
+        (_local_date("2026-09-08T12:00:00+00:00"), 220, 1),
     ]
+    _assert_continuous_timeline(month_result["timeline"])
+    _assert_timeline_covers_window(month_result["timeline"], "month", now)
 
     all_result = _filter_usage_data(event_data, "all", now=now)
-    assert [(day["date"], day["total_tokens"]) for day in all_result["timeline"]] == [
-        ("2026-09-01", 110),
-        ("2026-09-08", 220),
+    assert [(day["date"], day["total_tokens"]) for day in all_result["timeline"] if day["total_tokens"]] == [
+        (_local_date("2026-09-01T00:00:00+00:00"), 110),
+        (_local_date("2026-09-08T12:00:00+00:00"), 220),
     ]
+    _assert_continuous_timeline(all_result["timeline"])
+    assert all_result["analytics"]["active_days"] == 2
+    assert all_result["analytics"]["active_days"] < len(all_result["timeline"]) or len(all_result["timeline"]) == 2
 
     print("✓ Calendar-month, rolling, and per-call time-range boundaries verified.")
 
@@ -542,6 +555,185 @@ def test_custom_time_range() -> None:
     print("✓ get_tool_usage early custom range validation and execution verified.")
 
 
+def _local_tz():
+    return datetime.now().astimezone().tzinfo
+
+
+def _local_date(iso_utc: str) -> str:
+    return datetime.fromisoformat(iso_utc).astimezone(_local_tz()).date().isoformat()
+
+
+def _local_hour(iso_utc: str) -> int:
+    return datetime.fromisoformat(iso_utc).astimezone(_local_tz()).hour
+
+
+def _local_weekday(iso_utc: str) -> int:
+    return datetime.fromisoformat(iso_utc).astimezone(_local_tz()).weekday()
+
+
+def _nonzero_timeline(timeline: list[dict]) -> list[tuple[str, int, int]]:
+    return [
+        (str(day["date"]), int(day["total_tokens"]), int(day["call_count"]))
+        for day in timeline
+        if int(day.get("total_tokens") or 0) or int(day.get("call_count") or 0)
+    ]
+
+
+def _assert_continuous_timeline(timeline: list[dict]) -> None:
+    dates = [str(day["date"]) for day in timeline]
+    if not dates:
+        return
+    start = date.fromisoformat(dates[0])
+    end = date.fromisoformat(dates[-1])
+    expected = []
+    cursor = start
+    while cursor <= end:
+        expected.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+    assert dates == expected, (dates, expected)
+
+
+def _assert_timeline_covers_window(timeline: list[dict], time_range: str, now: datetime) -> None:
+    cutoff, current = _time_range_cutoff(time_range, now)
+    local = _local_tz()
+    start = cutoff.astimezone(local).date().isoformat() if cutoff is not None else None
+    end = current.astimezone(local).date().isoformat()
+    dates = [str(day["date"]) for day in timeline]
+    assert dates[0] == start
+    assert dates[-1] == end
+
+
+def test_activity_timelines() -> None:
+    print("\n--- 8. Testing event-based hourly / weekday timelines ---")
+    now = datetime(2026, 9, 8, 12, 0, 0, tzinfo=timezone.utc)
+
+    split_session = {
+        "id": "split-hours",
+        "tool": "codex",
+        "model": "gpt-5",
+        "created_at": "2026-09-08T10:00:00+00:00",
+        "start_time": "2026-09-08T10:00:00+00:00",
+        "call_count": 2,
+        "uncached_input": 150,
+        "cached_input": 0,
+        "total_input": 150,
+        "output": 0,
+        "reasoning_output": 0,
+        "total_tokens": 150,
+        "cost_cached_usd": 0.15,
+        "cost_uncached_usd": 0.30,
+        "savings_usd": 0.15,
+        "usage_events": [
+            {
+                "timestamp": "2026-09-08T10:00:00+00:00",
+                "input_tokens": 100,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 100,
+            },
+            {
+                "timestamp": "2026-09-08T15:00:00+00:00",
+                "input_tokens": 50,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 50,
+            },
+        ],
+    }
+    split_result = _filter_usage_data(
+        {"tool": "codex", "summary": {}, "models": [], "timeline": [], "sessions": [split_session]},
+        "all",
+        now=now,
+    )
+    hour_a = _local_hour("2026-09-08T10:00:00+00:00")
+    hour_b = _local_hour("2026-09-08T15:00:00+00:00")
+    assert hour_a != hour_b
+    assert len(split_result["hourly_timeline"]) == 24
+    hourly = {row["hour"]: row for row in split_result["hourly_timeline"]}
+    assert hourly[hour_a]["total_tokens"] == 100
+    assert hourly[hour_a]["call_count"] == 1
+    assert hourly[hour_b]["total_tokens"] == 50
+    assert hourly[hour_b]["call_count"] == 1
+    assert sum(row["total_tokens"] for row in split_result["hourly_timeline"]) == 150
+    assert hourly[hour_a]["total_tokens"] != 150
+    assert "usage_events" not in split_result["sessions"][0]
+
+    event_data = {
+        "tool": "codex",
+        "summary": {},
+        "models": [],
+        "timeline": [],
+        "sessions": [{
+            "id": "long-running",
+            "tool": "codex",
+            "model": "gpt-5",
+            "created_at": "2026-08-01T00:00:00+00:00",
+            "start_time": "2026-08-01T00:00:00+00:00",
+            "call_count": 2,
+            "uncached_input": 180,
+            "cached_input": 120,
+            "total_input": 300,
+            "output": 30,
+            "reasoning_output": 0,
+            "total_tokens": 330,
+            "cost_cached_usd": 0.1,
+            "cost_uncached_usd": 0.2,
+            "savings_usd": 0.1,
+            "usage_events": [
+                {
+                    "timestamp": "2026-09-01T00:00:00+00:00",
+                    "input_tokens": 100,
+                    "cached_input_tokens": 20,
+                    "output_tokens": 10,
+                    "total_tokens": 110,
+                },
+                {
+                    "timestamp": "2026-09-08T12:00:00+00:00",
+                    "input_tokens": 200,
+                    "cached_input_tokens": 100,
+                    "output_tokens": 20,
+                    "total_tokens": 220,
+                },
+            ],
+        }],
+    }
+
+    rolling = _filter_usage_data(event_data, "7d", now=now)
+    late_hour = _local_hour("2026-09-08T12:00:00+00:00")
+    late_weekday = _local_weekday("2026-09-08T12:00:00+00:00")
+    rolling_hours = {row["hour"]: row for row in rolling["hourly_timeline"]}
+    assert rolling_hours[late_hour]["total_tokens"] == 220
+    assert rolling_hours[late_hour]["call_count"] == 1
+    assert sum(row["total_tokens"] for row in rolling["hourly_timeline"]) == 220
+    assert len(rolling["weekday_hour"]) == 168
+    late_cell = next(
+        cell for cell in rolling["weekday_hour"]
+        if cell["weekday"] == late_weekday and cell["hour"] == late_hour
+    )
+    assert late_cell["total_tokens"] == 220
+    assert late_cell["call_count"] == 1
+    assert rolling["analytics"]["active_days"] == 1
+    assert len(rolling["timeline"]) > 1
+    quiet_days = [day for day in rolling["timeline"] if not (day["total_tokens"] or day["call_count"])]
+    assert quiet_days
+    assert all(day["total_tokens"] == 0 and day["call_count"] == 0 for day in quiet_days)
+    _assert_timeline_covers_window(rolling["timeline"], "7d", now)
+
+    month = _filter_usage_data(event_data, "month", now=now)
+    early_hour = _local_hour("2026-09-01T00:00:00+00:00")
+    month_hours = {row["hour"]: row for row in month["hourly_timeline"]}
+    if early_hour == late_hour:
+        assert month_hours[late_hour]["total_tokens"] == 330
+        assert month_hours[late_hour]["call_count"] == 2
+    else:
+        assert month_hours[early_hour]["total_tokens"] == 110
+        assert month_hours[late_hour]["total_tokens"] == 220
+    assert sum(row["total_tokens"] for row in month["hourly_timeline"]) == 330
+    assert month["analytics"]["active_days"] == 2
+
+    print("✓ Event-based hourly timeline, weekday heatmap, and zero-filled days verified.")
+
+
 if __name__ == "__main__":
     test_pricing()
     codex_res = test_codex()
@@ -551,6 +743,7 @@ if __name__ == "__main__":
     test_time_filters()
     test_agy_estimated_provenance()
     test_custom_time_range()
+    test_activity_timelines()
     print("\n========================================")
     print("  ALL PARSER & PRICING TESTS PASSED!  ")
     print("========================================\n")
