@@ -87,7 +87,8 @@ _ALIASES: list[tuple[str, str]] = [
     ("gemini-2.5-flash", "Gemini 2.5 Flash"), ("1.5 pro", "Gemini 1.5 Pro"),
     ("gemini-1.5-pro", "Gemini 1.5 Pro"), ("1.5 flash", "Gemini 1.5 Flash"),
     ("gemini-1.5-flash", "Gemini 1.5 Flash"), ("astra", "gpt-6-astra"),
-    ("luna", "gpt-5.6-luna"), ("sol", "gpt-5.6-sol"), ("terra", "gpt-5.6-terra"),
+    ("luna", "gpt-5.6-luna"), ("codex-auto-review", "gpt-5.6-luna"),
+    ("sol", "gpt-5.6-sol"), ("terra", "gpt-5.6-terra"),
     ("o3-mini", "o3-mini"), ("o3", "o3-mini"),
     ("o1-mini", "o1-mini"), ("o1-preview", "o1"), ("o1", "o1"),
     ("gpt-4o-mini", "gpt-4o-mini"), ("4o-mini", "gpt-4o-mini"),
@@ -973,6 +974,9 @@ def active_pricing_payload(*, refresh: bool = True, cache_path: str | Path | Non
         for model, rates in MODEL_PRICING.items():
             resolved = PRICING_CATALOG.resolve(model)
             payload[model] = resolved.rates.as_dict() if resolved.rates is not None else dict(rates)
+        luna_rates = payload.get("gpt-5.6-luna")
+        if isinstance(luna_rates, dict):
+            payload.setdefault("codex-auto-review", dict(luna_rates))
         payload["__meta__"] = dict(_PRICING_STATES.get(state_key, _new_pricing_state()))
         return payload
 

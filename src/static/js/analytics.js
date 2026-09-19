@@ -42,18 +42,21 @@
       ctx.analyticsAvgTokens.textContent = formatCompactNumber(Math.round(Number(details.avg_tokens_per_session || 0)));
     }
     if (ctx.analyticsMonthlyProjection) {
-      ctx.analyticsMonthlyProjection.textContent = formatCurrency(details.monthly_projection_usd);
+      ctx.analyticsMonthlyProjection.textContent = formatCurrency(
+        details.projected_30d_usd ?? details.monthly_projection_usd
+      );
     }
     if (ctx.analyticsProjectionBasis) {
       const projectionLabels = {
-        last_30_days: 'Based on last 30 days',
-        current_month_run_rate: 'Current-month run rate',
-        custom_run_rate: 'Custom-range run rate',
-        '30d_run_rate': '30-day run rate',
-        '7d_run_rate': '7-day run rate',
-        '24h_run_rate': '24-hour run rate',
+        all_run_rate: 'All-time daily average × 30',
+        last_30_days: 'All-time daily average × 30',
+        current_month_run_rate: 'Current-month daily average × 30',
+        custom_run_rate: 'Selected-range daily average × 30',
+        '30d_run_rate': '30-day daily average × 30',
+        '7d_run_rate': '7-day daily average × 30',
+        '24h_run_rate': '24-hour daily average × 30',
       };
-      ctx.analyticsProjectionBasis.textContent = projectionLabels[details.projection_basis] || 'Based on current usage';
+      ctx.analyticsProjectionBasis.textContent = projectionLabels[details.projection_basis] || 'Filter daily average × 30';
     }
 
     const peakDay = details.peak_day;

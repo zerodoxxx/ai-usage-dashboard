@@ -18,7 +18,12 @@ from src.pricing import MODEL_PRICING, calculate_cost, get_pricing
 from src.parsers.codex import _parse_rollout_file, parse_codex_usage
 from src.parsers.agy import parse_agy_usage
 from src.parsers.claude import parse_claude_code_usage
-from src.parsers.aggregator import _filter_usage_data, _parse_custom_range, get_tool_usage
+from src.parsers.aggregator import (
+    _filter_usage_data,
+    _parse_custom_range,
+    _projected_30d_cost,
+    get_tool_usage,
+)
 
 
 def test_pricing() -> None:
@@ -41,6 +46,7 @@ def test_pricing() -> None:
         ("ASTRA", 10.0, 1.0, 50.0),
         ("gpt-5.6-luna", 0.20, 0.02, 1.20),
         ("Luna", 0.20, 0.02, 1.20),
+        ("codex-auto-review", 0.20, 0.02, 1.20),
         ("sol", 4.00, 0.40, 20.00),
         ("terra", 2.00, 0.20, 12.00),
         ("o1", 15.0, 7.50, 60.0),
@@ -251,6 +257,47 @@ def test_time_filters() -> None:
         assert result["summary"]["total_tokens"] == expected, (time_range, result["summary"])
         assert result["summary"]["session_count"] == (2 if time_range == "month" else 1 if time_range in ("7d", "24h") else 3)
         assert result["time_range"] == time_range
+
+    seven = _filter_usage_data(data, "7d", now=now)
+    assert seven["analytics"]["projection_basis"] == "7d_run_rate"
+    assert seven["analytics"]["projected_30d_usd"] == _projected_30d_cost(0.1, 7.0)
+    assert seven["analytics"]["monthly_projection_usd"] == seven["analytics"]["projected_30d_usd"]
+
+    thirty = _filter_usage_data(data, "30d", now=now)
+    assert thirty["analytics"]["projection_basis"] == "30d_run_rate"
+    assert thirty["analytics"]["projected_30d_usd"] == _projected_30d_cost(0.3, 30.0)
+
+    day = _filter_usage_data(data, "24h", now=now)
+    assert day["analytics"]["projection_basis"] == "24h_run_rate"
+    assert day["analytics"]["projected_30d_usd"] == _projected_30d_cost(0.1, 1.0)
+
+    month = _filter_usage_data(data, "month", now=now)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_days = max((now - month_start).total_seconds() / 86400.0, 1.0)
+    assert month["analytics"]["projection_basis"] == "current_month_run_rate"
+    assert month["analytics"]["projected_30d_usd"] == _projected_30d_cost(0.2, month_days)
+
+    all_time = _filter_usage_data(data, "all", now=now)
+    all_days = max(
+        (now - datetime(2026, 8, 31, 23, 59, 59, tzinfo=timezone.utc)).total_seconds() / 86400.0,
+        1.0,
+    )
+    assert all_time["analytics"]["projection_basis"] == "all_run_rate"
+    assert all_time["analytics"]["projected_30d_usd"] == _projected_30d_cost(0.3, all_days)
+
+    poisoned = {
+        "tool": "codex",
+        "summary": {},
+        "models": [],
+        "timeline": [],
+        "sessions": [
+            make_session("poison", "0001-01-01T00:00:00+00:00", 400),
+            make_session("today", "2026-09-08T12:00:00+00:00", 100),
+        ],
+    }
+    poisoned_all = _filter_usage_data(poisoned, "all", now=now)
+    assert poisoned_all["analytics"]["projected_30d_usd"] == _projected_30d_cost(0.2, 1.0)
+    print("✓ Filter daily-average 30-day projection verified.")
 
     # A long-running session can span the boundary of a rolling window. The
     # filter must use its per-call records instead of excluding the whole
@@ -464,6 +511,10 @@ def test_custom_time_range() -> None:
     assert result["summary"]["total_tokens"] == 200
     assert result["time_range"] == "custom"
     assert result["analytics"]["projection_basis"] == "custom_run_rate"
+    custom_start, custom_end = _parse_custom_range("2026-09-02", "2026-09-06")
+    custom_days = max((custom_end - custom_start).total_seconds() / 86400.0, 1.0)
+    assert result["analytics"]["projected_30d_usd"] == _projected_30d_cost(0.1, custom_days)
+    assert result["analytics"]["monthly_projection_usd"] == result["analytics"]["projected_30d_usd"]
     print("✓ _filter_usage_data custom date range filtering and projection_basis verified.")
 
     # 3. Test get_tool_usage with time_range="custom"

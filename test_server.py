@@ -80,6 +80,8 @@ def main() -> None:
     assert "chart-tokens" in html
     assert "models-table-body" in html
     assert "time-range-select" in html
+    assert "Projected 30 Day Cost" in html
+    assert "Projected Monthly Cost" not in html
     print("✓ GET / (Dashboard HTML) passed")
 
     # 3. Test Static Assets
@@ -103,7 +105,14 @@ def main() -> None:
     assert usage_all["tool"] == "all"
     assert "summary" in usage_all and "models" in usage_all and "timeline" in usage_all and "sessions" in usage_all
     assert "analytics" in usage_all
-    assert {"top_sessions", "daily_calls", "monthly_projection_usd", "comparison"}.issubset(usage_all["analytics"])
+    assert {
+        "top_sessions",
+        "daily_calls",
+        "projected_30d_usd",
+        "monthly_projection_usd",
+        "comparison",
+    }.issubset(usage_all["analytics"])
+    assert usage_all["analytics"]["projected_30d_usd"] == usage_all["analytics"]["monthly_projection_usd"]
     assert all("usage_events" not in session for session in usage_all["sessions"] if isinstance(session, dict))
     s = usage_all["summary"]
     assert s["total_tokens"] > 0

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from calendar import monthrange
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -468,9 +467,10 @@ def _build_usage_data(sessions: list[dict[str, Any]], tool: str) -> dict[str, An
             str(session.get("provider") or tool_value or "").strip() or None
         )
         status = str(session.get("pricing_status") or "").strip()
+        resolved = PRICING_CATALOG.resolve(raw_model, provider_hint)
         if status not in ("reported", "estimated", "known", "unpriced", "unknown", "ambiguous"):
-            resolved = PRICING_CATALOG.resolve(raw_model, provider_hint)
             status = resolved.status
+        canonical_model = resolved.canonical_model or model_key
         model_statuses[model_key].add(status)
         session_token_source = str(session.get("token_source") or ("estimated" if session.get("estimated") else "reported"))
         model_token_sources[model_key].add(session_token_source)
@@ -493,6 +493,7 @@ def _build_usage_data(sessions: list[dict[str, Any]], tool: str) -> dict[str, An
         if model_key not in models_map:
             models_map[model_key] = {
                 "model": model_key,
+                "canonical_model": canonical_model,
                 "tool": tool_value,
                 "call_count": call_count,
                 "session_count": 1,
@@ -776,6 +777,67 @@ def _build_comparison(
     }
 
 
+_MIN_PLAUSIBLE_USAGE_YEAR = 2020
+_MAX_USAGE_AGE_DAYS = 3650
+
+
+def _is_plausible_usage_time(parsed: datetime, current: datetime) -> bool:
+    """Reject sentinel/corrupt timestamps that would distort all-time averages."""
+    if parsed.year < _MIN_PLAUSIBLE_USAGE_YEAR:
+        return False
+    if parsed > current + timedelta(days=1):
+        return False
+    return (current - parsed).days <= _MAX_USAGE_AGE_DAYS
+
+
+def _session_span_start(
+    sessions: list[dict[str, Any]],
+    local_tz,
+    current: datetime,
+) -> datetime | None:
+    """Return the earliest plausible timestamp present on the filtered sessions."""
+    earliest: datetime | None = None
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        for key in ("created_at", "start_time", "activity_at", "end_time"):
+            parsed = _coerce_timestamp(session.get(key), local_tz)
+            if parsed is None or not _is_plausible_usage_time(parsed, current):
+                continue
+            if earliest is None or parsed < earliest:
+                earliest = parsed
+    return earliest
+
+
+def _filter_period_days(
+    cutoff: datetime | None,
+    current: datetime,
+    sessions: list[dict[str, Any]],
+) -> float:
+    """Length of the selected filter in days, used for a 30-day run-rate.
+
+    Bounded ranges use the filter window, including quiet days. All-time uses
+    the span from the first plausible session to the end of the window so the
+    average reflects actual history rather than an unbounded calendar.
+    """
+    start = cutoff
+    if start is None:
+        start = _session_span_start(
+            sessions,
+            current.tzinfo or datetime.now().astimezone().tzinfo,
+            current,
+        )
+    if start is None:
+        return 30.0 if sessions else 1.0
+    return max((current - start).total_seconds() / 86400.0, 1.0)
+
+
+def _projected_30d_cost(total_cost: float, period_days: float) -> float:
+    """Extrapolate filter spend to 30 days from the average daily cost."""
+    days = max(float(period_days), 1.0)
+    return round(float(total_cost) / days * 30.0, 6)
+
+
 def _build_analytics(
     data: dict[str, Any],
     time_range: str,
@@ -834,27 +896,15 @@ def _build_analytics(
     ]
 
     current_cost = round(float(summary.get("cost_cached_usd") or 0.0), 6)
+    period_days = _filter_period_days(cutoff, current, sessions)
+    projected_30d = _projected_30d_cost(current_cost, period_days)
     if normalized == "all":
-        projection_start = current - timedelta(days=30)
-        projection_sessions = _filter_sessions_between(source_sessions, projection_start, current)
-        projection_cost = round(
-            sum(float(session.get("cost_cached_usd") or 0.0) for session in projection_sessions),
-            6,
-        )
-        monthly_projection = projection_cost
-        projection_basis = "last_30_days"
+        projection_basis = "all_run_rate"
     elif normalized == "month":
-        elapsed_days = max((current - cutoff).total_seconds() / 86400.0, 1.0)
-        days_in_month = monthrange(current.year, current.month)[1]
-        monthly_projection = current_cost / elapsed_days * days_in_month
         projection_basis = "current_month_run_rate"
     elif normalized == "custom":
-        period_days = max((current - cutoff).total_seconds() / 86400.0, 1.0)
-        monthly_projection = current_cost / period_days * 30.0
         projection_basis = "custom_run_rate"
     else:
-        period_days = {"30d": 30.0, "7d": 7.0, "24h": 1.0}[normalized]
-        monthly_projection = current_cost / period_days * 30.0
         projection_basis = f"{normalized}_run_rate"
 
     comparison = None
@@ -896,7 +946,8 @@ def _build_analytics(
         ) if sessions else 0.0,
         "peak_day": peak_day,
         "top_sessions": top_sessions,
-        "monthly_projection_usd": round(monthly_projection, 6),
+        "projected_30d_usd": projected_30d,
+        "monthly_projection_usd": projected_30d,
         "projection_basis": projection_basis,
         "comparison": comparison,
     }

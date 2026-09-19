@@ -65,7 +65,10 @@
       // Backend flags models with no catalog rate; never backfill fallback rates.
       const isUnpricedRow = m.unpriced === true || m.priced === false;
 
-      const rates = isUnpricedRow ? null : window.DashboardApi.getModelRates(ctx.pricingData, modelName);
+      const rates = isUnpricedRow ? null : window.DashboardApi.getModelRates(
+        ctx.pricingData,
+        m.canonical_model || modelName
+      );
       const ratesStr = rates
         ? `$${(rates.uncached_input ?? 0).toFixed(2)} / $${(rates.cached_input ?? 0).toFixed(3)} / $${(rates.output ?? 0).toFixed(2)}`
         : 'N/A';
