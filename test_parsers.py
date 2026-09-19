@@ -730,6 +730,20 @@ def test_activity_timelines() -> None:
         assert month_hours[late_hour]["total_tokens"] == 220
     assert sum(row["total_tokens"] for row in month["hourly_timeline"]) == 330
     assert month["analytics"]["active_days"] == 2
+    assert month["analytics"]["peak_day"] is not None
+    assert month["analytics"]["peak_day"]["date"] in {
+        _local_date("2026-09-01T00:00:00+00:00"),
+        _local_date("2026-09-08T12:00:00+00:00"),
+    }
+
+    empty = _filter_usage_data(
+        {"tool": "codex", "summary": {}, "models": [], "timeline": [], "sessions": []},
+        "7d",
+        now=now,
+    )
+    assert empty["timeline"]
+    assert empty["analytics"]["active_days"] == 0
+    assert empty["analytics"]["peak_day"] is None
 
     print("✓ Event-based hourly timeline, weekday heatmap, and zero-filled days verified.")
 

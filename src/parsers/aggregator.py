@@ -1135,9 +1135,8 @@ def _build_analytics(
 
     usage_days = [day for day in timeline if _day_has_usage(day)]
     peak_day = None
-    peak_source = usage_days or timeline
-    if peak_source:
-        peak = max(peak_source, key=lambda item: float(item.get("cost_cached_usd") or 0.0))
+    if usage_days:
+        peak = max(usage_days, key=lambda item: float(item.get("cost_cached_usd") or 0.0))
         peak_day = {
             "date": str(peak.get("date") or ""),
             "cost_cached_usd": round(float(peak.get("cost_cached_usd") or 0.0), 6),
