@@ -26,11 +26,9 @@
 
   // Odometer Instances
   const odometers = {
-    totalTokens: null,
     totalCost: null,
-    cachedTokens: null,
-    cacheRate: null,
-    outputTokens: null,
+    burnRate: null,
+    savings: null,
     sessions: null,
   };
 
@@ -52,14 +50,6 @@
       }
     };
 
-    odometers.totalTokens = createOdometer('#odo-total-tokens', {
-      prefix: '',
-      suffix: '',
-      decimals: 0,
-      formatCommas: true,
-      duration: 850,
-    });
-
     odometers.totalCost = createOdometer('#odo-total-cost', {
       prefix: '$',
       suffix: '',
@@ -68,26 +58,18 @@
       duration: 850,
     });
 
-    odometers.cachedTokens = createOdometer('#odo-cached-tokens', {
-      prefix: '',
+    odometers.burnRate = createOdometer('#odo-burn-rate', {
+      prefix: '$',
       suffix: '',
-      decimals: 0,
+      decimals: 4,
       formatCommas: true,
       duration: 850,
     });
 
-    odometers.cacheRate = createOdometer('#odo-cache-rate', {
-      prefix: '',
-      suffix: '%',
-      decimals: 2,
-      formatCommas: true,
-      duration: 850,
-    });
-
-    odometers.outputTokens = createOdometer('#odo-output-tokens', {
-      prefix: '',
+    odometers.savings = createOdometer('#odo-savings', {
+      prefix: '$',
       suffix: '',
-      decimals: 0,
+      decimals: 4,
       formatCommas: true,
       duration: 850,
     });
@@ -140,7 +122,7 @@
       state.allSessions = Array.isArray(data.sessions) ? data.sessions : [];
 
       // Update UI components
-      updateMetricCards(data.summary || {});
+      updateMetricCards(data.summary || {}, data.analytics || {});
       const isCustom = state.currentTimeRange === 'custom'
         && state.customStart && state.customEnd;
       window.DashboardAnalytics.updateAnalytics(data.analytics || {}, data.summary || {}, {
@@ -152,6 +134,7 @@
         analyticsProjectionBasis: elements.analyticsProjectionBasis,
         analyticsPeakDayCost: elements.analyticsPeakDayCost,
         analyticsPeakDayDetail: elements.analyticsPeakDayDetail,
+        analyticsActiveDays: elements.analyticsActiveDays,
         topSessionsTableBody: elements.topSessionsTableBody,
         comparisonSubtitle: elements.comparisonSubtitle,
         comparisonContent: elements.comparisonContent,
@@ -176,6 +159,11 @@
         cacheTrendCanvas: elements.chartCacheTrendCanvas,
         costPer1kCanvas: elements.chartCostPer1kCanvas,
         hourlyActivityCanvas: elements.chartHourlyActivityCanvas,
+        weekdayHeatmap: elements.weekdayHeatmap,
+        sparklineSpend: elements.sparklineSpend,
+        sparklineBurn: elements.sparklineBurn,
+        sparklineSavings: elements.sparklineSavings,
+        sparklineSessions: elements.sparklineSessions,
       });
 
       // Update last synced badge
@@ -199,69 +187,45 @@
   }
 
   /**
-   * Update the 6 metric cards and their subtexts
+   * Update the 4 executive overview cards and their subtexts
    */
-  function updateMetricCards(summary) {
-    const { updateCompactMetric } = window.DashboardUtils;
-    const totalTokens = summary.total_tokens || 0;
-    const totalCost = summary.cost_cached_usd || 0;
-    const cachedTokens = summary.cached_input || 0;
-    const cacheHitRate = summary.cache_hit_rate || 0;
-    const outputTokens = summary.output || 0;
-    const sessionCount = summary.session_count || 0;
-    const savings = summary.savings_usd || 0;
-    const reasoning = summary.reasoning_output || 0;
-    const callCount = summary.call_count || 0;
+  function updateMetricCards(summary, analytics) {
+    const totals = summary && typeof summary === 'object' ? summary : {};
+    const details = analytics && typeof analytics === 'object' ? analytics : {};
+    const { formatCompactNumber } = window.DashboardUtils;
+    const totalTokens = Number(totals.total_tokens || 0);
+    const totalCost = Number(totals.cost_cached_usd || 0);
+    const uncachedCost = Number(totals.cost_uncached_usd || 0);
+    const cacheHitRate = Number(totals.cache_hit_rate || 0);
+    const sessionCount = Number(totals.session_count || 0);
+    const savings = Number(totals.savings_usd || 0);
+    const callCount = Number(totals.call_count || 0);
+    const burn = Number(details.projected_30d_usd ?? details.monthly_projection_usd ?? 0);
 
-    // Roll Odometers. Token totals use compact units so large values remain readable
-    // within the fixed-width summary cards; tables retain the exact values.
-    updateCompactMetric(
-      odometers.totalTokens,
-      elements.metricTotalTokensUnit,
-      elements.metricTotalTokensValue,
-      totalTokens,
-      'total tokens',
-    );
-    if (odometers.totalCost) odometers.totalCost.update(totalCost);
-    updateCompactMetric(
-      odometers.cachedTokens,
-      elements.metricCachedTokensUnit,
-      elements.metricCachedTokensValue,
-      cachedTokens,
-      'cached input tokens',
-    );
-    if (odometers.cacheRate) odometers.cacheRate.update(cacheHitRate);
-    updateCompactMetric(
-      odometers.outputTokens,
-      elements.metricOutputTokensUnit,
-      elements.metricOutputTokensValue,
-      outputTokens,
-      'output tokens',
-    );
-    if (odometers.sessions) odometers.sessions.update(sessionCount);
+    if (odometers.totalCost) odometers.totalCost.update(Number.isFinite(totalCost) ? totalCost : 0);
+    if (odometers.burnRate) odometers.burnRate.update(Number.isFinite(burn) ? burn : 0);
+    if (odometers.savings) odometers.savings.update(Number.isFinite(savings) ? savings : 0);
+    if (odometers.sessions) odometers.sessions.update(Number.isFinite(sessionCount) ? sessionCount : 0);
 
-    // Update Subtexts
-    if (elements.cardSavingsText) {
-      elements.cardSavingsText.textContent = `Saved $${savings.toFixed(4)} cached`;
-    }
-    if (elements.cardTokensSubtext) {
-      if (state.currentTimeRange === 'all') {
-        elements.cardTokensSubtext.textContent = 'Cumulative audit';
-      } else if (state.currentTimeRange === 'custom' && state.customStart && state.customEnd) {
-        elements.cardTokensSubtext.textContent = `${state.customStart} → ${state.customEnd} usage`;
-      } else {
-        const selectedOption = elements.timeRangeSelect?.selectedOptions?.[0];
-        elements.cardTokensSubtext.textContent = `${selectedOption?.textContent || 'Selected range'} usage`;
+    if (elements.cardSpendSubtext) {
+      let text = `${formatCompactNumber(totalTokens)} tokens in range`;
+      if (Number.isFinite(uncachedCost) && uncachedCost > 0 && Math.abs(uncachedCost - totalCost) > 0.00005) {
+        text += ` · $${totalCost.toFixed(2)} cached vs $${uncachedCost.toFixed(2)} uncached`;
       }
+      elements.cardSpendSubtext.textContent = text;
     }
-    if (elements.cardCachedShare) {
-      elements.cardCachedShare.textContent = `${cacheHitRate.toFixed(1)}% of input tokens`;
+    if (elements.cardBurnSubtext) {
+      const labelFn = window.DashboardAnalytics && window.DashboardAnalytics.projectionBasisLabel;
+      elements.cardBurnSubtext.textContent = labelFn
+        ? labelFn(details.projection_basis)
+        : 'Filter daily average × 30';
     }
-    if (elements.cardReasoningSubtext) {
-      elements.cardReasoningSubtext.textContent = `Incl. ${reasoning.toLocaleString()} reasoning`;
+    if (elements.cardSavingsSubtext) {
+      const rate = Number.isFinite(cacheHitRate) ? cacheHitRate : 0;
+      elements.cardSavingsSubtext.textContent = `${rate.toFixed(1)}% cache hit rate`;
     }
     if (elements.cardCallsSubtext) {
-      elements.cardCallsSubtext.textContent = `${callCount.toLocaleString()} API calls recorded`;
+      elements.cardCallsSubtext.textContent = `${Number(callCount || 0).toLocaleString()} API calls recorded`;
     }
   }
 
@@ -370,6 +334,51 @@
         });
       });
     }
+
+    setupDetailsTabs();
+    document.querySelectorAll('.chart-group').forEach((group) => {
+      group.addEventListener('toggle', () => {
+        if (group.open && window.DashboardCharts && window.DashboardCharts.resizeCharts) {
+          window.DashboardCharts.resizeCharts();
+        }
+      });
+    });
+  }
+
+  /**
+   * Models / Sessions / Insights tablist with roving tabindex.
+   */
+  function setupDetailsTabs() {
+    const tabs = Array.from(document.querySelectorAll('.details-tab'));
+    if (tabs.length === 0) return;
+
+    const selectTab = (tab) => {
+      tabs.forEach((item) => {
+        const selected = item === tab;
+        item.setAttribute('aria-selected', selected ? 'true' : 'false');
+        item.tabIndex = selected ? 0 : -1;
+        const panel = document.getElementById(item.getAttribute('aria-controls'));
+        if (panel) panel.hidden = !selected;
+      });
+    };
+
+    tabs.forEach((tab, index) => {
+      tab.addEventListener('click', () => selectTab(tab));
+      tab.addEventListener('keydown', (event) => {
+        if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft' && event.key !== 'Home' && event.key !== 'End') {
+          return;
+        }
+        event.preventDefault();
+        let nextIndex = index;
+        if (event.key === 'ArrowRight') nextIndex = (index + 1) % tabs.length;
+        if (event.key === 'ArrowLeft') nextIndex = (index - 1 + tabs.length) % tabs.length;
+        if (event.key === 'Home') nextIndex = 0;
+        if (event.key === 'End') nextIndex = tabs.length - 1;
+        const next = tabs[nextIndex];
+        selectTab(next);
+        next.focus();
+      });
+    });
   }
 
   /**
@@ -388,18 +397,14 @@
     elements.refreshBtn = document.getElementById('refresh-btn');
     elements.lastSyncedBadge = document.getElementById('last-synced-badge');
 
-    elements.metricTotalTokensValue = document.getElementById('metric-total-tokens-value');
-    elements.metricTotalTokensUnit = document.getElementById('metric-total-tokens-unit');
-    elements.metricCachedTokensValue = document.getElementById('metric-cached-tokens-value');
-    elements.metricCachedTokensUnit = document.getElementById('metric-cached-tokens-unit');
-    elements.metricOutputTokensValue = document.getElementById('metric-output-tokens-value');
-    elements.metricOutputTokensUnit = document.getElementById('metric-output-tokens-unit');
-
-    elements.cardSavingsText = document.getElementById('card-savings-text');
-    elements.cardTokensSubtext = document.getElementById('card-tokens-subtext');
-    elements.cardCachedShare = document.getElementById('card-cached-share');
-    elements.cardReasoningSubtext = document.getElementById('card-reasoning-subtext');
+    elements.cardSpendSubtext = document.getElementById('card-spend-subtext');
+    elements.cardBurnSubtext = document.getElementById('card-burn-subtext');
+    elements.cardSavingsSubtext = document.getElementById('card-savings-subtext');
     elements.cardCallsSubtext = document.getElementById('card-calls-subtext');
+    elements.sparklineSpend = document.getElementById('sparkline-spend');
+    elements.sparklineBurn = document.getElementById('sparkline-burn');
+    elements.sparklineSavings = document.getElementById('sparkline-savings');
+    elements.sparklineSessions = document.getElementById('sparkline-sessions');
 
     elements.analyticsWindowBadge = document.getElementById('analytics-window-badge');
     elements.analyticsCallCount = document.getElementById('analytics-call-count');
@@ -409,6 +414,7 @@
     elements.analyticsProjectionBasis = document.getElementById('analytics-projection-basis');
     elements.analyticsPeakDayCost = document.getElementById('analytics-peak-day-cost');
     elements.analyticsPeakDayDetail = document.getElementById('analytics-peak-day-detail');
+    elements.analyticsActiveDays = document.getElementById('analytics-active-days');
     elements.topSessionsTableBody = document.getElementById('top-sessions-table-body');
     elements.comparisonSubtitle = document.getElementById('comparison-subtitle');
     elements.comparisonContent = document.getElementById('comparison-content');
@@ -419,6 +425,7 @@
     elements.chartCacheTrendCanvas = document.getElementById('chart-cache-trend');
     elements.chartCostPer1kCanvas = document.getElementById('chart-cost-per-1k');
     elements.chartHourlyActivityCanvas = document.getElementById('chart-hourly-activity');
+    elements.weekdayHeatmap = document.getElementById('weekday-hour-heatmap');
     elements.unpricedBanner = document.getElementById('unpriced-banner');
 
     elements.modelsCountBadge = document.getElementById('models-count-badge');

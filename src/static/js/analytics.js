@@ -5,6 +5,20 @@
 (function () {
   'use strict';
 
+  const PROJECTION_LABELS = {
+    all_run_rate: 'All-time daily average × 30',
+    last_30_days: 'All-time daily average × 30',
+    current_month_run_rate: 'Current-month daily average × 30',
+    custom_run_rate: 'Selected-range daily average × 30',
+    '30d_run_rate': '30-day daily average × 30',
+    '7d_run_rate': '7-day daily average × 30',
+    '24h_run_rate': '24-hour daily average × 30',
+  };
+
+  function projectionBasisLabel(basis) {
+    return PROJECTION_LABELS[basis] || 'Filter daily average × 30';
+  }
+
   /**
    * Format the secondary analytics snapshot.
    * @param {object} analytics
@@ -35,6 +49,9 @@
     if (ctx.analyticsCallCount) {
       ctx.analyticsCallCount.textContent = Number(totals.call_count || 0).toLocaleString();
     }
+    if (ctx.analyticsActiveDays) {
+      ctx.analyticsActiveDays.textContent = Number(details.active_days || 0).toLocaleString();
+    }
     if (ctx.analyticsAvgCost) {
       ctx.analyticsAvgCost.textContent = formatCurrency(details.avg_cost_per_session_usd);
     }
@@ -47,16 +64,7 @@
       );
     }
     if (ctx.analyticsProjectionBasis) {
-      const projectionLabels = {
-        all_run_rate: 'All-time daily average × 30',
-        last_30_days: 'All-time daily average × 30',
-        current_month_run_rate: 'Current-month daily average × 30',
-        custom_run_rate: 'Selected-range daily average × 30',
-        '30d_run_rate': '30-day daily average × 30',
-        '7d_run_rate': '7-day daily average × 30',
-        '24h_run_rate': '24-hour daily average × 30',
-      };
-      ctx.analyticsProjectionBasis.textContent = projectionLabels[details.projection_basis] || 'Filter daily average × 30';
+      ctx.analyticsProjectionBasis.textContent = projectionBasisLabel(details.projection_basis);
     }
 
     const peakDay = details.peak_day;
@@ -160,5 +168,6 @@
   window.DashboardAnalytics = {
     updateAnalytics,
     renderTopSessions,
+    projectionBasisLabel,
   };
 })();

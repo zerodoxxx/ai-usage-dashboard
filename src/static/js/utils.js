@@ -102,13 +102,26 @@
     }
   }
 
+  const PROVIDER_MARKS = {
+    codex: '<svg class="provider-mark" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="8 1.5 14 5 14 11 8 14.5 2 11 2 5"></polygon><circle cx="8" cy="8" r="1.6"></circle></svg>',
+    claude: '<svg class="provider-mark" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><line x1="8" y1="1.5" x2="8" y2="14.5"></line><line x1="2.4" y1="4.4" x2="13.6" y2="11.6"></line><line x1="13.6" y1="4.4" x2="2.4" y2="11.6"></line></svg>',
+    agy: '<svg class="provider-mark" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><polygon points="8 2 14.5 13.5 1.5 13.5"></polygon></svg>',
+  };
+
+  const TOAST_ICONS = {
+    error: '<svg class="toast-icon toast-icon-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>',
+    info: '<svg class="toast-icon toast-icon-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>',
+  };
+
   function providerBadge(tool) {
     const normalized = String(tool || '').toLowerCase();
-    if (normalized === 'codex') return { className: 'badge-codex', text: 'Codex' };
-    if (normalized === 'claude' || normalized === 'claude-code') {
-      return { className: 'badge-claude', text: 'Claude Code' };
+    if (normalized === 'codex') {
+      return { className: 'badge-codex', text: `${PROVIDER_MARKS.codex}<span>Codex</span>` };
     }
-    return { className: 'badge-agy', text: 'Antigravity' };
+    if (normalized === 'claude' || normalized === 'claude-code') {
+      return { className: 'badge-claude', text: `${PROVIDER_MARKS.claude}<span>Claude Code</span>` };
+    }
+    return { className: 'badge-agy', text: `${PROVIDER_MARKS.agy}<span>Antigravity</span>` };
   }
 
   // AGY (Antigravity) token counts are chars//4 estimates, unlike the exact
@@ -151,7 +164,7 @@
     const toast = document.createElement('div');
     toast.className = `toast ${type === 'error' ? 'toast-error' : ''}`;
     toast.innerHTML = `
-      <span>${type === 'error' ? '⚠️' : 'ℹ️'}</span>
+      ${type === 'error' ? TOAST_ICONS.error : TOAST_ICONS.info}
       <span>${escapeHtml(String(message))}</span>
     `;
 

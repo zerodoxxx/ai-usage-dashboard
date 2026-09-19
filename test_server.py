@@ -118,8 +118,11 @@ def main() -> None:
     assert status == 200, f"Expected 200, got {status}"
     assert "<!DOCTYPE html>" in html
     assert "AI Usage & Cost Visualizer" in html
-    assert "odo-total-tokens" in html
+    assert "Executive Overview" in html
+    assert "Tracked sessions" in html
+    assert "odo-total-cost" in html
     assert "chart-tokens" in html
+    assert "weekday-hour-heatmap" in html
     assert "models-table-body" in html
     assert "time-range-select" in html
     assert "Projected 30 Day Cost" in html
