@@ -1019,6 +1019,7 @@ input:checked + .slider:before {
 }
 
 .unpriced-banner {
+  display: none;
   background: rgba(245, 158, 11, 0.1);
   border: 1px solid rgba(245, 158, 11, 0.4);
   border-radius: 8px;
@@ -1026,9 +1027,16 @@ input:checked + .slider:before {
   font-size: 13px;
   color: #fbbf24;
   margin-bottom: 16px;
-  display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.unpriced-banner:not([hidden]) {
+  display: flex;
+}
+
+.unpriced-banner[hidden] {
+  display: none !important;
 }
 
 .unpriced-pill {
