@@ -90,9 +90,17 @@ if $STOP; then
 fi
 
 if pid="$(running_pid)"; then
-  echo "Dashboard is already running (PID $pid) at http://127.0.0.1:$PORT"
-  $OPEN_BROWSER && open "http://127.0.0.1:$PORT" 2>/dev/null || true
-  exit 0
+  echo "Restarting dashboard (PID $pid) so this launch recalculates usage and charts..."
+  kill "$pid"
+  for _ in {1..20}; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.25
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "Dashboard did not stop cleanly (PID $pid); use: kill $pid" >&2
+    exit 1
+  fi
+  rm -f "$PID_FILE"
 fi
 
 if lsof -iTCP:"$PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then

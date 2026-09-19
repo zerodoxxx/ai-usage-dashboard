@@ -11,6 +11,41 @@ import urllib.error
 from pathlib import Path
 import uvicorn
 
+from src.app import NO_STORE_HEADERS, _static_asset_version, version_static_assets
+
+
+def test_version_static_assets_pins_mtime_and_replaces_stale_query() -> None:
+    html = (
+        '<script src="/static/js/charts.js"></script>'
+        '<link rel="stylesheet" href="/static/css/dashboard.css?v=old">'
+        '<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>'
+    )
+    charts_v = _static_asset_version("/static/js/charts.js")
+    css_v = _static_asset_version("/static/css/dashboard.css")
+    out = version_static_assets(html)
+    assert f'/static/js/charts.js?v={charts_v}' in out
+    assert f'/static/css/dashboard.css?v={css_v}' in out
+    assert "v=old" not in out
+    assert 'src="https://cdn.jsdelivr.net/npm/chart.js"' in out
+
+
+def test_index_html_cache_busts_charts_js() -> None:
+    html = (Path(__file__).resolve().parent / "src" / "templates" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    out = version_static_assets(html)
+    charts_v = _static_asset_version("/static/js/charts.js")
+    assert "Cost per 1M Tokens by Model" in out
+    assert f"/static/js/charts.js?v={charts_v}" in out
+    assert "Cost / 1K Tokens" not in out
+
+
+def test_no_store_headers_are_complete() -> None:
+    assert "no-store" in NO_STORE_HEADERS["Cache-Control"]
+    assert NO_STORE_HEADERS["Pragma"] == "no-cache"
+    assert NO_STORE_HEADERS["Expires"] == "0"
+
+
 TEST_HOST = "127.0.0.1"
 TEST_PORT = 8799
 BASE_URL = f"http://{TEST_HOST}:{TEST_PORT}"
@@ -28,21 +63,28 @@ def run_server() -> None:
 
 
 def fetch_url(path: str) -> tuple[int, dict | str]:
+    status, body, _headers = fetch_url_with_headers(path)
+    return status, body
+
+
+def fetch_url_with_headers(path: str) -> tuple[int, dict | str, dict[str, str]]:
     url = f"{BASE_URL}{path}"
-    req = urllib.request.Request(url)
+    req = urllib.request.Request(url, headers={"Cache-Control": "no-store"})
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
-            content_type = resp.headers.get("Content-Type", "")
+            headers = {str(key).lower(): str(value) for key, value in resp.headers.items()}
+            content_type = headers.get("content-type", "")
             raw = resp.read().decode("utf-8")
             if "application/json" in content_type:
-                return resp.status, json.loads(raw)
-            return resp.status, raw
+                return resp.status, json.loads(raw), headers
+            return resp.status, raw, headers
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8")
+        headers = {str(key).lower(): str(value) for key, value in e.headers.items()} if e.headers else {}
         try:
-            return e.code, json.loads(raw)
+            return e.code, json.loads(raw), headers
         except Exception:
-            return e.code, raw
+            return e.code, raw, headers
 
 
 def main() -> None:
@@ -72,7 +114,7 @@ def main() -> None:
     print("✓ GET /api/health passed")
 
     # 2. Test / (Dashboard HTML)
-    status, html = fetch_url("/")
+    status, html, headers = fetch_url_with_headers("/")
     assert status == 200, f"Expected 200, got {status}"
     assert "<!DOCTYPE html>" in html
     assert "AI Usage & Cost Visualizer" in html
@@ -82,27 +124,32 @@ def main() -> None:
     assert "time-range-select" in html
     assert "Projected 30 Day Cost" in html
     assert "Projected Monthly Cost" not in html
+    assert "/static/js/charts.js?v=" in html
+    assert "no-store" in headers.get("cache-control", "")
     print("✓ GET / (Dashboard HTML) passed")
 
     # 3. Test Static Assets
     for asset in ["/static/css/dashboard.css", "/static/js/odometer.js", "/static/js/dashboard.js"]:
-        st, content = fetch_url(asset)
+        st, content, headers = fetch_url_with_headers(asset)
         assert st == 200, f"Failed to fetch {asset}: {st}"
         assert len(content) > 100
+        assert "no-store" in headers.get("cache-control", "")
         print(f"✓ GET {asset} passed ({len(content)} bytes)")
 
     # 4. Test /api/pricing
-    status, pricing = fetch_url("/api/pricing")
+    status, pricing, headers = fetch_url_with_headers("/api/pricing")
     assert status == 200, f"Expected 200, got {status}"
     assert "gpt-6-astra" in pricing
     assert "Gemini 3.8 Flash (High)" in pricing
     assert pricing["gpt-6-astra"]["uncached_input"] == 10.0
+    assert "no-store" in headers.get("cache-control", "")
     print(f"✓ GET /api/pricing passed ({len(pricing)} models)")
 
     # 5. Test /api/usage?tool=all
-    status, usage_all = fetch_url("/api/usage?tool=all")
+    status, usage_all, headers = fetch_url_with_headers("/api/usage?tool=all")
     assert status == 200, f"Expected 200, got {status}"
     assert usage_all["tool"] == "all"
+    assert "no-store" in headers.get("cache-control", "")
     assert "summary" in usage_all and "models" in usage_all and "timeline" in usage_all and "sessions" in usage_all
     assert "analytics" in usage_all
     assert {

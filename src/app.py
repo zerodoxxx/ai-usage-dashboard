@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.responses import Response
 
 from src.parsers.aggregator import get_tool_usage
 from src.pricing import active_pricing_payload, refresh_openai_pricing
@@ -16,6 +18,14 @@ from src.pricing import active_pricing_payload, refresh_openai_pricing
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 TEMPLATES_DIR = BASE_DIR / "templates"
+_STATIC_ASSET_RE = re.compile(
+    r'(?P<attr>src|href)="(?P<path>/static/[^"?#]+)(?:\?[^"]*)?"'
+)
+NO_STORE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
 
 app = FastAPI(
     title="AI Tools Usage & Cost Visualizer",
@@ -30,13 +40,47 @@ TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
-@app.get("/", response_class=FileResponse)
-def read_index() -> FileResponse:
+def _static_asset_version(url_path: str) -> str:
+    """Return a filesystem mtime token for a /static/... URL."""
+    relative = url_path.lstrip("/")
+    candidate = (BASE_DIR / relative).resolve()
+    try:
+        candidate.relative_to(BASE_DIR.resolve())
+    except ValueError:
+        return "0"
+    try:
+        return str(candidate.stat().st_mtime_ns)
+    except OSError:
+        return "0"
+
+
+def version_static_assets(html: str) -> str:
+    """Pin local CSS/JS URLs to file mtime so browsers cannot keep a stale charts.js."""
+
+    def replace(match: re.Match[str]) -> str:
+        path = match.group("path")
+        return f'{match.group("attr")}="{path}?v={_static_asset_version(path)}"'
+
+    return _STATIC_ASSET_RE.sub(replace, html)
+
+
+@app.middleware("http")
+async def disable_browser_cache(request: Request, call_next) -> Response:
+    """Never let the browser reuse HTML, JS, or API payloads across loads."""
+    response = await call_next(request)
+    for name, value in NO_STORE_HEADERS.items():
+        response.headers[name] = value
+    return response
+
+
+@app.get("/", response_class=HTMLResponse)
+def read_index() -> HTMLResponse:
     """Serve the primary single-page dashboard."""
     index_file = TEMPLATES_DIR / "index.html"
     if not index_file.exists():
         raise HTTPException(status_code=404, detail="Dashboard index.html not found.")
-    return FileResponse(index_file)
+    html = version_static_assets(index_file.read_text(encoding="utf-8"))
+    return HTMLResponse(html, headers=dict(NO_STORE_HEADERS))
 
 
 @app.get("/api/usage")

@@ -18,7 +18,7 @@
    * @returns {Promise<object>} pricing payload
    */
   async function fetchPricing() {
-    const res = await fetch('/api/pricing');
+    const res = await fetch(`/api/pricing?_ts=${Date.now()}`, { cache: 'no-store' });
     if (!res.ok) {
       throw new Error(`Failed to fetch pricing: ${res.status} ${res.statusText}`);
     }
@@ -119,6 +119,7 @@
       const query = new URLSearchParams({
         tool,
         time_range: timeRange,
+        _ts: String(Date.now()),
       });
       if (timeRange === 'custom') {
         if (customRange && customRange.start) query.set('start', customRange.start);
@@ -126,6 +127,7 @@
       }
       const res = await fetch(`/api/usage?${query.toString()}`, {
         signal: controller.signal,
+        cache: 'no-store',
       });
       if (!res.ok) {
         const errorText = await res.text();
