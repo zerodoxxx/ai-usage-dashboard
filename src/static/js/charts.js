@@ -101,7 +101,9 @@
     updateCostByToolChart(data || {}, el.costByToolCanvas);
     updateCacheTrendChart((data && data.timeline) || [], el.cacheTrendCanvas);
     updateCostPer1kChart((data && data.models) || [], el.costPer1kCanvas);
-    updateHourlyActivityChart((data && data.sessions) || [], el.hourlyActivityCanvas);
+    updateHourlyActivityChart((data && data.hourly_timeline) || [], el.hourlyActivityCanvas);
+    updateWeekdayHeatmap((data && data.weekday_hour) || [], el.weekdayHeatmap);
+    updateSparklines((data && data.timeline) || [], el);
   }
 
   /**
@@ -428,9 +430,10 @@
 
   /**
    * Chart 6: Hourly Activity (Dual-Axis Bar & Line)
-   * API call distribution and token volume by local hour of day.
+   * Uses backend `hourly_timeline` (24 local-hour buckets). Missing data
+   * falls back to 24 zeros — never re-buckets sessions on the client.
    */
-  function updateHourlyActivityChart(sessions, canvas) {
+  function updateHourlyActivityChart(hourlyTimeline, canvas) {
     if (!canvas) return;
     const formatCompactNumber = utils().formatCompactNumber;
     const titleEl = document.getElementById('hourly-activity-title');
@@ -442,18 +445,14 @@
     const hourlyTokens = new Array(24).fill(0);
     const hourlyCalls = new Array(24).fill(0);
 
-    const list = Array.isArray(sessions) ? sessions : [];
-    for (const s of list) {
-      if (!s || typeof s !== 'object') continue;
-      const rawDate = s.activity_at || s.created_at || s.start_time || s.end_time;
-      if (!rawDate) continue;
-      const d = new Date(rawDate);
-      if (isNaN(d.getTime())) continue;
-      const hour = d.getHours();
-      if (hour >= 0 && hour < 24) {
-        hourlyTokens[hour] += Number(s.total_tokens || 0);
-        hourlyCalls[hour] += Number(s.call_count || 1);
-      }
+    const list = Array.isArray(hourlyTimeline) ? hourlyTimeline : [];
+    for (const row of list) {
+      if (!row || typeof row !== 'object') continue;
+      const hour = Math.trunc(Number(row.hour));
+      if (!Number.isFinite(hour) || hour < 0 || hour > 23) continue;
+      hourlyTokens[hour] = Number(row.total_tokens || 0) || 0;
+      hourlyCalls[hour] = Number(row.call_count || 0) || 0;
+      if (row.label) hourlyLabels[hour] = String(row.label);
     }
 
     if (prepareCanvas(chartHourlyActivity, canvas)) {
@@ -494,12 +493,147 @@
     });
   }
 
+  const WEEKDAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+  function heatmapCellTitle(weekdayLabel, hour, cell) {
+    const tokens = Number(cell.total_tokens || 0).toLocaleString();
+    const calls = Number(cell.call_count || 0).toLocaleString();
+    const cost = Number(cell.cost_cached_usd || 0).toFixed(4);
+    const hh = String(hour).padStart(2, '0');
+    return `${weekdayLabel} ${hh}:00 — ${tokens} tokens, ${calls} calls, $${cost}`;
+  }
+
+  /**
+   * 7×24 weekday × hour heatmap (HTML/CSS grid). Intensity uses total_tokens,
+   * or call_count if tokens are all zero. Empty input still renders a dim grid.
+   */
+  function updateWeekdayHeatmap(cells, container) {
+    if (!container) return;
+    const escapeHtml = (utils().escapeHtml) || ((s) => String(s));
+    const grid = Array.from({ length: 7 }, () => Array.from({ length: 24 }, () => ({
+      total_tokens: 0,
+      call_count: 0,
+      cost_cached_usd: 0,
+      session_count: 0,
+    })));
+
+    const list = Array.isArray(cells) ? cells : [];
+    for (const cell of list) {
+      if (!cell || typeof cell !== 'object') continue;
+      const day = Math.trunc(Number(cell.weekday));
+      const hour = Math.trunc(Number(cell.hour));
+      if (!Number.isFinite(day) || day < 0 || day > 6) continue;
+      if (!Number.isFinite(hour) || hour < 0 || hour > 23) continue;
+      grid[day][hour] = {
+        total_tokens: Number(cell.total_tokens || 0) || 0,
+        call_count: Number(cell.call_count || 0) || 0,
+        cost_cached_usd: Number(cell.cost_cached_usd || 0) || 0,
+        session_count: Number(cell.session_count || 0) || 0,
+        weekday_label: cell.weekday_label,
+      };
+    }
+
+    let maxTokens = 0;
+    let maxCalls = 0;
+    for (const row of grid) {
+      for (const cell of row) {
+        maxTokens = Math.max(maxTokens, cell.total_tokens);
+        maxCalls = Math.max(maxCalls, cell.call_count);
+      }
+    }
+    const useTokens = maxTokens > 0;
+    const maxVal = useTokens ? maxTokens : maxCalls;
+
+    const hourHeaders = Array.from({ length: 24 }, (_, hour) => (
+      `<div class="heatmap-hour">${String(hour).padStart(2, '0')}</div>`
+    )).join('');
+
+    let body = `<div class="heatmap-corner"></div>${hourHeaders}`;
+    WEEKDAY_LABELS.forEach((label, day) => {
+      body += `<div class="heatmap-weekday">${label}</div>`;
+      for (let hour = 0; hour < 24; hour += 1) {
+        const cell = grid[day][hour];
+        const value = useTokens ? cell.total_tokens : cell.call_count;
+        const t = maxVal > 0 ? value / maxVal : 0;
+        const alpha = (0.08 + t * 0.87).toFixed(3);
+        const weekdayLabel = cell.weekday_label || label;
+        const title = heatmapCellTitle(weekdayLabel, hour, cell);
+        body += `<div class="heatmap-cell" style="background:rgba(99,102,241,${alpha})" title="${escapeHtml(title)}"></div>`;
+      }
+    });
+
+    container.innerHTML = `
+      <div class="heatmap-scroll">
+        <div class="heatmap-grid" role="img" aria-label="Weekday by hour activity heatmap">${body}</div>
+      </div>
+      <div class="heatmap-legend">
+        <span>Low</span>
+        <div class="heatmap-legend-bar" aria-hidden="true"></div>
+        <span>High</span>
+      </div>
+    `;
+  }
+
+  function sparklinePoints(values, width, height, pad) {
+    const nums = (Array.isArray(values) ? values : []).map((value) => {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : 0;
+    });
+    if (nums.length === 0) nums.push(0, 0);
+    if (nums.length === 1) nums.push(nums[0]);
+    const min = Math.min(...nums);
+    const max = Math.max(...nums);
+    const span = max - min;
+    return nums.map((value, index) => {
+      const x = pad + (index / (nums.length - 1)) * (width - pad * 2);
+      const y = span === 0
+        ? height / 2
+        : height - pad - ((value - min) / span) * (height - pad * 2);
+      return `${x.toFixed(2)},${y.toFixed(2)}`;
+    }).join(' ');
+  }
+
+  function renderSparkline(container, values, color) {
+    if (!container) return;
+    const width = 100;
+    const height = 28;
+    const pad = 2;
+    const safeColor = /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(String(color || ''))
+      ? color
+      : '#94a3b8';
+    const points = sparklinePoints(values, width, height, pad);
+    container.innerHTML = `<svg viewBox="0 0 ${width} ${height}" class="sparkline" preserveAspectRatio="none" aria-hidden="true"><polyline fill="none" stroke="${safeColor}" stroke-width="1.75" stroke-linejoin="round" stroke-linecap="round" points="${points}"></polyline></svg>`;
+  }
+
+  function timelineFieldSeries(timeline, key) {
+    const list = Array.isArray(timeline) ? timeline : [];
+    return list.map((row) => {
+      if (!row || typeof row !== 'object') return 0;
+      const n = Number(row[key] || 0);
+      return Number.isFinite(n) ? n : 0;
+    });
+  }
+
+  function updateSparklines(timeline, el) {
+    if (!el) return;
+    renderSparkline(el.sparklineSpend, timelineFieldSeries(timeline, 'cost_cached_usd'), '#10b981');
+    renderSparkline(el.sparklineBurn, timelineFieldSeries(timeline, 'cost_cached_usd'), '#f59e0b');
+    renderSparkline(el.sparklineSavings, timelineFieldSeries(timeline, 'savings_usd'), '#06b6d4');
+    renderSparkline(el.sparklineSessions, timelineFieldSeries(timeline, 'session_count'), '#ec4899');
+  }
+
   /**
    * Destroy all active chart instances.
    */
   function destroyCharts() {
     [chartTokens, chartCost, chartCostByTool, chartCacheTrend, chartCostPer1k, chartHourlyActivity].forEach((c) => c?.destroy());
     chartTokens = chartCost = chartCostByTool = chartCacheTrend = chartCostPer1k = chartHourlyActivity = null;
+  }
+
+  function resizeCharts() {
+    [chartTokens, chartCost, chartCostByTool, chartCacheTrend, chartCostPer1k, chartHourlyActivity].forEach((chart) => {
+      try { chart?.resize(); } catch { /* canvas may be hidden */ }
+    });
   }
 
   window.DashboardCharts = {
@@ -510,6 +644,9 @@
     updateCacheTrendChart,
     updateCostPer1kChart,
     updateHourlyActivityChart,
+    updateWeekdayHeatmap,
+    updateSparklines,
+    resizeCharts,
     destroyCharts,
   };
 })();
