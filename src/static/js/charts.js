@@ -415,13 +415,28 @@
     });
   }
 
+  function localTimeZoneLabel() {
+    try {
+      const parts = new Intl.DateTimeFormat(undefined, { timeZoneName: 'short' }).formatToParts(new Date());
+      const tz = parts.find((part) => part.type === 'timeZoneName');
+      if (tz && tz.value) return tz.value;
+    } catch {
+      /* keep the fallback label */
+    }
+    return 'local time';
+  }
+
   /**
    * Chart 6: Hourly Activity (Dual-Axis Bar & Line)
-   * API call distribution and token volume by hour of day (UTC).
+   * API call distribution and token volume by local hour of day.
    */
   function updateHourlyActivityChart(sessions, canvas) {
     if (!canvas) return;
     const formatCompactNumber = utils().formatCompactNumber;
+    const titleEl = document.getElementById('hourly-activity-title');
+    if (titleEl) {
+      titleEl.textContent = `Hourly Activity (${localTimeZoneLabel()})`;
+    }
 
     const hourlyLabels = Array.from({ length: 24 }, (_, i) => `${String(i).padStart(2, '0')}:00`);
     const hourlyTokens = new Array(24).fill(0);
@@ -434,7 +449,7 @@
       if (!rawDate) continue;
       const d = new Date(rawDate);
       if (isNaN(d.getTime())) continue;
-      const hour = d.getUTCHours();
+      const hour = d.getHours();
       if (hour >= 0 && hour < 24) {
         hourlyTokens[hour] += Number(s.total_tokens || 0);
         hourlyCalls[hour] += Number(s.call_count || 1);
