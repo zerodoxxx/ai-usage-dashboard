@@ -57,7 +57,9 @@ input_tokens  ≈ total_input_chars  // 4
 output_tokens ≈ (output_chars + thinking_chars) // 4
 ```
 
-For multi-turn sessions (where prompt caching is very effective), a **45% cache hit rate** is assumed for input tokens. This is a conservative estimate based on typical coding session patterns.
+For multi-turn sessions (where prompt caching is very effective), a **45% cache hit rate** is assumed for input tokens. This is a conservative estimate based on typical coding session patterns. Single-turn sessions assume **0% cache** (no prior context to reuse). Both rules live in `src/parsers/agy.py` as `_AGY_CACHE_HIT_RATE_MULTI_TURN` with a rationale comment.
+
+Unlike Codex/Claude — which report exact per-call API counts — every AGY session and model row is marked estimated in the API (`estimated: true`, `token_source: "estimated"`, alongside the existing cost provenance `cost_source`/`pricing_status`). The dashboard renders these rows with a `~` prefix and an `est.` badge (hover for the heuristic), plus a footnote under the per-model table.
 
 ### 3. Claude Code (`~/.claude/`)
 

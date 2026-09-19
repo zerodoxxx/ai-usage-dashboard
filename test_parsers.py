@@ -18,7 +18,7 @@ from src.pricing import MODEL_PRICING, calculate_cost, get_pricing
 from src.parsers.codex import _parse_rollout_file, parse_codex_usage
 from src.parsers.agy import parse_agy_usage
 from src.parsers.claude import parse_claude_code_usage
-from src.parsers.aggregator import _filter_usage_data, get_tool_usage
+from src.parsers.aggregator import _filter_usage_data, _parse_custom_range, get_tool_usage
 
 
 def test_pricing() -> None:
@@ -313,6 +313,183 @@ def test_time_filters() -> None:
     print("✓ Calendar-month, rolling, and per-call time-range boundaries verified.")
 
 
+def test_agy_estimated_provenance() -> None:
+    print("\n--- 6. Testing AGY Estimated Provenance ---")
+    from src.parsers.agy import AntigravitySource
+
+    def write_transcript(root: Path, session_id: str, steps: list[dict]) -> None:
+        brain = root / "brain" / session_id / ".system_generated" / "logs"
+        brain.mkdir(parents=True, exist_ok=True)
+        (brain / "transcript.jsonl").write_text(
+            "\n".join(json.dumps(line) for line in steps), encoding="utf-8"
+        )
+
+    single_turn = [
+        {"created_at": "2026-09-08T10:00:00Z", "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "hello world, please help with this code"},
+        {"created_at": "2026-09-08T10:00:01Z", "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "sure thing, here is the fix", "thinking": "plan"},
+    ]
+    multi_turn = [
+        {"created_at": "2026-09-08T10:00:00Z", "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "first question about the codebase structure here"},
+        {"created_at": "2026-09-08T10:00:01Z", "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "first answer with details", "thinking": "think"},
+        {"created_at": "2026-09-08T10:01:00Z", "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "follow-up question with more context attached"},
+        {"created_at": "2026-09-08T10:01:01Z", "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "second answer with even more detail", "thinking": "think again"},
+    ]
+
+    with TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        (root / "settings.json").write_text(json.dumps({"model": "Gemini 2.5 Flash"}), encoding="utf-8")
+        write_transcript(root, "sess-single", single_turn)
+        write_transcript(root, "sess-multi", multi_turn)
+
+        # Contract-level provenance straight from the adapter.
+        sessions = AntigravitySource().extract_sessions(root)
+        assert len(sessions) == 2, f"Expected 2 AGY sessions, got {len(sessions)}"
+        for session in sessions:
+            assert session.metadata.get("estimated") is True, session.metadata
+            assert session.metadata.get("token_source") == "estimated", session.metadata
+
+        # Single-turn assumes 0% cache; multi-turn applies the flat 45% share.
+        by_id = {session.id: session for session in sessions}
+        assert by_id["sess-single"].usage.cached_input_tokens == 0
+        assert by_id["sess-multi"].usage.cached_input_tokens > 0
+        expected_cached = int(by_id["sess-multi"].usage.input_tokens * 0.45)
+        assert by_id["sess-multi"].usage.cached_input_tokens == expected_cached
+
+        # Aggregated API shape carries the estimated flag on sessions + models.
+        data = get_tool_usage("antigravity", agy_dir=root)
+        assert len(data["sessions"]) == 2
+        for api_session in data["sessions"]:
+            assert api_session["estimated"] is True, api_session
+            assert api_session["token_source"] == "estimated", api_session
+        assert len(data["models"]) == 1
+        assert data["models"][0]["estimated"] is True, data["models"][0]
+        assert data["models"][0]["token_source"] == "estimated", data["models"][0]
+
+    print("✓ AGY sessions/models are flagged estimated; single-turn 0% cache vs multi-turn 45% verified.")
+
+
+def test_custom_time_range() -> None:
+    print("\n--- 7. Testing Custom Date Range Filtering & Validation ---")
+
+    # 1. Test _parse_custom_range directly
+    # Valid date formats: returns UTC datetimes from 00:00:00 to 23:59:59.999999
+    start_dt, end_dt = _parse_custom_range("2026-09-01", "2026-09-08")
+    assert start_dt == datetime(2026, 9, 1, 0, 0, 0, 0, tzinfo=timezone.utc)
+    assert end_dt == datetime(2026, 9, 8, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    # Single-day range works
+    s_dt, e_dt = _parse_custom_range("2026-09-05", "2026-09-05")
+    assert s_dt == datetime(2026, 9, 5, 0, 0, 0, 0, tzinfo=timezone.utc)
+    assert e_dt == datetime(2026, 9, 5, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    # Invalid range: start > end raises ValueError
+    try:
+        _parse_custom_range("2026-09-08", "2026-09-01")
+        assert False, "Expected ValueError when start > end"
+    except ValueError as exc:
+        assert "after end date" in str(exc)
+
+    # Missing start/end: raises ValueError
+    for s, e in [
+        (None, "2026-09-08"),
+        ("2026-09-01", None),
+        (None, None),
+        ("", "2026-09-08"),
+        ("2026-09-01", ""),
+    ]:
+        try:
+            _parse_custom_range(s, e)
+            assert False, f"Expected ValueError for missing start/end: ({s}, {e})"
+        except ValueError as exc:
+            assert "requires both 'start' and 'end'" in str(exc)
+
+    # Invalid date format: raises ValueError
+    for bad_start in ["invalid", "2026/09/01", "09-01-2026", "2026-13-01", "2026-09-32"]:
+        try:
+            _parse_custom_range(bad_start, "2026-09-08")
+            assert False, f"Expected ValueError for invalid start date: {bad_start}"
+        except ValueError as exc:
+            assert "Invalid custom start date" in str(exc)
+
+    for bad_end in ["invalid", "2026/09/08", "09-08-2026", "2026-13-01", "2026-09-32"]:
+        try:
+            _parse_custom_range("2026-09-01", bad_end)
+            assert False, f"Expected ValueError for invalid end date: {bad_end}"
+        except ValueError as exc:
+            assert "Invalid custom end date" in str(exc)
+
+    print("✓ _parse_custom_range validated (UTC bounds, single-day, invalid bounds/formats).")
+
+    # 2. Test _filter_usage_data with time_range="custom"
+    def make_session(identifier: str, created_at: str, tokens: int) -> dict:
+        return {
+            "id": identifier,
+            "tool": "codex",
+            "model": "gpt-5.6-luna",
+            "created_at": created_at,
+            "start_time": created_at,
+            "call_count": 1,
+            "uncached_input": tokens,
+            "cached_input": 0,
+            "total_input": tokens,
+            "output": 0,
+            "reasoning_output": 0,
+            "total_tokens": tokens,
+            "cost_cached_usd": 0.1,
+            "cost_uncached_usd": 0.2,
+            "savings_usd": 0.1,
+        }
+
+    test_data = {
+        "tool": "codex",
+        "summary": {},
+        "models": [],
+        "timeline": [],
+        "sessions": [
+            make_session("sess-1", "2026-09-01T12:00:00+00:00", 100),
+            make_session("sess-2", "2026-09-05T12:00:00+00:00", 200),
+            make_session("sess-3", "2026-09-10T12:00:00+00:00", 300),
+        ],
+    }
+
+    result = _filter_usage_data(
+        test_data,
+        time_range="custom",
+        start="2026-09-02",
+        end="2026-09-06",
+    )
+    assert len(result["sessions"]) == 1
+    assert result["sessions"][0]["id"] == "sess-2"
+    assert result["summary"]["session_count"] == 1
+    assert result["summary"]["total_tokens"] == 200
+    assert result["time_range"] == "custom"
+    assert result["analytics"]["projection_basis"] == "custom_run_rate"
+    print("✓ _filter_usage_data custom date range filtering and projection_basis verified.")
+
+    # 3. Test get_tool_usage with time_range="custom"
+    # Invalid custom date range raises ValueError early before parsing
+    for bad_start, bad_end in [
+        ("2026-09-10", "2026-09-01"),  # start > end
+        (None, "2026-09-05"),           # missing start
+        ("2026-09-01", None),           # missing end
+        (None, None),                   # missing both
+        ("bad-date", "2026-09-05"),     # invalid start format
+        ("2026-09-01", "bad-date"),     # invalid end format
+    ]:
+        try:
+            get_tool_usage(time_range="custom", start=bad_start, end=bad_end)
+            assert False, f"Expected ValueError for get_tool_usage with ({bad_start}, {bad_end})"
+        except ValueError:
+            pass
+
+    # Valid custom range execution through get_tool_usage
+    valid_custom = get_tool_usage("codex", time_range="custom", start="2026-09-01", end="2026-09-08")
+    assert valid_custom["time_range"] == "custom"
+    assert valid_custom["analytics"]["projection_basis"] == "custom_run_rate"
+
+    print("✓ get_tool_usage early custom range validation and execution verified.")
+
+
 if __name__ == "__main__":
     test_pricing()
     codex_res = test_codex()
@@ -320,6 +497,9 @@ if __name__ == "__main__":
     agy_res = test_agy()
     test_aggregator()
     test_time_filters()
+    test_agy_estimated_provenance()
+    test_custom_time_range()
     print("\n========================================")
     print("  ALL PARSER & PRICING TESTS PASSED!  ")
     print("========================================\n")
+

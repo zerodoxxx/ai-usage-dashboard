@@ -17,6 +17,16 @@ from ..pricing import calculate_cost
 
 logger = logging.getLogger(__name__)
 
+# AGY transcripts carry text but no provider token counts (quota is tracked
+# server-side by Google), so tokens are estimated with the standard
+# chars//4 heuristic. Cache behavior is split by turn count:
+# - single-turn (call_count <= 1): 0% cache hit. There is no prior context
+#   to reuse, so assuming any cache hit would overstate savings.
+# - multi-turn (call_count > 1): flat 45% of input treated as cached. This
+#   is a conservative stand-in for prefix caching on repeated conversation
+#   context, not a measured rate — Codex/Claude report exact counts instead.
+_AGY_CACHE_HIT_RATE_MULTI_TURN = 0.45
+
 _AGY_PARSE_CACHE: dict[tuple[str, tuple[tuple[str, int, int], ...]], dict[str, Any]] = {}
 
 
@@ -341,12 +351,12 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                 logger.warning("Error reading transcript for %s: %s", t_path, e)
                 continue
 
-            # Estimation formulas:
-            # prompt / user input chars // 4 -> input tokens
-            # output + thinking chars // 4 -> output tokens
-            # 45% cache hit rate if multi-turn (call_count > 1)
+            # Token estimation (chars//4 heuristic; see _AGY_CACHE_HIT_RATE_MULTI_TURN):
+            # input ≈ input_chars // 4, output ≈ (output_chars + thinking) // 4.
+            # Single-turn sessions assume 0% cache (no reusable prefix);
+            # multi-turn sessions assume a flat 45% cached-input share.
             input_tokens = input_chars // 4
-            cached_input = int(input_tokens * 0.45) if call_count > 1 else 0
+            cached_input = int(input_tokens * _AGY_CACHE_HIT_RATE_MULTI_TURN) if call_count > 1 else 0
             uncached_input = max(0, input_tokens - cached_input)
             reasoning_output_tokens = thinking_chars // 4
             output_tokens = (output_chars + thinking_chars) // 4
@@ -373,7 +383,7 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                     reasoning_output_tokens,
                     [int(event["thinking_chars"]) for event in call_events],
                 )
-                cached_total = int(input_tokens * 0.45) if call_count > 1 else 0
+                cached_total = int(input_tokens * _AGY_CACHE_HIT_RATE_MULTI_TURN) if call_count > 1 else 0
                 cached_allocations = _allocate_total(cached_total, input_allocations)
                 for index, event in enumerate(call_events):
                     event_input = input_allocations[index]
@@ -445,7 +455,8 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
             output_tokens = steps * 200
             reasoning_output_tokens = int(output_tokens * 0.2)
             call_count = steps
-            cached_input = int(input_tokens * 0.45) if call_count > 1 else 0
+            # Same single- vs multi-turn cache split as the transcript path.
+            cached_input = int(input_tokens * _AGY_CACHE_HIT_RATE_MULTI_TURN) if call_count > 1 else 0
             uncached_input = max(0, input_tokens - cached_input)
             total_tokens = input_tokens + output_tokens
 
@@ -628,6 +639,15 @@ def _legacy_sessions_to_contract(
         session = UsageSession.from_legacy_dict(raw_session)
         session.provider = "antigravity"
         session.tool = "antigravity"
+        # Token provenance: AGY counts are chars//4 estimates, unlike the
+        # exact API counts from Codex/Claude. Cost provenance already flows
+        # via CostEstimate.source ("estimated"); the metadata flag below
+        # marks the *token* counts as estimated so the aggregator and UI
+        # can surface it without overloading cost_source.
+        session.metadata["estimated"] = True
+        session.metadata["token_source"] = "estimated"
+        if session.cost is not None and session.cost.source != "reported":
+            session.cost.source = "estimated"
         for event in session.events:
             if event.model is None:
                 event.model = session.model
