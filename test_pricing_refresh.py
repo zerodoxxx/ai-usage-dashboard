@@ -62,6 +62,8 @@ def test_refresh_persists_last_good_snapshot_and_reports_stale_failure(tmp_path:
     assert get_pricing_strict("gpt-5.6-sol").rates.uncached_input == 4.0
     assert get_pricing_strict("codex-auto-review", provider="codex").status == "known"
     assert get_pricing_strict("codex-auto-review", provider="codex").canonical_model == "gpt-5.6-luna"
+    assert get_pricing_strict("gpt-reserve", provider="codex").status == "known"
+    assert get_pricing_strict("gpt-reserve", provider="codex").canonical_model == "gpt-5.6-luna"
 
     stale = refresh_openai_pricing(
         force=True,
@@ -80,6 +82,7 @@ def test_active_payload_keeps_legacy_model_keys_and_adds_reserved_metadata(tmp_p
     assert payload["gpt-5.6-sol"]["uncached_input"] == 4.0
     assert payload["__meta__"]["tier"] == "standard"
     assert payload["codex-auto-review"]["uncached_input"] == payload["gpt-5.6-luna"]["uncached_input"]
+    assert payload["gpt-reserve"]["uncached_input"] == payload["gpt-5.6-luna"]["uncached_input"]
 
 
 def test_custom_cache_paths_reactivate_matching_rates_and_metadata(tmp_path: Path) -> None:
@@ -124,14 +127,40 @@ def test_estimated_costs_are_repriced_but_reported_cost_is_preserved(tmp_path: P
     assert float(reported.cost.reported_usd) == 0.42
 
 
-def test_codex_auto_review_uses_luna_pricing() -> None:
-    review = get_pricing_strict("codex-auto-review", provider="codex")
+def test_codex_luna_aliases_use_luna_pricing() -> None:
     luna = get_pricing_strict("gpt-5.6-luna", provider="codex")
-    assert review.status == "known"
-    assert review.canonical_model == "gpt-5.6-luna"
-    assert review.rates is not None
     assert luna.rates is not None
-    assert review.rates.as_dict() == luna.rates.as_dict()
+    for model in ("codex-auto-review", "gpt-reserve"):
+        resolved = get_pricing_strict(model, provider="codex")
+        assert resolved.status == "known"
+        assert resolved.canonical_model == "gpt-5.6-luna"
+        assert resolved.rates is not None
+        assert resolved.rates.as_dict() == luna.rates.as_dict()
+
+
+def test_gpt_reserve_estimated_cost_matches_luna() -> None:
+    reserve = UsageSession(
+        id="reserve",
+        tool="codex",
+        provider="codex",
+        model="gpt-reserve",
+        usage=TokenUsage(input_tokens=1_000_000, cached_input_tokens=0, output_tokens=0),
+        cost=CostEstimate(cached_usd=0.0, uncached_usd=0.0, source="estimated"),
+    )
+    luna = UsageSession(
+        id="luna",
+        tool="codex",
+        provider="codex",
+        model="gpt-5.6-luna",
+        usage=TokenUsage(input_tokens=1_000_000, cached_input_tokens=0, output_tokens=0),
+        cost=CostEstimate(cached_usd=0.0, uncached_usd=0.0, source="estimated"),
+    )
+    _refresh_estimated_session_cost(reserve)
+    _refresh_estimated_session_cost(luna)
+    assert reserve.cost is not None
+    assert luna.cost is not None
+    assert reserve.cost.cached_usd == luna.cost.cached_usd
+    assert float(reserve.cost.cached_usd) == 0.20
 
 
 def test_conditional_get_uses_persisted_validators_and_handles_304(tmp_path: Path, monkeypatch) -> None:

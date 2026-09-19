@@ -22,10 +22,12 @@
     return window.DashboardUtils || { formatCompactNumber: (num) => String(num) };
   }
 
-  function formatDollarPer1k(val) {
+  function formatDollarPerMillion(val) {
     const num = Number(val || 0);
-    if (num === 0) return '$0.0000/1k';
-    return num < 0.0001 ? `$${num.toFixed(6)}/1k` : `$${num.toFixed(4)}/1k`;
+    if (!Number.isFinite(num) || num === 0) return '$0.00/1M';
+    if (Math.abs(num) < 0.01) return `$${num.toFixed(4)}/1M`;
+    if (Math.abs(num) < 1) return `$${num.toFixed(3)}/1M`;
+    return `$${num.toFixed(2)}/1M`;
   }
 
   function defaultLegend() {
@@ -345,8 +347,9 @@
   }
 
   /**
-   * Chart 5: Cost per 1K Tokens by Model (Horizontal Bar)
-   * Displays $/1K tokens efficiency for top models.
+   * Chart 5: Cost per 1M Tokens by Model (Horizontal Bar)
+   * Actual blended $/1M from each model's token mix, for the 8 models
+   * with the most tokens in the current filter.
    */
   function updateCostPer1kChart(models, canvas) {
     if (!canvas) return;
@@ -357,15 +360,22 @@
       .slice(0, 8);
 
     const labels = list.map((m) => m.model || 'Unknown');
-    const costPer1kData = list.map((m) => {
+    const costPerMillionData = list.map((m) => {
       const tokens = Number(m.total_tokens || 0);
       const cost = Number(m.est_cost_cached_usd ?? m.cost_cached_usd ?? 0);
-      return tokens > 0 ? (cost / tokens) * 1000 : 0;
+      return tokens > 0 ? (cost / tokens) * 1_000_000 : 0;
     });
 
     if (prepareCanvas(chartCostPer1k, canvas)) {
       chartCostPer1k.data.labels = labels;
-      chartCostPer1k.data.datasets[0].data = costPer1kData;
+      chartCostPer1k.data.datasets[0].data = costPerMillionData;
+      chartCostPer1k.data.datasets[0].label = 'Blended cost / 1M tokens ($)';
+      if (chartCostPer1k.options.scales && chartCostPer1k.options.scales.x && chartCostPer1k.options.scales.x.title) {
+        chartCostPer1k.options.scales.x.title.text = 'Blended cost per 1M tokens ($)';
+      }
+      if (chartCostPer1k.options.scales && chartCostPer1k.options.scales.x && chartCostPer1k.options.scales.x.ticks) {
+        chartCostPer1k.options.scales.x.ticks.callback = (val) => formatDollarPerMillion(val);
+      }
       chartCostPer1k.update();
       return;
     }
@@ -375,8 +385,8 @@
       data: {
         labels,
         datasets: [{
-          label: 'Cost / 1K Tokens ($)',
-          data: costPer1kData,
+          label: 'Blended cost / 1M tokens ($)',
+          data: costPerMillionData,
           backgroundColor: 'rgba(139, 92, 246, 0.7)',
           borderColor: '#8b5cf6',
           borderWidth: 1.5,
@@ -388,13 +398,13 @@
         indexAxis: 'y',
         plugins: {
           legend: defaultLegend(),
-          tooltip: defaultTooltip((ctx) => ` ${formatDollarPer1k(ctx.raw)}`),
+          tooltip: defaultTooltip((ctx) => ` ${formatDollarPerMillion(ctx.raw)} actual blended`),
         },
         scales: {
           x: {
             grid: { color: 'rgba(255, 255, 255, 0.05)' },
-            ticks: { color: COLOR_MUTED, font: { size: 11 }, callback: (val) => formatDollarPer1k(val) },
-            title: { display: true, text: 'Cost per 1K Tokens ($)', color: '#8b5cf6', font: { size: 11 } },
+            ticks: { color: COLOR_MUTED, font: { size: 11 }, callback: (val) => formatDollarPerMillion(val) },
+            title: { display: true, text: 'Blended cost per 1M tokens ($)', color: '#8b5cf6', font: { size: 11 } },
           },
           y: {
             grid: { color: GRID_COLOR },
