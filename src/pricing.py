@@ -33,6 +33,8 @@ from urllib.request import Request, urlopen
 MODEL_PRICING: dict[str, dict[str, float]] = {
     # Codex / OpenAI
     "gpt-6-astra": {"uncached_input": 10.0, "cached_input": 1.0, "output": 50.0},
+    "gpt-6-sol": {"uncached_input": 2.00, "cached_input": 0.20, "output": 10.00},
+    "gpt-6-luna": {"uncached_input": 0.10, "cached_input": 0.01, "output": 0.50},
     "gpt-5.6-luna": {"uncached_input": 0.20, "cached_input": 0.02, "output": 1.20},
     "gpt-5.6-sol": {"uncached_input": 4.00, "cached_input": 0.40, "output": 20.00},
     "gpt-5.6-terra": {"uncached_input": 2.00, "cached_input": 0.20, "output": 12.00},
@@ -87,6 +89,10 @@ _ALIASES: list[tuple[str, str]] = [
     ("gemini-2.5-flash", "Gemini 2.5 Flash"), ("1.5 pro", "Gemini 1.5 Pro"),
     ("gemini-1.5-pro", "Gemini 1.5 Pro"), ("1.5 flash", "Gemini 1.5 Flash"),
     ("gemini-1.5-flash", "Gemini 1.5 Flash"), ("astra", "gpt-6-astra"),
+    ("6-sol", "gpt-6-sol"), ("gpt6-sol", "gpt-6-sol"), ("gpt-6 sol", "gpt-6-sol"),
+    ("gpt 6 sol", "gpt-6-sol"), ("6 sol", "gpt-6-sol"),
+    ("6-luna", "gpt-6-luna"), ("gpt6-luna", "gpt-6-luna"), ("gpt-6 luna", "gpt-6-luna"),
+    ("gpt 6 luna", "gpt-6-luna"), ("6 luna", "gpt-6-luna"),
     ("luna", "gpt-5.6-luna"), ("codex-auto-review", "gpt-5.6-luna"),
     ("gpt-reserve", "gpt-5.6-luna"),
     ("sol", "gpt-5.6-sol"), ("terra", "gpt-5.6-terra"),

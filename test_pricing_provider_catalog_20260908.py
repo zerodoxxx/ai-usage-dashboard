@@ -81,3 +81,24 @@ def test_current_claude_and_deepseek_models_have_pricing() -> None:
     flash = get_pricing_strict("deepseek-v4-flash", provider="deepseek")
     assert flash.status == "known"
     assert flash.rates == PricingRates(0.30, 0.006, 1.20)
+
+
+def test_gpt6_sol_and_luna_have_pricing() -> None:
+    sol = get_pricing_strict("gpt-6-sol", provider="codex")
+    assert sol.status == "known"
+    assert sol.canonical_model == "gpt-6-sol"
+    assert sol.rates == PricingRates(2.00, 0.20, 10.00)
+
+    sol_alias = get_pricing_strict("6-sol")
+    assert sol_alias.status == "known"
+    assert sol_alias.canonical_model == "gpt-6-sol"
+
+    luna = get_pricing_strict("gpt-6-luna", provider="codex")
+    assert luna.status == "known"
+    assert luna.canonical_model == "gpt-6-luna"
+    assert luna.rates == PricingRates(0.10, 0.01, 0.50)
+
+    luna_alias = get_pricing_strict("6-luna")
+    assert luna_alias.status == "known"
+    assert luna_alias.canonical_model == "gpt-6-luna"
+

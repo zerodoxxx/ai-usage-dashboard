@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.pricing import MODEL_PRICING, calculate_cost, get_pricing
+from src.pricing import MODEL_PRICING, calculate_cost, get_pricing, get_pricing_strict
 from src.parsers.codex import _parse_rollout_file, parse_codex_usage
 from src.parsers.agy import parse_agy_usage
 from src.parsers.claude import parse_claude_code_usage
@@ -45,6 +45,14 @@ def test_pricing() -> None:
     cases = [
         ("gpt-6-astra", 10.0, 1.0, 50.0),
         ("ASTRA", 10.0, 1.0, 50.0),
+        ("gpt-6-sol", 2.00, 0.20, 10.00),
+        ("gpt-6-luna", 0.10, 0.01, 0.50),
+        ("6-sol", 2.00, 0.20, 10.00),
+        ("gpt-6 sol", 2.00, 0.20, 10.00),
+        ("6 sol", 2.00, 0.20, 10.00),
+        ("6-luna", 0.10, 0.01, 0.50),
+        ("gpt-6 luna", 0.10, 0.01, 0.50),
+        ("6 luna", 0.10, 0.01, 0.50),
         ("gpt-5.6-luna", 0.20, 0.02, 1.20),
         ("Luna", 0.20, 0.02, 1.20),
         ("codex-auto-review", 0.20, 0.02, 1.20),
@@ -78,6 +86,69 @@ def test_pricing() -> None:
     assert c["cost_uncached_usd"] == 70.0, f"Expected 70.0, got {c['cost_uncached_usd']}"
     assert c["savings_usd"] == 9.0, f"Expected 9.0, got {c['savings_usd']}"
     print(f"✓ Cost calculation verified: {c}")
+
+    # Cost calculation for gpt-6-sol and gpt-6-luna
+    c_sol = calculate_cost("gpt-6-sol", 1_000_000, 1_000_000, 1_000_000)
+    assert c_sol["cost_cached_usd"] == 12.20, f"Expected 12.20, got {c_sol['cost_cached_usd']}"
+    assert c_sol["cost_uncached_usd"] == 14.00, f"Expected 14.00, got {c_sol['cost_uncached_usd']}"
+    assert c_sol["savings_usd"] == 1.80, f"Expected 1.80, got {c_sol['savings_usd']}"
+
+    c_luna = calculate_cost("gpt-6-luna", 1_000_000, 1_000_000, 1_000_000)
+    assert c_luna["cost_cached_usd"] == 0.61, f"Expected 0.61, got {c_luna['cost_cached_usd']}"
+    assert c_luna["cost_uncached_usd"] == 0.70, f"Expected 0.70, got {c_luna['cost_uncached_usd']}"
+    assert c_luna["savings_usd"] == 0.09, f"Expected 0.09, got {c_luna['savings_usd']}"
+
+    # Strict resolution verification
+    res_sol = get_pricing_strict("gpt-6-sol")
+    assert res_sol.status == "known"
+    assert res_sol.canonical_model == "gpt-6-sol"
+    assert res_sol.provider == "codex"
+    assert res_sol.rates is not None
+    assert res_sol.rates.uncached_input == 2.00
+    assert res_sol.rates.cached_input == 0.20
+    assert res_sol.rates.output == 10.00
+
+    res_sol_alias = get_pricing_strict("6-sol")
+    assert res_sol_alias.status == "known"
+    assert res_sol_alias.canonical_model == "gpt-6-sol"
+
+    res_sol_space = get_pricing_strict("gpt-6 sol")
+    assert res_sol_space.status == "known"
+    assert res_sol_space.canonical_model == "gpt-6-sol"
+
+    res_sol_num_space = get_pricing_strict("6 sol")
+    assert res_sol_num_space.status == "known"
+    assert res_sol_num_space.canonical_model == "gpt-6-sol"
+
+    res_luna = get_pricing_strict("gpt-6-luna")
+    assert res_luna.status == "known"
+    assert res_luna.canonical_model == "gpt-6-luna"
+    assert res_luna.provider == "codex"
+    assert res_luna.rates is not None
+    assert res_luna.rates.uncached_input == 0.10
+    assert res_luna.rates.cached_input == 0.01
+    assert res_luna.rates.output == 0.50
+
+    res_luna_alias = get_pricing_strict("6-luna")
+    assert res_luna_alias.status == "known"
+    assert res_luna_alias.canonical_model == "gpt-6-luna"
+
+    res_luna_space = get_pricing_strict("gpt-6 luna")
+    assert res_luna_space.status == "known"
+    assert res_luna_space.canonical_model == "gpt-6-luna"
+
+    res_luna_num_space = get_pricing_strict("6 luna")
+    assert res_luna_num_space.status == "known"
+    assert res_luna_num_space.canonical_model == "gpt-6-luna"
+
+    res_sol_base = get_pricing_strict("sol")
+    assert res_sol_base.status == "known"
+    assert res_sol_base.canonical_model == "gpt-5.6-sol"
+
+    res_luna_base = get_pricing_strict("luna")
+    assert res_luna_base.status == "known"
+    assert res_luna_base.canonical_model == "gpt-5.6-luna"
+    print("✓ Strict resolution verified for gpt-6-sol and gpt-6-luna.")
 
 
 def test_codex() -> dict:

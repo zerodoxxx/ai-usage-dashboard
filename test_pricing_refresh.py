@@ -22,6 +22,8 @@ STANDARD_FIXTURE = """
 | Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | gpt-6-astra | $10.00 | $1.00 | $12.50 | $50.00 | $20.00 | $2.00 | $25.00 | $75.00 |
+| gpt-6-sol | $2.00 | $0.20 | $2.50 | $10.00 | $4.00 | $0.40 | $5.00 | $15.00 |
+| gpt-6-luna | $0.10 | $0.01 | $0.125 | $0.50 | $0.20 | $0.02 | $0.25 | $0.75 |
 | gpt-5.6-sol | $4.00 | $0.40 | $5.00 | $20.00 | $8.00 | $0.80 | $10.00 | $30.00 |
 | gpt-5.6-terra | $2.00 | $0.20 | $2.50 | $12.00 | $4.00 | $0.40 | $5.00 | $18.00 |
 | gpt-5.6-luna | $0.20 | $0.02 | $0.25 | $1.20 | $0.40 | $0.04 | $0.50 | $1.80 |
@@ -294,7 +296,12 @@ def test_parser_rejects_duplicate_rows_and_structurally_incomplete_tables() -> N
     else:
         raise AssertionError("duplicate model row was accepted")
 
-    incomplete = STANDARD_FIXTURE.replace("| gpt-5.6-terra | $2.00 | $0.20 | $2.50 | $12.00 | $4.00 | $0.40 | $5.00 | $18.00 |\n", "")
+    incomplete = (
+        STANDARD_FIXTURE
+        .replace("| gpt-6-sol | $2.00 | $0.20 | $2.50 | $10.00 | $4.00 | $0.40 | $5.00 | $15.00 |\n", "")
+        .replace("| gpt-6-luna | $0.10 | $0.01 | $0.125 | $0.50 | $0.20 | $0.02 | $0.25 | $0.75 |\n", "")
+        .replace("| gpt-5.6-terra | $2.00 | $0.20 | $2.50 | $12.00 | $4.00 | $0.40 | $5.00 | $18.00 |\n", "")
+    )
     try:
         parse_openai_standard_pricing(incomplete)
     except ValueError as exc:
@@ -307,11 +314,16 @@ def test_parser_does_not_require_specific_model_ids() -> None:
     future_models = STANDARD_FIXTURE
     for old, new in {
         "gpt-6-astra": "gpt-7-alpha",
-        "gpt-5.6-sol": "gpt-7-beta",
+        "gpt-6-sol": "gpt-7-beta",
+        "gpt-6-luna": "gpt-7-gamma",
+        "gpt-5.6-sol": "gpt-7-delta",
         "gpt-5.6-terra": "o5-mini",
         "gpt-5.6-luna": "o5-pro",
         "gpt-5.5 (<272K context length)": "research-1",
     }.items():
         future_models = future_models.replace(old, new)
     rates = parse_openai_standard_pricing(future_models)
-    assert set(rates) == {"gpt-7-alpha", "gpt-7-beta", "o5-mini", "o5-pro", "research-1"}
+    assert set(rates) == {
+        "gpt-7-alpha", "gpt-7-beta", "gpt-7-gamma", "gpt-7-delta",
+        "o5-mini", "o5-pro", "research-1",
+    }
