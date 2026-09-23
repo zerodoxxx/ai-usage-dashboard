@@ -33,7 +33,7 @@ _AGY_PARSE_CACHE: dict[tuple[str, tuple[tuple[str, int, int], ...]], dict[str, A
 def _source_signature(base_dir: Path) -> tuple[str, tuple[tuple[str, int, int], ...]]:
     """Build a lightweight signature for the AGY files used by the parser."""
     tracked_paths: set[Path] = set()
-    for path in (base_dir / "settings.json",):
+    for path in (base_dir / "settings.json", base_dir / "token_usage.db"):
         if path.exists():
             tracked_paths.add(path)
 
@@ -166,6 +166,79 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
         except Exception as e:
             logger.debug("Failed to read settings.json from %s: %s", settings_file, e)
 
+    # 1b. Load from token_usage.db if available
+    token_db_path = base_dir / "token_usage.db"
+    db_sessions: dict[str, dict[str, Any]] = {}
+    db_session_ids: set[str] = set()
+    if token_db_path.exists():
+        conn = None
+        try:
+            try:
+                uri = f"file:{token_db_path.resolve().as_posix()}?mode=ro"
+                conn = sqlite3.connect(uri, uri=True)
+            except Exception:
+                conn = sqlite3.connect(str(token_db_path))
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM sessions")
+            for row in cursor.fetchall():
+                sid = row["session_id"]
+                db_session_ids.add(sid)
+                ev_cursor = conn.execute("SELECT * FROM token_events WHERE session_id = ? ORDER BY step_index", (sid,))
+                events = []
+                for ev in ev_cursor.fetchall():
+                    events.append({
+                        "timestamp": ev["timestamp"],
+                        "model": ev["model"],
+                        "input_tokens": ev["input_tokens"],
+                        "cached_input_tokens": ev["cached_input_tokens"],
+                        "output_tokens": ev["output_tokens"],
+                        "cache_write_tokens": ev["cache_write_tokens"],
+                        "reasoning_output_tokens": ev["reasoning_output_tokens"],
+                        "total_tokens": ev["total_tokens"],
+                        "cost_usd": ev["cost_usd"],
+                    })
+                inp = int(row["input_tokens"] or 0)
+                cached = int(row["cached_input_tokens"] or 0)
+                uncached = max(0, inp - cached)
+                out = int(row["output_tokens"] or 0)
+                tot = int(row["total_tokens"] or 0)
+                cost = float(row["cost_usd"] or 0.0)
+                hit_rate = round((cached / inp * 100.0), 2) if inp > 0 else 0.0
+
+                db_sessions[sid] = {
+                    "id": sid,
+                    "title": row["title"] or f"AGY Session {sid[:8]}",
+                    "tool": "antigravity",
+                    "model": row["model"],
+                    "call_count": int(row["call_count"] or 1),
+                    "uncached_input": uncached,
+                    "cached_input": cached,
+                    "total_input": inp,
+                    "output": out,
+                    "reasoning_output": int(row["reasoning_output_tokens"] or 0),
+                    "total_tokens": tot,
+                    "cache_hit_rate": hit_rate,
+                    "cost_cached_usd": cost,
+                    "cost_uncached_usd": 0.0,
+                    "savings_usd": 0.0,
+                    "cost_usd": cost,
+                    "created_at": row["timestamp"],
+                    "start_time": row["timestamp"],
+                    "end_time": row["updated_at"],
+                    "usage_events": events,
+                    "from_token_usage_db": True,
+                }
+            cursor.close()
+        except Exception as e:
+            logger.warning("Error reading token_usage.db: %s", e)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     # 2. Comprehensive session discovery:
     # 2a. Scan brain/**/transcript.jsonl using os.walk
     brain_dir = base_dir / "brain"
@@ -268,11 +341,14 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
             }
 
     # 3. Collect all session IDs and process
-    all_session_ids = set(transcripts_by_session.keys()) | set(summaries.keys()) | set(conv_db_sessions.keys())
+    all_session_ids = set(transcripts_by_session.keys()) | set(summaries.keys()) | set(conv_db_sessions.keys()) | db_session_ids
 
     sessions: list[dict[str, Any]] = []
 
     for session_id in sorted(all_session_ids):
+        if session_id in db_sessions:
+            sessions.append(db_sessions[session_id])
+            continue
         if session_id in transcripts_by_session:
             t_path = transcripts_by_session[session_id]
             input_chars = 0
@@ -351,10 +427,6 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                 logger.warning("Error reading transcript for %s: %s", t_path, e)
                 continue
 
-            # Token estimation (chars//4 heuristic; see _AGY_CACHE_HIT_RATE_MULTI_TURN):
-            # input ≈ input_chars // 4, output ≈ (output_chars + thinking) // 4.
-            # Single-turn sessions assume 0% cache (no reusable prefix);
-            # multi-turn sessions assume a flat 45% cached-input share.
             input_tokens = input_chars // 4
             cached_input = int(input_tokens * _AGY_CACHE_HIT_RATE_MULTI_TURN) if call_count > 1 else 0
             uncached_input = max(0, input_tokens - cached_input)
@@ -362,10 +434,6 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
             output_tokens = (output_chars + thinking_chars) // 4
             total_tokens = input_tokens + output_tokens
 
-            # Attribute transcript input/output estimates to individual model
-            # calls so rolling time filters can include only the calls that
-            # occurred inside the selected window. Any trailing context is
-            # assigned to the final call to preserve the session total.
             if call_events and pending_input_chars:
                 call_events[-1]["input_chars"] += pending_input_chars
 
@@ -455,7 +523,6 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
             output_tokens = steps * 200
             reasoning_output_tokens = int(output_tokens * 0.2)
             call_count = steps
-            # Same single- vs multi-turn cache split as the transcript path.
             cached_input = int(input_tokens * _AGY_CACHE_HIT_RATE_MULTI_TURN) if call_count > 1 else 0
             uncached_input = max(0, input_tokens - cached_input)
             total_tokens = input_tokens + output_tokens
@@ -533,9 +600,9 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
         entry["output"] += s["output"]
         entry["reasoning_output"] += s["reasoning_output"]
         entry["total_tokens"] += s["total_tokens"]
-        entry["est_cost_cached_usd"] += s["cost_cached_usd"]
-        entry["est_cost_uncached_usd"] += s["cost_uncached_usd"]
-        entry["est_savings_usd"] += s["savings_usd"]
+        entry["est_cost_cached_usd"] += s.get("cost_cached_usd", s.get("cost_usd", 0.0))
+        entry["est_cost_uncached_usd"] += s.get("cost_uncached_usd", 0.0)
+        entry["est_savings_usd"] += s.get("savings_usd", 0.0)
 
     for entry in models_dict.values():
         tot_in = entry["total_input"]
@@ -577,9 +644,9 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
         day["total_tokens"] += s["total_tokens"]
         day["call_count"] += s["call_count"]
         day["session_count"] += 1
-        day["cost_cached_usd"] += s["cost_cached_usd"]
-        day["cost_uncached_usd"] += s["cost_uncached_usd"]
-        day["savings_usd"] += s["savings_usd"]
+        day["cost_cached_usd"] += s.get("cost_cached_usd", s.get("cost_usd", 0.0))
+        day["cost_uncached_usd"] += s.get("cost_uncached_usd", 0.0)
+        day["savings_usd"] += s.get("savings_usd", 0.0)
 
     timeline_list = []
     for date_key in sorted(timeline_dict.keys()):
@@ -596,9 +663,9 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
     tot_output = sum(s["output"] for s in sessions)
     tot_reasoning = sum(s["reasoning_output"] for s in sessions)
     tot_tokens = sum(s["total_tokens"] for s in sessions)
-    tot_cost_cached = round(sum(s["cost_cached_usd"] for s in sessions), 6)
-    tot_cost_uncached = round(sum(s["cost_uncached_usd"] for s in sessions), 6)
-    tot_savings = round(sum(s["savings_usd"] for s in sessions), 6)
+    tot_cost_cached = round(sum(s.get("cost_cached_usd", s.get("cost_usd", 0.0)) for s in sessions), 6)
+    tot_cost_uncached = round(sum(s.get("cost_uncached_usd", 0.0) for s in sessions), 6)
+    tot_savings = round(sum(s.get("savings_usd", 0.0) for s in sessions), 6)
     summary_cache_hit_rate = round((tot_cached / tot_input * 100.0), 2) if tot_input > 0 else 0.0
 
     summary = {
@@ -639,15 +706,16 @@ def _legacy_sessions_to_contract(
         session = UsageSession.from_legacy_dict(raw_session)
         session.provider = "antigravity"
         session.tool = "antigravity"
-        # Token provenance: AGY counts are chars//4 estimates, unlike the
-        # exact API counts from Codex/Claude. Cost provenance already flows
-        # via CostEstimate.source ("estimated"); the metadata flag below
-        # marks the *token* counts as estimated so the aggregator and UI
-        # can surface it without overloading cost_source.
-        session.metadata["estimated"] = True
-        session.metadata["token_source"] = "estimated"
-        if session.cost is not None and session.cost.source != "reported":
-            session.cost.source = "estimated"
+        if raw_session.get("from_token_usage_db"):
+            session.metadata["estimated"] = False
+            session.metadata["token_source"] = "reported"
+            if session.cost is not None:
+                session.cost.source = "reported"
+        else:
+            session.metadata["estimated"] = True
+            session.metadata["token_source"] = "estimated"
+            if session.cost is not None and session.cost.source != "reported":
+                session.cost.source = "estimated"
         for event in session.events:
             if event.model is None:
                 event.model = session.model

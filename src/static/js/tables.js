@@ -5,6 +5,38 @@
 (function () {
   'use strict';
 
+  const SESSION_TITLE_MAX_LENGTH = 96;
+  const CODEX_HISTORY_TITLE_PREFIX = /^The following is the Codex agent history whose request action you are assessing:\s*/i;
+
+  /**
+   * Return a compact, one-line session title for the table while leaving the
+   * complete (escaped by the caller) value available to title/ARIA metadata.
+   * Some provider exports prepend a verbose wrapper to the actual request;
+   * remove only that known wrapper so ordinary user titles remain untouched.
+   */
+  function normalizeSessionTitle(value) {
+    const raw = String(value ?? '').replace(/\s+/g, ' ').trim();
+    if (!raw) return 'Untitled Session';
+
+    const withoutWrapper = raw.replace(CODEX_HISTORY_TITLE_PREFIX, '').trim() || raw;
+    if (withoutWrapper.length <= SESSION_TITLE_MAX_LENGTH) return withoutWrapper;
+    return `${withoutWrapper.slice(0, SESSION_TITLE_MAX_LENGTH - 1).trimEnd()}…`;
+  }
+
+  function fullSessionTitle(value) {
+    const normalized = String(value ?? '').replace(/\s+/g, ' ').trim();
+    return normalized || 'Untitled Session';
+  }
+
+  function sessionCountLabel(displayCount, totalCount, query) {
+    const display = Number(displayCount) || 0;
+    const total = Number(totalCount) || 0;
+    const noun = total === 1 ? 'session' : 'sessions';
+    const matching = query ? ' matching' : '';
+    if (display < total) return `Showing ${display} of ${total}${matching} ${noun}`;
+    return `${display}${matching} ${noun}`;
+  }
+
   /**
    * Render Per-Model Granularity Table with all 12 columns.
    * @param {Array} models
@@ -84,7 +116,10 @@
         ? ` <span class="unpriced-pill" title="${escapeHtml(unpricedTitle)}">unpriced</span>`
         : '';
       const costTitle = isUnpricedRow ? ` title="${escapeHtml(unpricedTitle)}"` : tokTitle;
-      const cachedCost = isUnpricedRow ? '<strong>$0.0000</strong>' : `<strong>${usd(m.est_cost_cached_usd)}</strong>`;
+      const unavailableCost = `<strong class="cost-unavailable" title="${escapeHtml(unpricedTitle)}" aria-label="Unavailable; no catalog rate">—</strong>`;
+      const cachedCost = isUnpricedRow ? unavailableCost : `<strong>${usd(m.est_cost_cached_usd)}</strong>`;
+      const uncachedCost = isUnpricedRow ? unavailableCost : usd(m.est_cost_uncached_usd);
+      const savingsCost = isUnpricedRow ? unavailableCost : `+${usd(m.est_savings_usd)}`;
 
       rowsHtml += `
         <tr class="${isUnpricedRow ? 'unpriced-row' : ''}">
@@ -103,8 +138,8 @@
           </td>
           <td class="cell-mono cell-right text-muted">${ratesStr}</td>
           <td class="cell-mono cell-right"${costTitle}>${cachedCost}</td>
-          <td class="cell-mono cell-right text-muted"${tokTitle}>${usd(m.est_cost_uncached_usd)}</td>
-          <td class="cell-mono cell-right text-success"${tokTitle}>+${usd(m.est_savings_usd)}</td>
+          <td class="cell-mono cell-right text-muted"${costTitle}>${uncachedCost}</td>
+          <td class="cell-mono cell-right ${isUnpricedRow ? 'text-muted' : 'text-success'}"${costTitle}>${savingsCost}</td>
         </tr>
       `;
     });
@@ -143,9 +178,11 @@
     }
 
     if (ctx.countBadge) {
-      ctx.countBadge.textContent = query
-        ? `${filtered.length} of ${sessionList.length} Sessions`
-        : `${sessionList.length} Sessions`;
+      ctx.countBadge.textContent = sessionCountLabel(
+        Math.min(filtered.length, 100),
+        filtered.length,
+        query,
+      );
     }
 
     if (filtered.length === 0) {
@@ -174,14 +211,15 @@
       else if (hitRate >= 35) hitRateClass = 'hit-rate-mid';
 
       const dateStr = formatDateTime(s.activity_at || s.created_at || s.start_time);
-      const titleStr = String(s.title || 'Untitled Session');
+      const titleStr = normalizeSessionTitle(s.title);
+      const fullTitle = fullSessionTitle(s.title);
       const idStr = String(s.id || '');
       const modelStr = String(s.model || 'unknown');
 
       rowsHtml += `
         <tr>
           <td>
-            <strong>${escapeHtml(titleStr)}</strong>
+            <strong class="session-title" title="${escapeHtml(fullTitle)}" aria-label="${escapeHtml(fullTitle)}">${escapeHtml(titleStr)}</strong>
             <div class="text-muted" style="font-size: 11px; font-family: var(--font-mono);">${escapeHtml(idStr)}</div>
           </td>
           <td>
@@ -204,5 +242,7 @@
   window.DashboardTables = {
     renderModelTable,
     renderSessionsTable,
+    normalizeSessionTitle,
+    sessionCountLabel,
   };
 })();

@@ -36,12 +36,20 @@
 
       this.currentValue = 0;
       this.slots = []; // Track mounted slot descriptors: { type: 'digit'|'sep', char, element, ribbon }
+      this._originalRole = this.el.getAttribute('role');
+      this._originalAriaLabel = this.el.getAttribute('aria-label');
 
       this._init();
     }
 
     _init() {
       this.el.classList.add('odometer-container');
+      // The visible mechanism is intentionally hidden from assistive technology:
+      // each ribbon contains all ten digits, so exposing its children would make
+      // a single value sound like a long sequence of repeated digits. The
+      // container exposes one stable, current value instead (and is not a live
+      // region, so polling/animation does not interrupt the user).
+      this.el.setAttribute('role', 'img');
       this.update(0, true);
     }
 
@@ -87,6 +95,10 @@
       this.currentValue = isNaN(num) ? 0 : num;
 
       const chars = this._formatToChars(this.currentValue);
+      this.el.setAttribute(
+        'aria-label',
+        `${this.prefix}${chars.join('')}${this.suffix}`,
+      );
 
       // Check if current slot structure matches the new chars pattern
       const structureMatches = !isInitial &&
@@ -139,6 +151,7 @@
       if (this.prefix) {
         const prefixEl = document.createElement('span');
         prefixEl.className = 'odometer-prefix';
+        prefixEl.setAttribute('aria-hidden', 'true');
         prefixEl.textContent = this.prefix;
         this.el.appendChild(prefixEl);
       }
@@ -154,10 +167,12 @@
           const digit = parseInt(char, 10);
           const digitEl = document.createElement('span');
           digitEl.className = 'odometer-digit';
+          digitEl.setAttribute('aria-hidden', 'true');
           digitEl.setAttribute('data-digit', digit);
 
           const ribbon = document.createElement('span');
           ribbon.className = 'odometer-ribbon';
+          ribbon.setAttribute('aria-hidden', 'true');
 
           // Stack spans 0 through 9
           for (let i = 0; i <= 9; i++) {
@@ -184,6 +199,7 @@
         } else {
           const sepEl = document.createElement('span');
           sepEl.className = 'odometer-separator';
+          sepEl.setAttribute('aria-hidden', 'true');
           sepEl.textContent = char;
           this.el.appendChild(sepEl);
 
@@ -199,6 +215,7 @@
       if (this.suffix) {
         const suffixEl = document.createElement('span');
         suffixEl.className = 'odometer-suffix';
+        suffixEl.setAttribute('aria-hidden', 'true');
         suffixEl.textContent = this.suffix;
         this.el.appendChild(suffixEl);
       }
@@ -239,6 +256,10 @@
     destroy() {
       this.el.innerHTML = '';
       this.el.classList.remove('odometer-container');
+      if (this._originalRole === null) this.el.removeAttribute('role');
+      else this.el.setAttribute('role', this._originalRole);
+      if (this._originalAriaLabel === null) this.el.removeAttribute('aria-label');
+      else this.el.setAttribute('aria-label', this._originalAriaLabel);
       this.slots = [];
     }
   }

@@ -31,6 +31,7 @@
 
       <div class="header-controls">
         <div class="control-group filter-controls" aria-label="Usage filters">
+          <label class="visually-hidden" for="tool-select">AI tool filter</label>
           <select id="tool-select" class="select-control tool-select-control" title="Select AI Tool Filter">
             <option value="all" selected>All AI Tools (Combined)</option>
             <option value="codex">OpenAI Codex</option>
@@ -51,7 +52,7 @@
           <button id="custom-range-apply" class="btn-refresh" title="Apply custom date range" hidden>Apply</button>
         </div>
 
-        <div class="control-group">
+        <div class="control-group refresh-controls">
           <label class="toggle-wrapper" title="Toggle Auto-Refresh">
             <span class="switch">
               <input type="checkbox" id="auto-refresh-toggle" checked>
@@ -60,6 +61,7 @@
             <span>Auto Refresh</span>
           </label>
 
+          <label class="visually-hidden" for="refresh-interval">Auto-refresh interval</label>
           <select id="refresh-interval" class="select-control" title="Auto Refresh Interval">
             <option value="10000">10s</option>
             <option value="30000" selected>30s</option>
@@ -67,7 +69,7 @@
           </select>
         </div>
 
-        <div class="control-group">
+        <div class="control-group action-controls">
           <button id="refresh-btn" class="btn-refresh" title="Trigger Instant Refresh">
             <svg class="refresh-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
@@ -76,7 +78,7 @@
           </button>
         </div>
 
-        <span id="last-synced-badge" class="synced-badge">Syncing...</span>
+        <span id="last-synced-badge" class="synced-badge" role="status" aria-live="polite" aria-atomic="true">Syncing...</span>
       </div>
     </header>
 
@@ -176,42 +178,42 @@
           <div class="chart-card">
             <div class="chart-header">
               <div>
-                <div class="chart-title">Daily Cost & Token Trend</div>
-                <div class="chart-subtitle">Daily API spend, token volume, and call count</div>
+                <div id="chart-cost-title" class="chart-title">Daily Cost &amp; Token Trend</div>
+                <div id="chart-cost-desc" class="chart-subtitle">Daily API spend, token volume, and call count</div>
               </div>
             </div>
             <div class="chart-canvas-wrap">
-              <canvas id="chart-cost"></canvas>
+              <canvas id="chart-cost" role="img" aria-labelledby="chart-cost-title chart-cost-desc"></canvas>
             </div>
           </div>
 
           <div class="chart-card">
             <div class="chart-header">
               <div>
-                <div class="chart-title">Cost by Tool</div>
-                <div class="chart-subtitle">Estimated spend split across Codex, Claude Code & Antigravity</div>
+                <div id="chart-cost-by-tool-title" class="chart-title">Cost by Tool</div>
+                <div id="chart-cost-by-tool-desc" class="chart-subtitle">Estimated spend split across Codex, Claude Code &amp; Antigravity</div>
               </div>
             </div>
             <div class="chart-canvas-wrap">
-              <canvas id="chart-cost-by-tool"></canvas>
+              <canvas id="chart-cost-by-tool" role="img" aria-labelledby="chart-cost-by-tool-title chart-cost-by-tool-desc"></canvas>
             </div>
           </div>
 
           <div class="chart-card">
             <div class="chart-header">
               <div>
-                <div class="chart-title">Cost per 1M Tokens by Model</div>
-                <div class="chart-subtitle">Your estimated blended cost from this usage mix — not list price. Top 8 by token volume.</div>
+                <div id="chart-cost-per-1m-title" class="chart-title">Cost per 1M Tokens by Model</div>
+                <div id="chart-cost-per-1m-desc" class="chart-subtitle">Your estimated blended cost from this usage mix — not list price. Top 8 by token volume.</div>
               </div>
             </div>
             <div class="chart-canvas-wrap">
-              <canvas id="chart-cost-per-1k"></canvas>
+              <canvas id="chart-cost-per-1k" role="img" aria-labelledby="chart-cost-per-1m-title chart-cost-per-1m-desc"></canvas>
             </div>
           </div>
         </div>
       </details>
 
-      <details class="chart-group" open>
+      <details class="chart-group">
         <summary class="chart-group-summary">
           <svg class="chart-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <polyline points="9 6 15 12 9 18"></polyline>
@@ -222,30 +224,30 @@
           <div class="chart-card">
             <div class="chart-header">
               <div>
-                <div class="chart-title">Token Distribution by Model</div>
-                <div class="chart-subtitle">Breakdown of cached vs uncached input, output & reasoning</div>
+                <div id="chart-tokens-title" class="chart-title">Token Distribution by Model</div>
+                <div id="chart-tokens-desc" class="chart-subtitle">Breakdown of cached vs uncached input, output &amp; reasoning</div>
               </div>
             </div>
             <div class="chart-canvas-wrap">
-              <canvas id="chart-tokens"></canvas>
+              <canvas id="chart-tokens" role="img" aria-labelledby="chart-tokens-title chart-tokens-desc"></canvas>
             </div>
           </div>
 
           <div class="chart-card">
             <div class="chart-header">
               <div>
-                <div class="chart-title">Cache-Efficiency Trend</div>
-                <div class="chart-subtitle">Daily prompt-cache hit rate (cached input / total input)</div>
+                <div id="chart-cache-trend-title" class="chart-title">Cache-Efficiency Trend</div>
+                <div id="chart-cache-trend-desc" class="chart-subtitle">Daily prompt-cache hit rate (cached input / total input)</div>
               </div>
             </div>
             <div class="chart-canvas-wrap">
-              <canvas id="chart-cache-trend"></canvas>
+              <canvas id="chart-cache-trend" role="img" aria-labelledby="chart-cache-trend-title chart-cache-trend-desc"></canvas>
             </div>
           </div>
         </div>
       </details>
 
-      <details class="chart-group" open>
+      <details class="chart-group">
         <summary class="chart-group-summary">
           <svg class="chart-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <polyline points="9 6 15 12 9 18"></polyline>
@@ -257,22 +259,22 @@
             <div class="chart-header">
               <div>
                 <div class="chart-title" id="hourly-activity-title">Hourly Activity (local time)</div>
-                <div class="chart-subtitle">API call distribution and token volume by local hour of day</div>
+                <div id="hourly-activity-desc" class="chart-subtitle">API call distribution and token volume by local hour of day</div>
               </div>
             </div>
             <div class="chart-canvas-wrap">
-              <canvas id="chart-hourly-activity"></canvas>
+              <canvas id="chart-hourly-activity" role="img" aria-labelledby="hourly-activity-title hourly-activity-desc"></canvas>
             </div>
           </div>
 
           <div class="chart-card chart-card-wide">
             <div class="chart-header">
               <div>
-                <div class="chart-title">Weekday × Hour</div>
-                <div class="chart-subtitle">Token intensity by weekday and local hour. Hover a cell for tokens, calls, and cost.</div>
+                <div id="heatmap-title" class="chart-title">Weekday × Hour</div>
+                <div id="heatmap-desc" class="chart-subtitle">Token intensity by weekday and local hour. Hover a cell for tokens, calls, and cost.</div>
               </div>
             </div>
-            <div id="weekday-hour-heatmap" class="heatmap-host"></div>
+            <div id="weekday-hour-heatmap" class="heatmap-host" role="img" aria-labelledby="heatmap-title heatmap-desc"></div>
           </div>
         </div>
       </details>
@@ -298,20 +300,21 @@
         <div id="unpriced-banner" class="unpriced-banner" hidden></div>
         <div class="table-responsive">
           <table class="data-table">
+            <caption class="visually-hidden">Per-model token usage, cache efficiency, rates, and estimated costs</caption>
             <thead>
               <tr>
-                <th>Model & Provider</th>
-                <th class="cell-right">Uncached Input</th>
-                <th class="cell-right">Cached Input</th>
-                <th class="cell-right">Total Input</th>
-                <th class="cell-right">Output</th>
-                <th class="cell-right">Reasoning / Thoughts</th>
-                <th class="cell-right">Total Tokens</th>
-                <th class="cell-right">Cache Hit %</th>
-                <th class="cell-right">API Rates ($/1M In / Cache / Out)</th>
-                <th class="cell-right">Est. Cost (Cached)</th>
-                <th class="cell-right">Est. Cost (Uncached)</th>
-                <th class="cell-right">Net Savings ($)</th>
+                <th scope="col">Model &amp; Provider</th>
+                <th scope="col" class="cell-right">Uncached Input</th>
+                <th scope="col" class="cell-right">Cached Input</th>
+                <th scope="col" class="cell-right">Total Input</th>
+                <th scope="col" class="cell-right">Output</th>
+                <th scope="col" class="cell-right">Reasoning / Thoughts</th>
+                <th scope="col" class="cell-right">Total Tokens</th>
+                <th scope="col" class="cell-right">Cache Hit %</th>
+                <th scope="col" class="cell-right">API Rates ($/1M In / Cache / Out)</th>
+                <th scope="col" class="cell-right">Est. Cost (Cached)</th>
+                <th scope="col" class="cell-right">Est. Cost (Uncached)</th>
+                <th scope="col" class="cell-right">Net Savings ($)</th>
               </tr>
             </thead>
             <tbody id="models-table-body">
@@ -349,21 +352,23 @@
               <circle cx="11" cy="11" r="8"></circle>
               <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
             </svg>
+            <label class="visually-hidden" for="sessions-search">Search sessions</label>
             <input type="text" id="sessions-search" class="search-input" placeholder="Search sessions by title, model, or ID...">
           </div>
         </div>
 
         <div class="table-responsive">
           <table class="data-table">
+            <caption class="visually-hidden">Tracked sessions with tool, model, token, cache, cost, and timestamp details</caption>
             <thead>
               <tr>
-                <th>Session Title</th>
-                <th>Tool</th>
-                <th>Model</th>
-                <th class="cell-right">Total Tokens</th>
-                <th class="cell-right">Cache Hit %</th>
-                <th class="cell-right">Est. Cost</th>
-                <th class="cell-right">Date / Time</th>
+                <th scope="col">Session Title</th>
+                <th scope="col">Tool</th>
+                <th scope="col">Model</th>
+                <th scope="col" class="cell-right">Total Tokens</th>
+                <th scope="col" class="cell-right">Cache Hit %</th>
+                <th scope="col" class="cell-right">Est. Cost</th>
+                <th scope="col" class="cell-right">Date / Time</th>
               </tr>
             </thead>
             <tbody id="sessions-table-body">
@@ -424,13 +429,14 @@
             </div>
             <div class="table-responsive insight-table-wrap">
               <table class="data-table insight-table">
+                <caption class="visually-hidden">Highest-cost sessions in the selected range</caption>
                 <thead>
                   <tr>
-                    <th>Session</th>
-                    <th>Tool</th>
-                    <th>Model</th>
-                    <th class="cell-right">Tokens</th>
-                    <th class="cell-right">Est. Cost</th>
+                    <th scope="col">Session</th>
+                    <th scope="col">Tool</th>
+                    <th scope="col">Model</th>
+                    <th scope="col" class="cell-right">Tokens</th>
+                    <th scope="col" class="cell-right">Est. Cost</th>
                   </tr>
                 </thead>
                 <tbody id="top-sessions-table-body">
@@ -456,7 +462,7 @@
     </section>
   </div>
 
-  <div id="toast-container" class="toast-container"></div>
+  <div id="toast-container" class="toast-container" role="alert" aria-live="assertive" aria-atomic="true"></div>
 
   <!-- Scripts (order matters: odometer -> utils -> api/charts/tables/analytics -> orchestrator) -->
   <script src="/static/js/odometer.js?v=cost-per-1m"></script>

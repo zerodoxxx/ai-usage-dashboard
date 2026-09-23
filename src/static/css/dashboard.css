@@ -841,6 +841,30 @@ input:checked + .slider:before {
   width: 100%;
 }
 
+/* Chart.js canvases are replaced elements with an intrinsic width. Keep that
+ * intrinsic size from widening cards or the document at narrow viewports. */
+.charts-section,
+.chart-group,
+.charts-grid,
+.chart-card,
+.chart-header,
+.chart-header > div,
+.chart-canvas-wrap {
+  min-width: 0;
+}
+
+.chart-canvas-wrap {
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.chart-canvas-wrap canvas {
+  display: block;
+  width: 100% !important;
+  max-width: 100%;
+  min-width: 0;
+}
+
 /* Sections & Tables */
 .section-card {
   background: var(--card-bg);
@@ -1342,4 +1366,279 @@ tr.unpriced-row {
   height: 8px;
   border-radius: 4px;
   background: linear-gradient(90deg, rgba(99, 102, 241, 0.08), rgba(99, 102, 241, 0.95));
+}
+
+/* Consistent keyboard focus treatment for every interactive control. */
+button:focus-visible,
+select:focus-visible,
+input:focus-visible,
+summary:focus-visible,
+.details-tab:focus-visible {
+  outline: 2px solid #a5b4fc;
+  outline-offset: 2px;
+}
+
+.switch input:focus-visible + .slider {
+  outline: 2px solid #a5b4fc;
+  outline-offset: 3px;
+}
+
+/* Keep horizontally dense tables useful while preserving model/session context. */
+.data-table th:first-child,
+.data-table td:first-child {
+  position: sticky;
+  left: 0;
+}
+
+.data-table th:first-child {
+  z-index: 20;
+  background: #172033;
+}
+
+.data-table td:first-child {
+  z-index: 2;
+  background: #111827;
+}
+
+.data-table tbody tr:hover td:first-child {
+  background: #182235;
+}
+
+.data-table tbody tr.unpriced-row td:first-child {
+  background: #1b202d;
+}
+
+#panel-sessions tbody td:first-child strong,
+#panel-sessions tbody td:first-child .text-muted {
+  display: block;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.table-footnote {
+  align-items: flex-start;
+  flex-wrap: wrap;
+  line-height: 1.4;
+}
+
+.table-footnote code {
+  overflow-wrap: anywhere;
+}
+
+/* Compact layout for phones and narrow embedded windows. */
+@media (max-width: 700px) {
+  .dashboard-container {
+    padding: 16px 14px 40px;
+  }
+
+  .dashboard-header {
+    align-items: stretch;
+    gap: 16px;
+    padding: 16px;
+    margin-bottom: 20px;
+    border-radius: 14px;
+  }
+
+  .brand-section {
+    align-items: flex-start;
+    gap: 12px;
+    min-width: 0;
+  }
+
+  .brand-logo-icon {
+    flex: 0 0 40px;
+    width: 40px;
+    height: 40px;
+    font-size: 18px;
+  }
+
+  .brand-titles {
+    min-width: 0;
+  }
+
+  .brand-titles h1 {
+    flex-wrap: wrap;
+    gap: 6px;
+    font-size: 18px;
+    line-height: 1.25;
+  }
+
+  .brand-titles .subtitle {
+    font-size: 12px;
+    line-height: 1.4;
+  }
+
+  .live-badge {
+    font-size: 10px;
+  }
+
+  .header-controls {
+    width: 100%;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .control-group,
+  .filter-controls,
+  .refresh-controls,
+  .action-controls {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .filter-controls {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .select-control,
+  .date-input {
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+  }
+
+  .refresh-controls {
+    justify-content: space-between;
+  }
+
+  .refresh-controls .toggle-wrapper {
+    flex: 1 1 auto;
+  }
+
+  .refresh-controls #refresh-interval {
+    width: auto;
+    flex: 0 0 78px;
+  }
+
+  .action-controls .btn-refresh {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .synced-badge {
+    align-self: flex-start;
+  }
+
+  .overview-heading {
+    margin-bottom: 10px;
+  }
+
+  .charts-section,
+  .executive-overview,
+  .section-card {
+    margin-bottom: 20px;
+  }
+
+  .chart-group {
+    padding: 4px 6px 8px;
+    border-radius: 14px;
+  }
+
+  .charts-grid {
+    gap: 12px;
+    padding: 0 2px 2px;
+  }
+
+  .chart-card {
+    padding: 16px;
+    border-radius: 14px;
+  }
+
+  .chart-title {
+    font-size: 14px;
+  }
+
+  .chart-subtitle {
+    font-size: 11px;
+    line-height: 1.35;
+  }
+
+  .chart-canvas-wrap {
+    height: 240px;
+  }
+
+  .section-card {
+    padding: 16px;
+    border-radius: 14px;
+  }
+
+  .section-header {
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .details-tabs {
+    width: 100%;
+  }
+
+  .details-tab {
+    flex: 1 1 0;
+    padding-inline: 8px;
+  }
+
+  .sessions-toolbar .search-box {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .table-responsive {
+    max-width: 100%;
+  }
+
+  #panel-sessions tbody td:first-child strong,
+  #panel-sessions tbody td:first-child .text-muted {
+    max-width: 240px;
+  }
+
+  .table-footnote {
+    gap: 6px;
+    font-size: 11px;
+  }
+
+  .heatmap-legend {
+    font-size: 10px;
+  }
+
+  .toast-container {
+    right: 14px;
+    bottom: 14px;
+    left: 14px;
+  }
+
+  .toast {
+    width: 100%;
+  }
+}
+
+@media (min-width: 500px) and (max-width: 700px) {
+  .metrics-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 420px) {
+  .chart-canvas-wrap {
+    height: 220px;
+  }
+
+  .odometer-container {
+    font-size: 20px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }
