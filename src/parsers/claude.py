@@ -8,7 +8,6 @@ orchestration is persisted, so message IDs make usage events idempotent.
 
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import re
@@ -20,9 +19,6 @@ from ..pricing import calculate_cost_strict
 from .contracts import CostEstimate, TokenUsage, UsageEvent, UsageSession
 
 logger = logging.getLogger(__name__)
-_CLAUDE_PARSE_CACHE: dict[tuple[str, int, int], UsageSession | None] = {}
-
-
 def _pricing_provider(model: str) -> str:
     """Return the billing provider for a model recorded in Claude logs."""
     return "deepseek" if model.casefold().startswith("deepseek") else "claude"
@@ -129,14 +125,6 @@ def _session_title(record: dict[str, Any]) -> str:
 
 
 def _parse_session_file(path: Path) -> UsageSession | None:
-    try:
-        stat = path.stat()
-        cache_key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size)
-        if cache_key in _CLAUDE_PARSE_CACHE:
-            return copy.deepcopy(_CLAUDE_PARSE_CACHE[cache_key])
-    except OSError:
-        return None
-
     events: list[UsageEvent] = []
     seen_message_ids: set[str] = set()
     models: Counter[str] = Counter()
@@ -231,11 +219,7 @@ def _parse_session_file(path: Path) -> UsageSession | None:
             call_count=len(events),
         )
 
-    _CLAUDE_PARSE_CACHE[cache_key] = copy.deepcopy(result)
-    for old_key in list(_CLAUDE_PARSE_CACHE):
-        if old_key != cache_key and old_key[0] == cache_key[0]:
-            del _CLAUDE_PARSE_CACHE[old_key]
-    return copy.deepcopy(result)
+    return result
 
 
 def _session_files(base_dir: Path) -> list[Path]:

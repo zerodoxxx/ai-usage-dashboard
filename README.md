@@ -11,7 +11,7 @@ A local real-time dashboard that visualizes token usage and API inference costs 
 - 🔽 **Tool filter dropdown**: All Tools, OpenAI Codex, Claude Code, AGY (Google Antigravity)
 - 🗓️ **Time filter dropdown**: All time, This month, Past 30 days, Past 7 days, Past 24h
 - 📊 **Analytics snapshot**: API calls, averages, peak spend day, top-cost sessions, period comparison, and a 30-day cost projection from the selected filter's daily average
-- ⚡ **Efficient live polling**: cached parser work for unchanged files plus parallel all-tool parsing
+- ⚡ **Fresh live polling**: source files are reparsed for each refresh, with parallel all-tool parsing
 - 🔎 **Session search** — filter across titles, models, and session IDs
 
 ## Quickstart

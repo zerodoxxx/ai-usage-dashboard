@@ -17,7 +17,6 @@ from ..pricing import calculate_cost_strict
 
 logger = logging.getLogger(__name__)
 
-_ROLLOUT_PARSE_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
 _USAGE_FIELDS = (
     "input_tokens",
     "cached_input_tokens",
@@ -168,15 +167,6 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
 
     Extracts incremental and cumulative token usage, timestamps, and call counts.
     """
-    cache_key = None
-    try:
-        stat = file_path.stat()
-        cache_key = (str(file_path.resolve()), stat.st_mtime_ns, stat.st_size)
-        if cache_key in _ROLLOUT_PARSE_CACHE:
-            return dict(_ROLLOUT_PARSE_CACHE[cache_key])
-    except OSError as e:
-        logger.debug("Failed to stat rollout file %s: %s", file_path, e)
-
     call_count = 0
     extracted_model: str | None = None
     first_timestamp: str | None = None
@@ -188,7 +178,6 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
     previous_event_msg_cumulative: dict[str, int] | None = None
     last_cumulative: dict[str, int] | None = None
 
-    has_error = False
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
@@ -263,7 +252,6 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
                         if usage_event:
                             event_msg_fallback_events.append(usage_event)
     except Exception as e:
-        has_error = True
         logger.warning("Error reading rollout file %s: %s", file_path, e)
 
     if last_cumulative:
@@ -329,8 +317,6 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
         "model": extracted_model,
         "usage_events": usage_events,
     }
-    if cache_key is not None and not has_error:
-        _ROLLOUT_PARSE_CACHE[cache_key] = result
     return dict(result)
 
 

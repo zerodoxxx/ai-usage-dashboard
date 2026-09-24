@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import os
@@ -13,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import UsageSession
-from ..pricing import calculate_cost
+from ..pricing import calculate_cost, calculate_cost_strict
 
 logger = logging.getLogger(__name__)
 
@@ -26,51 +25,6 @@ logger = logging.getLogger(__name__)
 #   is a conservative stand-in for prefix caching on repeated conversation
 #   context, not a measured rate — Codex/Claude report exact counts instead.
 _AGY_CACHE_HIT_RATE_MULTI_TURN = 0.45
-
-_AGY_PARSE_CACHE: dict[tuple[str, tuple[tuple[str, int, int], ...]], dict[str, Any]] = {}
-
-
-def _source_signature(base_dir: Path) -> tuple[str, tuple[tuple[str, int, int], ...]]:
-    """Build a lightweight signature for the AGY files used by the parser."""
-    tracked_paths: set[Path] = set()
-    for path in (base_dir / "settings.json", base_dir / "token_usage.db"):
-        if path.exists():
-            tracked_paths.add(path)
-
-    for path in base_dir.glob("*.db*"):
-        if path.is_file():
-            tracked_paths.add(path)
-
-    conv_dir = base_dir / "conversations"
-    if conv_dir.exists():
-        for path in conv_dir.glob("*.db*"):
-            if path.is_file():
-                tracked_paths.add(path)
-
-    brain_dir = base_dir / "brain"
-    if brain_dir.exists():
-        for root, _dirs, files in os.walk(brain_dir):
-            if "transcript.jsonl" in files:
-                tracked_paths.add(Path(root) / "transcript.jsonl")
-
-    entries: list[tuple[str, int, int]] = []
-    for path in sorted(tracked_paths, key=lambda item: str(item)):
-        try:
-            stat = path.stat()
-            entries.append((str(path.relative_to(base_dir)), stat.st_mtime_ns, stat.st_size))
-        except (OSError, ValueError):
-            continue
-    return str(base_dir.resolve()), tuple(entries)
-
-
-def _cache_result(cache_key: tuple[str, tuple[tuple[str, int, int], ...]], result: dict[str, Any]) -> None:
-    """Store the newest AGY snapshot and discard stale snapshots for its root."""
-    _AGY_PARSE_CACHE[cache_key] = copy.deepcopy(result)
-    root = cache_key[0]
-    for old_key in list(_AGY_PARSE_CACHE):
-        if old_key != cache_key and old_key[0] == root:
-            del _AGY_PARSE_CACHE[old_key]
-
 
 def _allocate_total(total: int, weights: list[int]) -> list[int]:
     """Distribute an estimated total across weighted transcript events."""
@@ -91,6 +45,108 @@ def _allocate_total(total: int, weights: list[int]) -> list[int]:
     for index in fractions[:remainder]:
         allocations[index] += 1
     return allocations
+
+
+def _reprice_session_cost(session: dict[str, Any]) -> None:
+    """Reprice locally estimated costs using each call's timestamp."""
+    model = session.get("model")
+    provider = "deepseek" if str(model or "").casefold().startswith("deepseek") else "antigravity"
+    fallback_timestamp = (
+        session.get("created_at")
+        or session.get("start_time")
+        or session.get("end_time")
+        or session.get("activity_at")
+    )
+    base_cost = calculate_cost_strict(
+        model,
+        int(session.get("uncached_input") or 0),
+        int(session.get("cached_input") or 0),
+        int(session.get("output") or 0),
+        provider=provider,
+        cache_write=int(session.get("cache_write_tokens") or 0),
+        timestamp=session.get("created_at") or session.get("start_time") or session.get("activity_at"),
+    )
+
+    cached_total = float(base_cost.get("cost_cached_usd") or 0.0)
+    uncached_total = float(base_cost.get("cost_uncached_usd") or 0.0)
+    savings_total = float(base_cost.get("savings_usd") or 0.0)
+    usage_events = session.get("usage_events", [])
+    event_costs: list[dict[str, Any]] = []
+    event_uncached = 0
+    event_cached_total = 0
+    event_output = 0
+    event_reasoning = 0
+    event_total = 0
+    event_cache_write = 0
+    for event in usage_events:
+        event_model = event.get("model") or model
+        event_provider = (
+            "deepseek"
+            if str(event_model or "").casefold().startswith("deepseek")
+            else provider
+        )
+        event_input = int(event.get("input_tokens") or 0)
+        event_cached = min(event_input, int(event.get("cached_input_tokens") or 0))
+        event_cached_total += event_cached
+        event_uncached += event_input - event_cached
+        event_output += int(event.get("output_tokens") or 0)
+        event_reasoning += int(event.get("reasoning_output_tokens") or 0)
+        event_total += int(event.get("total_tokens") or event_input + int(event.get("output_tokens") or 0))
+        event_cache_write += int(event.get("cache_write_tokens") or event.get("cache_creation_tokens") or 0)
+        event_cost = calculate_cost_strict(
+            event_model,
+            max(0, event_input - event_cached),
+            event_cached,
+            int(event.get("output_tokens") or 0),
+            provider=event_provider,
+            cache_write=int(event.get("cache_write_tokens") or event.get("cache_creation_tokens") or 0),
+            timestamp=event.get("timestamp") or fallback_timestamp,
+        )
+        if event_cost.get("status") == "known":
+            event_costs.append(event_cost)
+
+    residual_uncached = max(0, int(session.get("uncached_input") or 0) - event_uncached)
+    residual_cached = max(0, int(session.get("cached_input") or 0) - event_cached_total)
+    residual_output = max(0, int(session.get("output") or 0) - event_output)
+    residual_reasoning = max(0, int(session.get("reasoning_output") or 0) - event_reasoning)
+    residual_total = max(0, int(session.get("total_tokens") or 0) - event_total)
+    residual_cache_write = max(0, int(session.get("cache_write_tokens") or 0) - event_cache_write)
+    represented_calls = sum(
+        int((event.get("metadata") or {}).get("call_count") or 0)
+        if "call_count" in (event.get("metadata") or {}) else 1
+        for event in usage_events
+    )
+    residual_calls = max(0, int(session.get("call_count") or 0) - represented_calls)
+    if any((
+        residual_uncached,
+        residual_cached,
+        residual_output,
+        residual_reasoning,
+        residual_total,
+        residual_cache_write,
+        residual_calls,
+    )):
+        residual_cost = calculate_cost_strict(
+            model,
+            residual_uncached,
+            residual_cached,
+            residual_output,
+            provider=provider,
+            cache_write=residual_cache_write,
+            timestamp=fallback_timestamp,
+        )
+        if residual_cost.get("status") == "known":
+            event_costs.append(residual_cost)
+
+    if event_costs:
+        cached_total = sum(float(cost.get("cost_cached_usd") or 0.0) for cost in event_costs)
+        uncached_total = sum(float(cost.get("cost_uncached_usd") or 0.0) for cost in event_costs)
+        savings_total = sum(float(cost.get("savings_usd") or 0.0) for cost in event_costs)
+
+    session["cost_cached_usd"] = cached_total
+    session["cost_uncached_usd"] = uncached_total
+    session["savings_usd"] = savings_total
+    session["cost_usd"] = cached_total
 
 
 def _to_iso_string(ts: int | float | str | None) -> str:
@@ -148,11 +204,6 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
 
     if not base_dir.exists():
         return empty_result
-
-    cache_key = _source_signature(base_dir)
-    cached_result = _AGY_PARSE_CACHE.get(cache_key)
-    if cached_result is not None:
-        return copy.deepcopy(cached_result)
 
     # 1. Read configured model from settings.json
     configured_model = "Gemini 3.8 Flash (High)"
@@ -567,6 +618,11 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                 "usage_events": usage_events,
             })
 
+    # Reprice each call at its own timestamp so the legacy parser summary
+    # agrees with the shared aggregator's time-range-aware totals.
+    for session in sessions:
+        _reprice_session_cost(session)
+
     # Sort sessions by created_at descending
     sessions.sort(key=lambda s: str(s.get("created_at") or ""), reverse=True)
 
@@ -691,8 +747,7 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
         "timeline": timeline_list,
         "sessions": sessions,
     }
-    _cache_result(cache_key, result)
-    return copy.deepcopy(result)
+    return result
 
 
 def _legacy_sessions_to_contract(
@@ -710,7 +765,11 @@ def _legacy_sessions_to_contract(
             session.metadata["estimated"] = False
             session.metadata["token_source"] = "reported"
             if session.cost is not None:
-                session.cost.source = "reported"
+                # token_usage.db stores the local estimator's result, not a
+                # provider-reported bill. Keep the exact token provenance,
+                # but let the shared aggregator reprice costs per call using
+                # the active catalog and each event timestamp.
+                session.cost.source = "estimated"
         else:
             session.metadata["estimated"] = True
             session.metadata["token_source"] = "estimated"
