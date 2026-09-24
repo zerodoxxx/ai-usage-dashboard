@@ -521,19 +521,17 @@ def test_custom_time_range() -> None:
     except ValueError as exc:
         assert "after end date" in str(exc)
 
-    # Missing start/end: raises ValueError
+    # A start date is required; omitting the end date defaults to now.
     for s, e in [
         (None, "2026-09-08"),
-        ("2026-09-01", None),
         (None, None),
         ("", "2026-09-08"),
-        ("2026-09-01", ""),
     ]:
         try:
             _parse_custom_range(s, e)
             assert False, f"Expected ValueError for missing start/end: ({s}, {e})"
         except ValueError as exc:
-            assert "requires both 'start' and 'end'" in str(exc)
+            assert "requires a 'start' query parameter" in str(exc)
 
     # Invalid date format: raises ValueError
     for bad_start in ["invalid", "2026/09/01", "09-01-2026", "2026-13-01", "2026-09-32"]:
@@ -607,7 +605,6 @@ def test_custom_time_range() -> None:
     for bad_start, bad_end in [
         ("2026-09-10", "2026-09-01"),  # start > end
         (None, "2026-09-05"),           # missing start
-        ("2026-09-01", None),           # missing end
         (None, None),                   # missing both
         ("bad-date", "2026-09-05"),     # invalid start format
         ("2026-09-01", "bad-date"),     # invalid end format
@@ -832,4 +829,3 @@ if __name__ == "__main__":
     print("\n========================================")
     print("  ALL PARSER & PRICING TESTS PASSED!  ")
     print("========================================\n")
-

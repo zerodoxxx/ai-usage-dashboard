@@ -35,32 +35,42 @@ def _normalize_time_range(time_range: str | None) -> str:
     return normalized
 
 
-def _parse_custom_range(start: str | None, end: str | None) -> tuple[datetime, datetime]:
-    """Parse inclusive UTC YYYY-MM-DD bounds for ``time_range=custom``."""
-    if not start or not end:
-        raise ValueError(
-            "Custom time range requires both 'start' and 'end' query parameters (YYYY-MM-DD)."
-        )
+def _parse_custom_range(
+    start: str | None,
+    end: str | None,
+    now: datetime | None = None,
+) -> tuple[datetime, datetime]:
+    """Parse UTC bounds for a custom range, defaulting a missing end to now."""
+    if not start:
+        raise ValueError("Custom time range requires a 'start' query parameter (YYYY-MM-DD).")
     try:
         start_date = datetime.strptime(str(start).strip(), "%Y-%m-%d")
     except (TypeError, ValueError):
         raise ValueError(
             f"Invalid custom start date: {start!r}. Expected format YYYY-MM-DD."
         )
-    try:
-        end_date = datetime.strptime(str(end).strip(), "%Y-%m-%d")
-    except (TypeError, ValueError):
-        raise ValueError(
-            f"Invalid custom end date: {end!r}. Expected format YYYY-MM-DD."
-        )
     start_dt = start_date.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
-    end_dt = end_date.replace(
-        hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
-    )
-    if start_dt > end_dt:
-        raise ValueError(
-            f"Invalid custom range: start date {start!r} is after end date {end!r}."
+    if end:
+        try:
+            end_date = datetime.strptime(str(end).strip(), "%Y-%m-%d")
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Invalid custom end date: {end!r}. Expected format YYYY-MM-DD."
+            )
+        end_dt = end_date.replace(
+            hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
         )
+    else:
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        end_dt = current.astimezone(timezone.utc)
+    if start_dt > end_dt:
+        if end:
+            raise ValueError(
+                f"Invalid custom range: start date {start!r} is after end date {end!r}."
+            )
+        raise ValueError(f"Invalid custom range: start date {start!r} is after the current time.")
     return start_dt, end_dt
 
 
@@ -110,12 +120,19 @@ def _time_range_cutoff(
     """Return the inclusive lower bound and current time for a range.
 
     Calendar-month boundaries use the machine's local timezone. Relative ranges
-    are measured back from the current instant. Custom ranges use inclusive UTC
-    day bounds derived from ``start``/``end`` (YYYY-MM-DD).
+    are measured back from the current instant. Custom ranges use an inclusive
+    UTC start day and either an inclusive end day or the current instant when
+    ``end`` is omitted.
     """
     normalized = _normalize_time_range(time_range)
     if normalized == "custom":
-        custom_start, custom_end = _parse_custom_range(start, end)
+        if now is None:
+            current = datetime.now().astimezone()
+        elif now.tzinfo is None:
+            current = now.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        else:
+            current = now
+        custom_start, custom_end = _parse_custom_range(start, end, current)
         return custom_start, custom_end
     if now is None:
         current = datetime.now().astimezone()
@@ -1234,7 +1251,8 @@ def _filter_usage_data(
             window_end=current,
         )
     else:
-        filtered_sessions = _filter_sessions(source_sessions, normalized, now, start, end)
+        range_now = current if normalized == "custom" and not end else now
+        filtered_sessions = _filter_sessions(source_sessions, normalized, range_now, start, end)
         result = _build_usage_data(
             filtered_sessions,
             str(data.get("tool") or "all"),
@@ -1242,7 +1260,10 @@ def _filter_usage_data(
             window_end=current,
         )
     result["time_range"] = normalized
-    result["analytics"] = _build_analytics(result, normalized, source_sessions, now, start, end)
+    analytics_now = current if normalized == "custom" and not end else now
+    result["analytics"] = _build_analytics(
+        result, normalized, source_sessions, analytics_now, start, end
+    )
     return result
 
 
@@ -1331,7 +1352,8 @@ def get_tool_usage(
 
     ``codex_dir`` and ``agy_dir`` remain for API compatibility. New providers
     receive paths through ``source_dirs`` and require no aggregator branches.
-    ``time_range=custom`` requires inclusive UTC ``start``/``end`` (YYYY-MM-DD).
+    ``time_range=custom`` requires a UTC ``start`` date (YYYY-MM-DD); the
+    optional ``end`` date is inclusive and defaults to the current instant.
     """
     time_range_normalized = _normalize_time_range(time_range)
     if time_range_normalized == "custom":

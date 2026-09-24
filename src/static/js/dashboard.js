@@ -123,8 +123,7 @@
 
       // Update UI components
       updateMetricCards(data.summary || {}, data.analytics || {});
-      const isCustom = state.currentTimeRange === 'custom'
-        && state.customStart && state.customEnd;
+      const isCustom = state.currentTimeRange === 'custom' && state.customStart;
       window.DashboardAnalytics.updateAnalytics(data.analytics || {}, data.summary || {}, {
         analyticsWindowBadge: elements.analyticsWindowBadge,
         analyticsCallCount: elements.analyticsCallCount,
@@ -139,7 +138,7 @@
         comparisonSubtitle: elements.comparisonSubtitle,
         comparisonContent: elements.comparisonContent,
         selectedRangeLabel: isCustom
-          ? `${state.customStart} → ${state.customEnd}`
+          ? `${state.customStart} → ${state.customEnd || 'Up to now'}`
           : elements.timeRangeSelect?.selectedOptions?.[0]?.textContent,
       });
       window.DashboardTables.renderModelTable(data.models || [], {
@@ -251,8 +250,15 @@
   function setCustomControlsVisible(visible) {
     const flag = !visible;
     if (elements.customStartDate) elements.customStartDate.hidden = flag;
-    if (elements.customEndDate) elements.customEndDate.hidden = flag;
+    if (elements.customEndControl) elements.customEndControl.hidden = flag;
     if (elements.customRangeApply) elements.customRangeApply.hidden = flag;
+  }
+
+  /** Show that a blank custom end date means the range ends at the current time. */
+  function updateCustomEndHint() {
+    if (elements.customEndNowLabel && elements.customEndDate) {
+      elements.customEndNowLabel.hidden = Boolean(elements.customEndDate.value);
+    }
   }
 
   /**
@@ -275,6 +281,7 @@
         setCustomControlsVisible(isCustom);
         if (isCustom) {
           // Wait for explicit Apply; keep last custom dates in the inputs.
+          updateCustomEndHint();
           return;
         }
         fetchUsageData(true).catch((err) => console.error('Error fetching usage data on time range select:', err));
@@ -282,15 +289,27 @@
     }
 
     // Custom date-range apply
+    if (elements.customStartDate) {
+      elements.customStartDate.addEventListener('change', () => {
+        // A new start date begins a fresh range ending at the current time.
+        if (elements.customEndDate) elements.customEndDate.value = '';
+        updateCustomEndHint();
+      });
+    }
+
+    if (elements.customEndDate) {
+      elements.customEndDate.addEventListener('change', updateCustomEndHint);
+    }
+
     if (elements.customRangeApply) {
       elements.customRangeApply.addEventListener('click', () => {
         const start = elements.customStartDate ? elements.customStartDate.value : '';
         const end = elements.customEndDate ? elements.customEndDate.value : '';
-        if (!start || !end) {
-          window.DashboardUtils.showToast('Select both a start and an end date.', 'error');
+        if (!start) {
+          window.DashboardUtils.showToast('Select a start date.', 'error');
           return;
         }
-        if (start > end) {
+        if (end && start > end) {
           window.DashboardUtils.showToast('Start date must be on or before the end date.', 'error');
           return;
         }
@@ -391,6 +410,8 @@
     elements.timeRangeSelect = document.getElementById('time-range-select');
     elements.customStartDate = document.getElementById('custom-start-date');
     elements.customEndDate = document.getElementById('custom-end-date');
+    elements.customEndControl = document.getElementById('custom-end-control');
+    elements.customEndNowLabel = document.getElementById('custom-end-now-label');
     elements.customRangeApply = document.getElementById('custom-range-apply');
     elements.autoRefreshToggle = document.getElementById('auto-refresh-toggle');
     elements.refreshInterval = document.getElementById('refresh-interval');

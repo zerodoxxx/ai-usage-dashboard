@@ -91,7 +91,7 @@ def api_usage(
     ),
     time_range: str = Query(
         default="all",
-        description="Filter usage by time: 'all', 'month', '30d', '7d', '24h', or 'custom' (requires start/end YYYY-MM-DD).",
+        description="Filter usage by time: 'all', 'month', '30d', '7d', '24h', or 'custom' (requires start; end is optional, YYYY-MM-DD).",
     ),
     start: str | None = Query(
         default=None,
@@ -99,7 +99,7 @@ def api_usage(
     ),
     end: str | None = Query(
         default=None,
-        description="Inclusive custom-range end date (YYYY-MM-DD, UTC). Required when time_range=custom.",
+        description="Inclusive custom-range end date (YYYY-MM-DD, UTC). Optional; defaults to the current instant when omitted.",
     ),
 ) -> dict[str, Any]:
     """Return real-time usage metrics, summaries, model breakdowns, timelines, and sessions."""

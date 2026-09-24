@@ -48,7 +48,10 @@
             <option value="custom">Custom…</option>
           </select>
           <input type="date" id="custom-start-date" class="select-control date-input" title="Custom range start (UTC)" aria-label="Custom range start date" hidden>
-          <input type="date" id="custom-end-date" class="select-control date-input" title="Custom range end (UTC)" aria-label="Custom range end date" hidden>
+          <span id="custom-end-control" class="custom-end-control" hidden>
+            <input type="date" id="custom-end-date" class="select-control date-input" title="Custom range end (UTC); leave blank to include usage up to now" aria-label="Custom range end date; leave blank to include usage up to now">
+            <span id="custom-end-now-label" class="custom-end-now-label">Up to now</span>
+          </span>
           <button id="custom-range-apply" class="btn-refresh" title="Apply custom date range" hidden>Apply</button>
         </div>
 
