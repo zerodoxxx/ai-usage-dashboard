@@ -12,7 +12,7 @@ from ..pricing import MODEL_PRICING, PRICING_CATALOG, calculate_cost_strict
 from .agy import AntigravitySource
 from .claude import ClaudeCodeSource
 from .codex import CodexSource
-from .contracts import CostEstimate, UsageSession
+from .contracts import CostEstimate, TokenUsage, UsageEvent, UsageSession
 from .source_registry import SOURCE_REGISTRY, SourceRegistry, normalize_source_key
 
 _CANONICAL_MODELS: dict[str, str] = {k.lower(): k for k in MODEL_PRICING}
@@ -156,7 +156,7 @@ def _time_range_cutoff(
 
 def _session_timestamp(session: dict[str, Any], local_tz) -> datetime | None:
     """Get the best available timestamp for a session."""
-    for key in ("created_at", "start_time", "end_time"):
+    for key in ("created_at", "start_time", "end_time", "activity_at"):
         parsed = _coerce_timestamp(session.get(key), local_tz)
         if parsed is not None:
             return parsed
@@ -191,6 +191,16 @@ def _event_metrics(event: dict[str, Any]) -> tuple[int, int, int, int, int]:
     reasoning_output = _as_int(event.get("reasoning_output_tokens") or event.get("reasoning_output"))
     total_tokens = _as_int(event.get("total_tokens")) or (input_tokens + output)
     return uncached_input, cached_input, output, reasoning_output, total_tokens
+
+
+def _event_call_count(event: Mapping[str, Any]) -> int:
+    """Read an event's represented call count, defaulting ordinary events to one."""
+    metadata = event.get("metadata")
+    if isinstance(metadata, Mapping) and "call_count" in metadata:
+        return _as_int(metadata.get("call_count"))
+    if "call_count" in event:
+        return _as_int(event.get("call_count"))
+    return 1
 
 
 def _event_timestamp(event: dict[str, Any], local_tz) -> datetime | None:
@@ -261,6 +271,9 @@ def _refresh_estimated_session_cost(session: UsageSession) -> None:
     if str(session.model or "").casefold().startswith("deepseek"):
         provider = "deepseek"
     usage = session.usage
+    event_fallback_time = (
+        session.created_at or session.start_time or session.end_time or session.activity_at
+    )
     resolved = calculate_cost_strict(
         session.model,
         usage.uncached_input_tokens,
@@ -297,7 +310,7 @@ def _refresh_estimated_session_cost(session: UsageSession) -> None:
             event_usage.output_tokens,
             provider=event_provider,
             cache_write=event_usage.cache_write_tokens,
-            timestamp=event.timestamp or session.created_at,
+            timestamp=event.timestamp or event_fallback_time,
         )
         if event_result.get("status") == "known":
             event.cost = CostEstimate(
@@ -308,6 +321,126 @@ def _refresh_estimated_session_cost(session: UsageSession) -> None:
             )
         else:
             event.cost = None
+
+    # Time-dependent pricing (for example, DeepSeek peak/off-peak rates) must
+    # be applied to each call at its own timestamp. Reuse those event costs for
+    # the session total so all-time totals match the same calls when a range is
+    # sliced later. Pricing the whole session at its start time can materially
+    # understate usage spread across multiple pricing windows.
+    if session.events and not (
+        session.cost is not None
+        and (session.cost.source == "reported" or session.cost.reported_usd is not None)
+    ):
+        event_uncached = sum(event.usage.uncached_input_tokens for event in session.events)
+        event_cached = sum(event.usage.cached_input_tokens for event in session.events)
+        event_output = sum(event.usage.output_tokens for event in session.events)
+        event_reasoning = sum(event.usage.reasoning_output_tokens for event in session.events)
+        event_total = sum(event.usage.total_tokens for event in session.events)
+        event_cache_write = sum(event.usage.cache_write_tokens for event in session.events)
+
+        # Some providers retain authoritative session totals when only part of
+        # a transcript can be converted into timestamped usage events. Keep
+        # that residual as an event at the best available session timestamp so
+        # all-time and bounded ranges account for it consistently.
+        residual_uncached = max(0, usage.uncached_input_tokens - event_uncached)
+        residual_cached = max(0, usage.cached_input_tokens - event_cached)
+        residual_output = max(0, usage.output_tokens - event_output)
+        residual_reasoning = max(0, usage.reasoning_output_tokens - event_reasoning)
+        residual_total = max(0, usage.total_tokens - event_total)
+        residual_cache_write = max(0, usage.cache_write_tokens - event_cache_write)
+        residual_cost_data: dict[str, Any] = {
+            "status": "unknown",
+            "cost_cached_usd": 0.0,
+            "cost_uncached_usd": 0.0,
+            "savings_usd": 0.0,
+        }
+        has_residual = any((
+            residual_uncached,
+            residual_cached,
+            residual_output,
+            residual_reasoning,
+            residual_total,
+            residual_cache_write,
+        ))
+        represented_call_count = sum(
+            _as_int(event.metadata.get("call_count"))
+            if "call_count" in event.metadata else 1
+            for event in session.events
+        )
+        residual_call_count = max(0, session.call_count - represented_call_count)
+        if has_residual or residual_call_count:
+            residual_cost_data = calculate_cost_strict(
+                session.model,
+                residual_uncached,
+                residual_cached,
+                residual_output,
+                provider=provider,
+                cache_write=residual_cache_write,
+                timestamp=event_fallback_time,
+            )
+            residual_cost = (
+                CostEstimate(
+                    cached_usd=residual_cost_data.get("cost_cached_usd") or 0.0,
+                    uncached_usd=residual_cost_data.get("cost_uncached_usd") or 0.0,
+                    savings_usd=residual_cost_data.get("savings_usd") or 0.0,
+                    source="estimated",
+                )
+                if residual_cost_data.get("status") == "known" else None
+            )
+            residual_input = residual_uncached + residual_cached
+            session.events.append(UsageEvent(
+                timestamp=event_fallback_time,
+                usage=TokenUsage(
+                    input_tokens=residual_input,
+                    cached_input_tokens=residual_cached,
+                    output_tokens=residual_output,
+                    reasoning_output_tokens=residual_reasoning,
+                    total_tokens=residual_total,
+                    cache_write_tokens=residual_cache_write,
+                ),
+                model=session.model,
+                cost=residual_cost,
+                event_id=f"{session.id}:session-residual",
+                metadata={
+                    "synthetic": "session-residual",
+                    "call_count": 1 if residual_call_count else 0,
+                },
+            ))
+            # The authoritative call count can exceed both timestamped and
+            # untimestamped event records; retain those calls as zero-token
+            # placeholders at the same fallback time.
+            for index in range(max(0, residual_call_count - 1)):
+                session.events.append(UsageEvent(
+                    timestamp=event_fallback_time,
+                    model=session.model,
+                    cost=CostEstimate() if residual_cost_data.get("status") == "known" else None,
+                    event_id=f"{session.id}:session-residual-call-{index + 2}",
+                    metadata={"synthetic": "session-residual-call", "call_count": 1},
+                ))
+
+        event_costs = [event.cost for event in session.events if event.cost is not None]
+        if event_costs:
+            all_reported = (
+                len(event_costs) == len(session.events)
+                and all(cost.reported_usd is not None for cost in event_costs)
+                and not has_residual
+            )
+            event_cached_cost = sum(float(cost.total_usd) for cost in event_costs)
+            event_uncached_cost = sum(
+                float(cost.uncached_usd or cost.total_usd) for cost in event_costs
+            )
+            event_savings = sum(float(cost.savings_usd) for cost in event_costs)
+            session.cost = CostEstimate(
+                cached_usd=event_cached_cost,
+                uncached_usd=event_uncached_cost,
+                savings_usd=event_savings,
+                reported_usd=(
+                    sum(float(cost.reported_usd or 0.0) for cost in event_costs)
+                    if all_reported else None
+                ),
+                currency=event_costs[0].currency if event_costs else "USD",
+                source="reported" if all_reported else "estimated",
+            )
 
 
 def _timestamp_in_bounds(
@@ -342,16 +475,31 @@ def _slice_session(
         return sliced
 
     selected_events: list[tuple[dict[str, Any], datetime]] = []
+    unplaced_events: list[dict[str, Any]] = []
     timestamped_event_count = 0
     for event in raw_events:
         if not isinstance(event, dict):
             continue
         event_timestamp = _event_timestamp(event, local_tz)
         if event_timestamp is None:
+            unplaced_events.append(event)
             continue
         timestamped_event_count += 1
         if _timestamp_in_bounds(event_timestamp, start, end, include_end):
             selected_events.append((event, event_timestamp))
+
+    # When only part of a session has per-call timestamps, place the remaining
+    # records at the session fallback timestamp if it falls in this range.
+    # This keeps the full-session residual used by all-time totals visible in
+    # the matching bounded range.
+    fallback_timestamp = _session_timestamp(session, local_tz)
+    if timestamped_event_count and fallback_timestamp is not None and _timestamp_in_bounds(
+        fallback_timestamp, start, end, include_end
+    ):
+        for event in unplaced_events:
+            placed_event = dict(event)
+            placed_event["timestamp"] = fallback_timestamp.isoformat()
+            selected_events.append((placed_event, fallback_timestamp))
 
     # If a source gave us events but no usable event timestamps, retain the
     # session-level fallback rather than silently dropping otherwise valid data.
@@ -394,7 +542,7 @@ def _slice_session(
     sliced = dict(session)
     sliced["usage_events"] = [event for event, _event_time in selected_events]
     sliced.update({
-        "call_count": len(selected_events),
+        "call_count": sum(_event_call_count(event) for event, _event_time in selected_events),
         "uncached_input": uncached_input,
         "cached_input": cached_input,
         "total_input": uncached_input + cached_input,
@@ -830,12 +978,17 @@ def _build_usage_data(
     for session_index, session in enumerate(sessions_combined):
         session_key = str(session.get("id") or f"session-{session_index}")
         event_rows: list[tuple[dict[str, Any], datetime]] = []
+        fallback_event_time = _session_timestamp(session, local_tz)
         raw_events = session.get("usage_events")
         if isinstance(raw_events, list):
             for event in raw_events:
                 if not isinstance(event, dict):
                     continue
                 event_time = _event_timestamp(event, local_tz)
+                if event_time is None and fallback_event_time is not None:
+                    event = dict(event)
+                    event["timestamp"] = fallback_event_time.isoformat()
+                    event_time = fallback_event_time
                 if event_time is not None:
                     event_rows.append((event, event_time))
 
@@ -857,7 +1010,7 @@ def _build_usage_data(
                     event_output,
                     event_reasoning,
                     event_total,
-                    1,
+                    _event_call_count(event),
                     event_cost,
                 )
             continue
