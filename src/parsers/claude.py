@@ -49,16 +49,17 @@ def _clean_title(value: str) -> str:
     return text[:120] if text else ""
 
 
-def _cache_creation_tokens(usage: dict[str, Any]) -> int:
+def _cache_creation_components(usage: dict[str, Any]) -> tuple[int, int, int]:
+    """Return total, five-minute, and one-hour cache-write tokens."""
     direct = _as_int(usage.get("cache_creation_input_tokens"))
-    if direct:
-        return direct
     nested = usage.get("cache_creation")
     if not isinstance(nested, dict):
-        return 0
-    return _as_int(nested.get("ephemeral_5m_input_tokens")) + _as_int(
-        nested.get("ephemeral_1h_input_tokens")
-    )
+        nested = {}
+    writes_5m = _as_int(nested.get("ephemeral_5m_input_tokens"))
+    writes_1h = _as_int(nested.get("ephemeral_1h_input_tokens"))
+    if direct and not (writes_5m or writes_1h):
+        writes_5m = direct
+    return writes_5m + writes_1h, writes_5m, writes_1h
 
 
 def _usage_event(
@@ -67,7 +68,7 @@ def _usage_event(
     """Normalize one Claude API usage observation."""
     base_input = _as_int(usage.get("input_tokens"))
     cache_read = _as_int(usage.get("cache_read_input_tokens"))
-    cache_write = _cache_creation_tokens(usage)
+    cache_write, cache_write_5m, cache_write_1h = _cache_creation_components(usage)
     output = _as_int(usage.get("output_tokens"))
     reasoning = _as_int(usage.get("reasoning_output_tokens"))
     if not any((base_input, cache_read, cache_write, output, reasoning)):
@@ -80,9 +81,11 @@ def _usage_event(
         cached_input_tokens=cache_read,
         output_tokens=output,
         reasoning_output_tokens=reasoning,
-        total_tokens=base_input + cache_read + output,
+        total_tokens=base_input + cache_read + cache_write + output,
         cache_read_tokens=cache_read,
         cache_write_tokens=cache_write,
+        cache_write_5m_tokens=cache_write_5m,
+        cache_write_1h_tokens=cache_write_1h,
     )
 
     cost: CostEstimate | None = None
@@ -93,7 +96,8 @@ def _usage_event(
             cache_read,
             output,
             provider=_pricing_provider(model),
-            cache_write=cache_write,
+            cache_write_5m=cache_write_5m,
+            cache_write_1h=cache_write_1h,
             timestamp=record.get("timestamp"),
         )
         if resolved.get("status") == "known":
@@ -112,7 +116,11 @@ def _usage_event(
         model=model,
         cost=cost,
         event_id=event_id,
-        metadata={"cache_write_tokens": cache_write},
+        metadata={
+            "cache_write_tokens": cache_write,
+            "cache_write_5m_tokens": cache_write_5m,
+            "cache_write_1h_tokens": cache_write_1h,
+        },
     )
 
 
@@ -183,6 +191,11 @@ def _parse_session_file(path: Path) -> UsageSession | None:
                 event = _usage_event(record, usage, model, line_number)
                 if event is None:
                     continue
+                if message_id is None and event.event_id:
+                    # Line-number fallbacks are only unique within one file.
+                    # Namespace them so two transcript files cannot suppress
+                    # one another's calls during cross-file deduplication.
+                    event.event_id = f"{path.resolve()}:{event.event_id}"
                 events.append(event)
                 if model:
                     models[model] += 1
@@ -213,6 +226,8 @@ def _parse_session_file(path: Path) -> UsageSession | None:
                 total_tokens=sum(event.usage.total_tokens for event in events),
                 cache_read_tokens=sum(event.usage.cache_read_tokens or 0 for event in events),
                 cache_write_tokens=sum(event.usage.cache_write_tokens for event in events),
+                cache_write_5m_tokens=sum(event.usage.cache_write_5m_tokens for event in events),
+                cache_write_1h_tokens=sum(event.usage.cache_write_1h_tokens for event in events),
             ),
             events=events,
             metadata={"cwd": cwd, "git_branch": git_branch} if cwd or git_branch else {},

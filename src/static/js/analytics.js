@@ -77,7 +77,12 @@
         : 'No daily usage yet';
     }
 
-    renderTopSessions(ctx.topSessionsTableBody, details.top_sessions || [], formatCurrency);
+    renderTopSessions(
+      ctx.topSessionsTableBody,
+      details.top_sessions || [],
+      formatCurrency,
+      ctx.timezone,
+    );
 
     const comparison = details.comparison;
     if (ctx.comparisonSubtitle) {
@@ -130,7 +135,7 @@
   /**
    * Render the five highest-cost sessions in the current view.
    */
-  function renderTopSessions(tbody, sessions, formatCurrency) {
+  function renderTopSessions(tbody, sessions, formatCurrency, timezone = '') {
     if (!tbody) return;
     const { formatDateTime, providerBadge, escapeHtml, isEstimatedRow, EST_TOOLTIP } = window.DashboardUtils;
 
@@ -149,7 +154,10 @@
         : '';
       const tokTitle = est ? ` title="${escapeHtml(EST_TOOLTIP)}"` : '';
       const tokPrefix = est ? '~' : '';
-      const activity = formatDateTime(session.activity_at || session.created_at || session.start_time);
+      const activity = formatDateTime(
+        session.activity_at || session.created_at || session.start_time,
+        timezone,
+      );
       return `
         <tr>
           <td>

@@ -51,6 +51,26 @@ def test_standard_markdown_parser_selects_short_context_and_strips_annotations()
     }
 
 
+def test_pricing_cache_rejects_invalid_ttl_write_rates(tmp_path: Path) -> None:
+    cache_file = tmp_path / "pricing.json"
+    cache_file.write_text(json.dumps({
+        "source": "openai",
+        "source_url": pricing_module.OPENAI_PRICING_URL,
+        "fetched_at": "2026-09-25T00:00:00+00:00",
+        "tier": "standard",
+        "rates": {
+            "gpt-5.6-sol": {
+                "uncached_input": 4.0,
+                "cached_input": 0.4,
+                "output": 20.0,
+                "cache_write_5m": -1.0,
+            }
+        },
+    }), encoding="utf-8")
+
+    assert pricing_module._read_pricing_cache(cache_file) is None
+
+
 def test_refresh_persists_last_good_snapshot_and_reports_stale_failure(tmp_path: Path) -> None:
     cache_file = tmp_path / "pricing.json"
     fresh = refresh_openai_pricing(

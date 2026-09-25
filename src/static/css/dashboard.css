@@ -287,6 +287,15 @@ input:checked + .slider:before {
   transform: translateY(-1px);
 }
 
+.btn-refresh:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+  transform: none;
+  background: rgba(31, 41, 55, 0.6);
+  border-color: rgba(255, 255, 255, 0.08);
+  color: var(--text-muted);
+}
+
 .btn-refresh:active {
   transform: translateY(0);
 }
@@ -299,6 +308,12 @@ input:checked + .slider:before {
   width: 14px;
   height: 14px;
   transition: transform 0.3s ease;
+}
+
+.export-icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
 }
 
 .refresh-icon.spin {
@@ -1009,6 +1024,11 @@ input:checked + .slider:before {
 
 .text-success {
   color: #34d399 !important;
+  font-weight: 600;
+}
+
+.text-negative {
+  color: #fb7185 !important;
   font-weight: 600;
 }
 
