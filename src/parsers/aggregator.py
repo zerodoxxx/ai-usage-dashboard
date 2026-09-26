@@ -714,6 +714,8 @@ def _slice_session(
         "savings_usd": round(savings, 6),
         "activity_at": max(timestamp for _event, timestamp in selected_events).isoformat(),
     })
+    if session.get("reported_cost_usd") is not None:
+        sliced["reported_cost_usd"] = round(cost_cached, 6)
     return sliced
 
 

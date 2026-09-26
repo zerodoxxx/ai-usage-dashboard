@@ -137,9 +137,7 @@ class TokenUsage:
         self.cache_write_5m_tokens = _non_negative_int(self.cache_write_5m_tokens)
         self.cache_write_1h_tokens = _non_negative_int(self.cache_write_1h_tokens)
         component_cache_writes = self.cache_write_5m_tokens + self.cache_write_1h_tokens
-        self.cache_write_tokens = _non_negative_int(self.cache_write_tokens)
-        if self.cache_write_tokens == 0 and component_cache_writes:
-            self.cache_write_tokens = component_cache_writes
+        self.cache_write_tokens = max(_non_negative_int(self.cache_write_tokens), component_cache_writes)
         self.cache_read_tokens = (
             self.cached_input_tokens if self.cache_read_tokens is None
             else min(self.input_tokens, _non_negative_int(self.cache_read_tokens))

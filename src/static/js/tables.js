@@ -187,7 +187,7 @@
   function csvText(value) {
     const text = String(value ?? '');
     // Prevent spreadsheet formula execution for user-controlled titles/IDs.
-    return /^[\s\t]*[=+\-@|%]/.test(text) ? `'${text}` : text;
+    return /^[\s\x00-\x1f]*[=+\-@|%]/.test(text) ? `'${text}` : text;
   }
 
   /**

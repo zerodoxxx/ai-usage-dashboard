@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 def _timezone_name_from_system() -> str | None:
     for variable in ("AI_USAGE_TIMEZONE", "TZ"):
         value = os.environ.get(variable, "").strip()
+        if value.startswith(":"):
+            value = value[1:].strip()
         if value:
             return value
 

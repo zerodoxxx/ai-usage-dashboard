@@ -67,10 +67,13 @@ def _allocate_total(total: int, weights: list[int]) -> list[int]:
     """Distribute a total across events while preserving the exact sum."""
     if not weights:
         return []
+    if total <= 0:
+        return [0] * len(weights)
     safe_weights = [max(0, int(weight)) for weight in weights]
     weight_sum = sum(safe_weights)
-    if total <= 0 or weight_sum <= 0:
-        return [0] * len(weights)
+    if weight_sum <= 0:
+        safe_weights = [1] * len(weights)
+        weight_sum = len(weights)
 
     allocations = [(total * weight) // weight_sum for weight in safe_weights]
     remainder = total - sum(allocations)

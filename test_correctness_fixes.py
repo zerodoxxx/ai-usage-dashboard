@@ -1153,3 +1153,125 @@ def test_to_utc_datetime_narrowed_exceptions() -> None:
     assert to_utc_datetime(1e30) is None
     dt = to_utc_datetime("2026-09-18T10:00:00Z")
     assert dt == datetime(2026, 9, 18, 10, 0, tzinfo=timezone.utc)
+
+
+def test_slice_session_scales_reported_cost_and_prevents_cost_explosion() -> None:
+    from src.parsers.aggregator import _build_usage_data, _slice_session
+
+    session = {
+        "id": "session-reported-cost",
+        "tool": "codex",
+        "provider": "codex",
+        "model": "gpt-5",
+        "created_at": "2026-09-18T10:00:00+00:00",
+        "call_count": 2,
+        "uncached_input": 100,
+        "cached_input": 0,
+        "total_input": 100,
+        "output": 100,
+        "reasoning_output": 0,
+        "total_tokens": 200,
+        "reported_cost_usd": 10.0,
+        "cost_cached_usd": 10.0,
+        "cost_uncached_usd": 10.0,
+        "savings_usd": 0.0,
+        "usage_events": [
+            {
+                "timestamp": "2026-09-18T10:00:00+00:00",
+                "model": "gpt-5",
+                "input_tokens": 50,
+                "cached_input_tokens": 0,
+                "output_tokens": 50,
+                "reasoning_output_tokens": 0,
+                "total_tokens": 100,
+            },
+            {
+                "timestamp": "2026-09-19T10:00:00+00:00",
+                "model": "gpt-5",
+                "input_tokens": 50,
+                "cached_input_tokens": 0,
+                "output_tokens": 50,
+                "reasoning_output_tokens": 0,
+                "total_tokens": 100,
+            },
+        ],
+    }
+
+    start = datetime(2026, 9, 18, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 9, 18, 23, 59, 59, tzinfo=timezone.utc)
+
+    sliced = _slice_session(session, start, end, include_end=True)
+    assert sliced is not None
+    assert sliced["total_tokens"] == 100
+    assert sliced["cost_cached_usd"] == 5.0
+    assert sliced["reported_cost_usd"] == 5.0
+
+    result = _build_usage_data(
+        [sliced],
+        "codex",
+        window_start=start,
+        window_end=end,
+    )
+    assert result["summary"]["cost_cached_usd"] == 5.0
+    assert len(result["models"]) == 1
+    assert result["models"][0]["est_cost_cached_usd"] == 5.0
+    active_rows = [row for row in result["timeline"] if row["total_tokens"]]
+    assert len(active_rows) == 1
+    assert active_rows[0]["cost_cached_usd"] == 5.0
+
+
+def test_allocate_total_with_zero_weights_distributes_evenly() -> None:
+    from src.parsers.codex import _allocate_total
+
+    # Positive total with zero weights distributes evenly without dropping tokens
+    allocations = _allocate_total(10, [0, 0, 0])
+    assert allocations == [4, 3, 3]
+    assert sum(allocations) == 10
+
+    # Total <= 0 returns all zeros
+    assert _allocate_total(0, [0, 0, 0]) == [0, 0, 0]
+    assert _allocate_total(-5, [0, 0, 0]) == [0, 0, 0]
+
+    # Empty weights returns empty list
+    assert _allocate_total(10, []) == []
+
+
+def test_token_usage_elevates_cache_write_tokens_to_component_sum() -> None:
+    # When cache_write_tokens is smaller than component sum, it gets elevated
+    usage = TokenUsage(
+        input_tokens=100,
+        cache_write_tokens=5,
+        cache_write_5m_tokens=10,
+        cache_write_1h_tokens=15,
+    )
+    assert usage.cache_write_tokens == 25
+    assert usage.total_input == 125
+
+    # When cache_write_tokens is already larger than component sum, it is preserved
+    usage_larger = TokenUsage(
+        input_tokens=100,
+        cache_write_tokens=50,
+        cache_write_5m_tokens=10,
+        cache_write_1h_tokens=15,
+    )
+    assert usage_larger.cache_write_tokens == 50
+    assert usage_larger.total_input == 150
+
+
+def test_timezone_name_from_system_strips_leading_colon(monkeypatch) -> None:
+    from src.timezones import _timezone_name_from_system, local_timezone_name
+
+    monkeypatch.delenv("AI_USAGE_TIMEZONE", raising=False)
+    monkeypatch.setenv("TZ", ":America/New_York")
+
+    assert _timezone_name_from_system() == "America/New_York"
+    assert local_timezone_name() == "America/New_York"
+
+    monkeypatch.setenv("AI_USAGE_TIMEZONE", ":UTC")
+    assert _timezone_name_from_system() == "UTC"
+    assert local_timezone_name() == "UTC"
+
+
+def test_csv_text_formula_injection_guard() -> None:
+    tables_js = (Path(__file__).parent / "src" / "static" / "js" / "tables.js").read_text(encoding="utf-8")
+    assert r"^[\s\x00-\x1f]*[=+\-@|%]" in tables_js
