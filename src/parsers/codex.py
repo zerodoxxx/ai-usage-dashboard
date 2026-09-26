@@ -22,6 +22,7 @@ _USAGE_FIELDS = (
     "cached_input_tokens",
     "output_tokens",
     "reasoning_output_tokens",
+    "cache_write_input_tokens",
     "total_tokens",
 )
 
@@ -44,7 +45,11 @@ def _normalize_usage(usage: Any) -> dict[str, int] | None:
         normalized["input_tokens"], normalized["cached_input_tokens"]
     )
     if normalized["total_tokens"] == 0:
-        normalized["total_tokens"] = normalized["input_tokens"] + normalized["output_tokens"]
+        normalized["total_tokens"] = (
+            normalized["input_tokens"]
+            + normalized["cache_write_input_tokens"]
+            + normalized["output_tokens"]
+        )
     return normalized if any(normalized.values()) else None
 
 
@@ -114,6 +119,10 @@ def _reconcile_usage_events(
         target["reasoning_output_tokens"],
         [_as_int(event.get("reasoning_output_tokens")) for event in events],
     )
+    cache_write_allocations = _allocate_total(
+        target["cache_write_input_tokens"],
+        [_as_int(event.get("cache_write_input_tokens")) for event in events],
+    )
     total_allocations = _allocate_total(
         target["total_tokens"],
         [
@@ -131,6 +140,7 @@ def _reconcile_usage_events(
             "cached_input_tokens": min(input_allocations[index], cached_allocations[index]),
             "output_tokens": output_allocations[index],
             "reasoning_output_tokens": reasoning_allocations[index],
+            "cache_write_input_tokens": cache_write_allocations[index],
             "total_tokens": total_allocations[index],
         })
     return reconciled
@@ -259,6 +269,7 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
         cached_input_tokens = last_cumulative["cached_input_tokens"]
         output_tokens = last_cumulative["output_tokens"]
         reasoning_output_tokens = last_cumulative["reasoning_output_tokens"]
+        cache_write_tokens = last_cumulative["cache_write_input_tokens"]
         total_tokens = last_cumulative["total_tokens"]
     else:
         usage_events_for_totals = token_record_events or event_msg_fallback_events
@@ -266,6 +277,7 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
         cached_input_tokens = sum(event["cached_input_tokens"] for event in usage_events_for_totals)
         output_tokens = sum(event["output_tokens"] for event in usage_events_for_totals)
         reasoning_output_tokens = sum(event["reasoning_output_tokens"] for event in usage_events_for_totals)
+        cache_write_tokens = sum(event["cache_write_input_tokens"] for event in usage_events_for_totals)
         total_tokens = sum(event["total_tokens"] for event in usage_events_for_totals)
 
     # A rollout may contain both a token_usage_record and a token_count status
@@ -301,6 +313,7 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
             "cached_input_tokens": cached_input_tokens,
             "output_tokens": output_tokens,
             "reasoning_output_tokens": reasoning_output_tokens,
+            "cache_write_input_tokens": cache_write_tokens,
             "total_tokens": total_tokens,
         })
 
@@ -311,6 +324,8 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
         "uncached_input_tokens": uncached_input_tokens,
         "output_tokens": output_tokens,
         "reasoning_output_tokens": reasoning_output_tokens,
+        "cache_write_input_tokens": cache_write_tokens,
+        "cache_write_tokens": cache_write_tokens,
         "total_tokens": total_tokens,
         "start_time": first_timestamp,
         "end_time": last_timestamp,
@@ -343,6 +358,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
             "uncached_input": 0,
             "cached_input": 0,
             "total_input": 0,
+            "cache_write": 0,
             "output": 0,
             "reasoning_output": 0,
             "cost_cached_usd": 0.0,
@@ -422,7 +438,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
         raw_title = str(t.get("title") or "").strip()
         # Clean title to first readable non-empty line
         clean_title = next((line.strip() for line in raw_title.splitlines() if line.strip()), f"Codex Session {t_id[:8]}")
-        model = str(t.get("model") or "gpt-5.6-luna").strip()
+        model = str(t.get("model") or "").strip()
         reasoning_effort = t.get("reasoning_effort")
         db_tokens = int(t.get("tokens_used") or 0)
         created_at_raw = t.get("created_at")
@@ -439,12 +455,15 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
         if matched_rollout_path:
             processed_rollout_paths.add(str(matched_rollout_path.resolve()))
             parsed = _parse_rollout_file(matched_rollout_path)
+            if parsed.get("model"):
+                model = str(parsed["model"]).strip()
             call_count = parsed["call_count"]
             input_tokens = parsed["input_tokens"]
             cached_input = parsed["cached_input_tokens"]
             uncached_input = parsed["uncached_input_tokens"]
             output = parsed["output_tokens"]
             reasoning_output = parsed["reasoning_output_tokens"]
+            cache_write_tokens = parsed["cache_write_input_tokens"]
             total_tokens = parsed["total_tokens"]
             start_time = parsed["start_time"]
             end_time = parsed["end_time"]
@@ -456,6 +475,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
             uncached_input = input_tokens
             output = max(0, db_tokens - input_tokens)
             reasoning_output = 0
+            cache_write_tokens = 0
             total_tokens = db_tokens
             start_time = None
             end_time = None
@@ -467,6 +487,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
             uncached_input = input_tokens
             cached_input = 0
             output = max(0, db_tokens - input_tokens)
+            cache_write_tokens = 0
             call_count = max(1, call_count)
 
         created_at_iso = _to_iso_string(created_at_raw) or (start_time or "")
@@ -478,17 +499,25 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
                 "cached_input_tokens": cached_input,
                 "output_tokens": output,
                 "reasoning_output_tokens": reasoning_output,
+                "cache_write_input_tokens": cache_write_tokens,
                 "total_tokens": total_tokens,
             }]
 
-        priced = calculate_cost_strict(model, uncached_input, cached_input, output, provider="codex")
+        priced = calculate_cost_strict(
+            model,
+            uncached_input,
+            cached_input,
+            output,
+            provider="codex",
+            cache_write=cache_write_tokens,
+        )
         cost = {
             "cost_cached_usd": float(priced.get("cost_cached_usd") or 0.0),
             "cost_uncached_usd": float(priced.get("cost_uncached_usd") or 0.0),
             "savings_usd": float(priced.get("savings_usd") or 0.0),
         }
-        total_input = uncached_input + cached_input
-        cache_hit_rate = round((cached_input / total_input * 100.0), 2) if total_input > 0 else 0.0
+        total_input = uncached_input + cached_input + cache_write_tokens
+        cache_hit_rate = round((cached_input / (uncached_input + cached_input) * 100.0), 2) if uncached_input + cached_input > 0 else 0.0
 
         sessions.append({
             "id": t_id,
@@ -500,6 +529,9 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
             "uncached_input": uncached_input,
             "cached_input": cached_input,
             "total_input": total_input,
+            "cache_write": cache_write_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "cache_write_input_tokens": cache_write_tokens,
             "output": output,
             "reasoning_output": reasoning_output,
             "total_tokens": total_tokens,
@@ -523,7 +555,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
         # Extract UUID or basename
         match = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", rpath.name)
         orphan_id = match.group(1) if match else rpath.stem
-        orphan_model = parsed.get("model") or "gpt-5.6-luna"
+        orphan_model = str(parsed.get("model") or "").strip()
         created_at_iso = parsed["start_time"] or ""
 
         priced = calculate_cost_strict(
@@ -532,14 +564,15 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
             parsed["cached_input_tokens"],
             parsed["output_tokens"],
             provider="codex",
+            cache_write=parsed["cache_write_input_tokens"],
         )
         cost = {
             "cost_cached_usd": float(priced.get("cost_cached_usd") or 0.0),
             "cost_uncached_usd": float(priced.get("cost_uncached_usd") or 0.0),
             "savings_usd": float(priced.get("savings_usd") or 0.0),
         }
-        tot_in = parsed["uncached_input_tokens"] + parsed["cached_input_tokens"]
-        c_hit_rate = round((parsed["cached_input_tokens"] / tot_in * 100.0), 2) if tot_in > 0 else 0.0
+        tot_in = parsed["uncached_input_tokens"] + parsed["cached_input_tokens"] + parsed["cache_write_input_tokens"]
+        c_hit_rate = round((parsed["cached_input_tokens"] / (parsed["uncached_input_tokens"] + parsed["cached_input_tokens"]) * 100.0), 2) if parsed["uncached_input_tokens"] + parsed["cached_input_tokens"] > 0 else 0.0
 
         sessions.append({
             "id": orphan_id,
@@ -551,6 +584,9 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
             "uncached_input": parsed["uncached_input_tokens"],
             "cached_input": parsed["cached_input_tokens"],
             "total_input": tot_in,
+            "cache_write": parsed["cache_write_input_tokens"],
+            "cache_write_tokens": parsed["cache_write_input_tokens"],
+            "cache_write_input_tokens": parsed["cache_write_input_tokens"],
             "output": parsed["output_tokens"],
             "reasoning_output": parsed["reasoning_output_tokens"],
             "total_tokens": parsed["total_tokens"],
@@ -580,6 +616,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
                 "uncached_input": 0,
                 "cached_input": 0,
                 "total_input": 0,
+                "cache_write": 0,
                 "output": 0,
                 "reasoning_output": 0,
                 "total_tokens": 0,
@@ -594,6 +631,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
         entry["uncached_input"] += s["uncached_input"]
         entry["cached_input"] += s["cached_input"]
         entry["total_input"] += s["total_input"]
+        entry["cache_write"] += s.get("cache_write", 0)
         entry["output"] += s["output"]
         entry["reasoning_output"] += s["reasoning_output"]
         entry["total_tokens"] += s["total_tokens"]
@@ -602,8 +640,8 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
         entry["est_savings_usd"] += s["savings_usd"]
 
     for entry in models_dict.values():
-        tot_in = entry["total_input"]
-        entry["cache_hit_rate"] = round((entry["cached_input"] / tot_in * 100.0), 2) if tot_in > 0 else 0.0
+        cacheable_input = entry["uncached_input"] + entry["cached_input"]
+        entry["cache_hit_rate"] = round((entry["cached_input"] / cacheable_input * 100.0), 2) if cacheable_input > 0 else 0.0
         entry["est_cost_cached_usd"] = round(entry["est_cost_cached_usd"], 6)
         entry["est_cost_uncached_usd"] = round(entry["est_cost_uncached_usd"], 6)
         entry["est_savings_usd"] = round(entry["est_savings_usd"], 6)
@@ -616,6 +654,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
         "uncached_input": 0,
         "cached_input": 0,
         "total_input": 0,
+        "cache_write": 0,
         "output": 0,
         "reasoning_output": 0,
         "total_tokens": 0,
@@ -636,6 +675,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
         day["uncached_input"] += s["uncached_input"]
         day["cached_input"] += s["cached_input"]
         day["total_input"] += s["total_input"]
+        day["cache_write"] += s.get("cache_write", 0)
         day["output"] += s["output"]
         day["reasoning_output"] += s["reasoning_output"]
         day["total_tokens"] += s["total_tokens"]
@@ -656,20 +696,22 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
     # 7. Summary odometer totals
     tot_uncached = sum(s["uncached_input"] for s in sessions)
     tot_cached = sum(s["cached_input"] for s in sessions)
-    tot_input = tot_uncached + tot_cached
+    tot_cache_write = sum(s.get("cache_write", 0) for s in sessions)
+    tot_input = tot_uncached + tot_cached + tot_cache_write
     tot_output = sum(s["output"] for s in sessions)
     tot_reasoning = sum(s["reasoning_output"] for s in sessions)
     tot_tokens = sum(s["total_tokens"] for s in sessions)
     tot_cost_cached = round(sum(s["cost_cached_usd"] for s in sessions), 6)
     tot_cost_uncached = round(sum(s["cost_uncached_usd"] for s in sessions), 6)
     tot_savings = round(sum(s["savings_usd"] for s in sessions), 6)
-    summary_cache_hit_rate = round((tot_cached / tot_input * 100.0), 2) if tot_input > 0 else 0.0
+    summary_cache_hit_rate = round((tot_cached / (tot_uncached + tot_cached) * 100.0), 2) if tot_uncached + tot_cached > 0 else 0.0
 
     summary = {
         "total_tokens": tot_tokens,
         "uncached_input": tot_uncached,
         "cached_input": tot_cached,
         "total_input": tot_input,
+        "cache_write": tot_cache_write,
         "output": tot_output,
         "reasoning_output": tot_reasoning,
         "cost_cached_usd": tot_cost_cached,

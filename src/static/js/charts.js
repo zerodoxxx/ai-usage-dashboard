@@ -101,7 +101,11 @@
     updateCostByToolChart(data || {}, el.costByToolCanvas);
     updateCacheTrendChart((data && data.timeline) || [], el.cacheTrendCanvas);
     updateCostPer1kChart((data && data.models) || [], el.costPer1kCanvas);
-    updateHourlyActivityChart((data && data.hourly_timeline) || [], el.hourlyActivityCanvas);
+    updateHourlyActivityChart(
+      (data && data.hourly_timeline) || [],
+      el.hourlyActivityCanvas,
+      data && data.timezone
+    );
     updateWeekdayHeatmap((data && data.weekday_hour) || [], el.weekdayHeatmap);
     updateSparklines((data && data.timeline) || [], el);
   }
@@ -116,15 +120,15 @@
     const labels = list.map((m) => m.model);
     const uncached = list.map((m) => m.uncached_input || 0);
     const cached = list.map((m) => m.cached_input || 0);
+    const cacheWrite = list.map((m) => m.cache_write || 0);
     const output = list.map((m) => m.output || 0);
-    const reasoning = list.map((m) => m.reasoning_output || 0);
 
     if (prepareCanvas(chartTokens, canvas)) {
       chartTokens.data.labels = labels;
       chartTokens.data.datasets[0].data = uncached;
       chartTokens.data.datasets[1].data = cached;
-      chartTokens.data.datasets[2].data = output;
-      chartTokens.data.datasets[3].data = reasoning;
+      chartTokens.data.datasets[2].data = cacheWrite;
+      chartTokens.data.datasets[3].data = output;
       chartTokens.update();
       return;
     }
@@ -137,8 +141,8 @@
         datasets: [
           { label: 'Uncached Input', data: uncached, backgroundColor: '#3b82f6', borderRadius: 4, stack },
           { label: 'Cached Input', data: cached, backgroundColor: '#06b6d4', borderRadius: 4, stack },
-          { label: 'Output', data: output, backgroundColor: '#8b5cf6', borderRadius: 4, stack },
-          { label: 'Reasoning', data: reasoning, backgroundColor: '#ec4899', borderRadius: 4, stack },
+          { label: 'Cache Writes', data: cacheWrite, backgroundColor: '#f59e0b', borderRadius: 4, stack },
+          { label: 'Output (incl. reasoning)', data: output, backgroundColor: '#8b5cf6', borderRadius: 4, stack },
         ],
       },
       options: timeSeriesOptions(
@@ -302,8 +306,8 @@
     const labels = list.map((t) => t.date);
     const rateData = list.map((t) => {
       if (t.cache_hit_rate !== undefined && t.cache_hit_rate !== null) return Number(t.cache_hit_rate) || 0;
-      const total = Number(t.total_input || 0);
-      return total > 0 ? Math.round((Number(t.cached_input || 0) / total) * 10000) / 100 : 0;
+      const cacheableInput = Number(t.uncached_input || 0) + Number(t.cached_input || 0);
+      return cacheableInput > 0 ? Math.round((Number(t.cached_input || 0) / cacheableInput) * 10000) / 100 : 0;
     });
 
     if (prepareCanvas(chartCacheTrend, canvas)) {
@@ -357,7 +361,14 @@
     if (!canvas) return;
 
     const list = (Array.isArray(models) ? models : [])
-      .filter((m) => m && typeof m === 'object' && Number(m.total_tokens || 0) > 0)
+      .filter((m) => (
+        m
+        && typeof m === 'object'
+        && Number(m.total_tokens || 0) > 0
+        && m.cost_available !== false
+        && m.unpriced !== true
+        && m.priced !== false
+      ))
       .sort((a, b) => Number(b.total_tokens || 0) - Number(a.total_tokens || 0))
       .slice(0, 8);
 
@@ -417,9 +428,11 @@
     });
   }
 
-  function localTimeZoneLabel() {
+  function localTimeZoneLabel(zone) {
     try {
-      const parts = new Intl.DateTimeFormat(undefined, { timeZoneName: 'short' }).formatToParts(new Date());
+      const options = { timeZoneName: 'short' };
+      if (zone) options.timeZone = String(zone);
+      const parts = new Intl.DateTimeFormat(undefined, options).formatToParts(new Date());
       const tz = parts.find((part) => part.type === 'timeZoneName');
       if (tz && tz.value) return tz.value;
     } catch {
@@ -433,12 +446,12 @@
    * Uses backend `hourly_timeline` (24 local-hour buckets). Missing data
    * falls back to 24 zeros — never re-buckets sessions on the client.
    */
-  function updateHourlyActivityChart(hourlyTimeline, canvas) {
+  function updateHourlyActivityChart(hourlyTimeline, canvas, timezone) {
     if (!canvas) return;
     const formatCompactNumber = utils().formatCompactNumber;
     const titleEl = document.getElementById('hourly-activity-title');
     if (titleEl) {
-      titleEl.textContent = `Hourly Activity (${localTimeZoneLabel()})`;
+      titleEl.textContent = `Hourly Activity (${localTimeZoneLabel(timezone)})`;
     }
 
     const hourlyLabels = Array.from({ length: 24 }, (_, i) => `${String(i).padStart(2, '0')}:00`);
@@ -545,12 +558,12 @@
     const maxVal = useTokens ? maxTokens : maxCalls;
 
     const hourHeaders = Array.from({ length: 24 }, (_, hour) => (
-      `<div class="heatmap-hour">${String(hour).padStart(2, '0')}</div>`
+      `<div class="heatmap-hour" role="columnheader" aria-label="Hour ${String(hour).padStart(2, '0')}">${String(hour).padStart(2, '0')}</div>`
     )).join('');
 
-    let body = `<div class="heatmap-corner"></div>${hourHeaders}`;
+    let body = `<div class="heatmap-corner" role="columnheader" aria-label="Weekday"></div>${hourHeaders}`;
     WEEKDAY_LABELS.forEach((label, day) => {
-      body += `<div class="heatmap-weekday">${label}</div>`;
+      body += `<div class="heatmap-weekday" role="rowheader">${label}</div>`;
       for (let hour = 0; hour < 24; hour += 1) {
         const cell = grid[day][hour];
         const value = useTokens ? cell.total_tokens : cell.call_count;
@@ -558,13 +571,13 @@
         const alpha = (0.08 + t * 0.87).toFixed(3);
         const weekdayLabel = cell.weekday_label || label;
         const title = heatmapCellTitle(weekdayLabel, hour, cell);
-        body += `<div class="heatmap-cell" style="background:rgba(99,102,241,${alpha})" title="${escapeHtml(title)}"></div>`;
+        body += `<div class="heatmap-cell" role="gridcell" tabindex="0" aria-label="${escapeHtml(title)}" style="background:rgba(99,102,241,${alpha})" title="${escapeHtml(title)}"></div>`;
       }
     });
 
     container.innerHTML = `
       <div class="heatmap-scroll">
-        <div class="heatmap-grid" role="img" aria-label="Weekday by hour activity heatmap">${body}</div>
+        <div class="heatmap-grid" role="grid" aria-label="Weekday by hour activity heatmap" aria-rowcount="8" aria-colcount="25">${body}</div>
       </div>
       <div class="heatmap-legend">
         <span>Low</span>

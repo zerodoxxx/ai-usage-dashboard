@@ -77,7 +77,12 @@
         : 'No daily usage yet';
     }
 
-    renderTopSessions(ctx.topSessionsTableBody, details.top_sessions || [], formatCurrency);
+    renderTopSessions(
+      ctx.topSessionsTableBody,
+      details.top_sessions || [],
+      formatCurrency,
+      ctx.timezone,
+    );
 
     const comparison = details.comparison;
     if (ctx.comparisonSubtitle) {
@@ -130,9 +135,16 @@
   /**
    * Render the five highest-cost sessions in the current view.
    */
-  function renderTopSessions(tbody, sessions, formatCurrency) {
+  function renderTopSessions(tbody, sessions, formatCurrency, timezone = '') {
     if (!tbody) return;
-    const { formatDateTime, providerBadge, escapeHtml, isEstimatedRow, EST_TOOLTIP } = window.DashboardUtils;
+    const {
+      formatDateTime,
+      providerBadge,
+      escapeHtml,
+      tokenProvenance,
+      provenanceLabel,
+      EST_TOOLTIP,
+    } = window.DashboardUtils;
 
     const sessionList = (Array.isArray(sessions) ? sessions : []).filter((session) => session && typeof session === 'object');
     if (sessionList.length === 0) {
@@ -143,23 +155,38 @@
     tbody.innerHTML = sessionList.map((session) => {
       const tool = String(session.tool || '');
       const badge = providerBadge(tool);
-      const est = isEstimatedRow(session);
+      const provenance = tokenProvenance(session);
+      const est = provenance !== 'reported';
       const estBadge = est
-        ? ` <span class="est-badge" title="${escapeHtml(EST_TOOLTIP)}" aria-label="Estimated tokens">est.</span>`
+        ? ` <span class="est-badge ${provenance === 'mixed' ? 'mixed-badge' : ''}" title="${escapeHtml(EST_TOOLTIP)}" aria-label="${escapeHtml(provenanceLabel(session))} token provenance">${escapeHtml(provenanceLabel(session))}</span>`
         : '';
       const tokTitle = est ? ` title="${escapeHtml(EST_TOOLTIP)}"` : '';
       const tokPrefix = est ? '~' : '';
-      const activity = formatDateTime(session.activity_at || session.created_at || session.start_time);
+      const costStatus = String(session.pricing_status || session.cost_source || '').toLowerCase();
+      const costAvailable = (
+        session.cost_available === true
+        || (session.cost_available !== false
+          && session.cost_cached_usd != null
+          && !['unknown', 'unpriced', 'ambiguous'].includes(costStatus))
+      );
+      const costText = costAvailable
+        ? `${tokPrefix}${formatCurrency(session.cost_cached_usd)}`
+        : '<strong class="cost-unavailable" aria-label="Cost unavailable">—</strong>';
+      const costTitle = costAvailable ? tokTitle : ' title="Cost unavailable: no catalog rate"';
+      const activity = formatDateTime(
+        session.activity_at || session.created_at || session.start_time,
+        timezone,
+      );
       return `
         <tr>
           <td>
             <strong class="insight-session-title" title="${escapeHtml(String(session.title || 'Untitled Session'))}">${escapeHtml(String(session.title || 'Untitled Session'))}</strong>
             <div class="text-muted" style="font-size: 10px; font-family: var(--font-mono);">${escapeHtml(activity)}</div>
           </td>
-          <td><span class="provider-badge ${badge.className}">${badge.text}</span>${estBadge}</td>
+          <td><span class="provider-badge ${badge.className}">${badge.text}</span>${estBadge}${costAvailable ? '' : ' <span class="unpriced-pill">unpriced</span>'}</td>
           <td class="cell-mono">${escapeHtml(String(session.model || 'unknown'))}</td>
           <td class="cell-mono cell-right"${tokTitle}>${tokPrefix}${Number(session.total_tokens || 0).toLocaleString()}</td>
-          <td class="cell-mono cell-right text-success"${tokTitle}>${tokPrefix}${formatCurrency(session.cost_cached_usd)}</td>
+          <td class="cell-mono cell-right ${costAvailable ? 'text-success' : 'text-muted'}"${costTitle}>${costText}</td>
         </tr>
       `;
     }).join('');

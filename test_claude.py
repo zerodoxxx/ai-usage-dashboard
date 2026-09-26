@@ -83,9 +83,11 @@ def test_claude_source_deduplicates_and_preserves_cache_metrics(tmp_path: Path) 
     assert session.title == "Track this Claude Code session"
     assert session.call_count == 2
     assert session.usage.input_tokens == 6_000
+    assert session.usage.total_input == 6_500
     assert session.usage.cached_input_tokens == 4_600
     assert session.usage.cache_write_tokens == 500
     assert session.usage.output_tokens == 300
+    assert session.usage.total_tokens == 6_800
     assert session.cost is not None
     assert session.cost.source == "estimated"
     assert session.events[0].cost is not None
@@ -101,5 +103,7 @@ def test_claude_source_flows_through_registered_aggregator(tmp_path: Path) -> No
     assert result["tool"] == "claude-code"
     assert result["summary"]["session_count"] == 1
     assert result["summary"]["call_count"] == 2
-    assert result["summary"]["total_tokens"] == 6_300
+    assert result["summary"]["total_input"] == 6_500
+    assert result["summary"]["cache_write"] == 500
+    assert result["summary"]["total_tokens"] == 6_800
     assert result["sessions"][0]["pricing_status"] == "estimated"

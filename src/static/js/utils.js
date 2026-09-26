@@ -90,11 +90,26 @@
   /**
    * Format date strings cleanly
    */
-  function formatDateTime(isoString) {
+  function formatDateTime(isoString, timeZone) {
     if (!isoString) return '—';
     try {
       const d = new Date(isoString);
       if (isNaN(d.getTime())) return String(isoString).slice(0, 19);
+      if (timeZone) {
+        const parts = new Intl.DateTimeFormat('en-CA', {
+          timeZone: String(timeZone),
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+          hourCycle: 'h23',
+        }).formatToParts(d);
+        const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+        return `${values.year}-${values.month}-${values.day} ${values.hour}:${values.minute}:${values.second}`;
+      }
       const pad = (n) => String(n).padStart(2, '0');
       return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
     } catch {
@@ -124,19 +139,33 @@
     return { className: 'badge-agy', text: `${PROVIDER_MARKS.agy}<span>Antigravity</span>` };
   }
 
-  // AGY (Antigravity) token counts are chars//4 estimates, unlike the exact
-  // API-reported counts from Codex/Claude. The backend marks these rows with
-  // `estimated:true` / `token_source:'estimated'` (cost provenance stays in
-  // `cost_source`/`pricing_status`), so token and cost cells can carry a
-  // "~"/"est." marker instead of looking exact.
+  // AGY transcript token counts are chars//4 estimates, unlike the exact
+  // API-reported counts from Codex/Claude. The backend marks those rows with
+  // `estimated:true` / `token_source:'estimated'`; token_usage.db rows carry
+  // explicit reported provenance. Cost provenance stays in
+  // `cost_source`/`pricing_status`.
   const EST_TOOLTIP = 'Estimated from transcript text (chars ÷ 4); single-turn assumes 0% cache, multi-turn assumes a flat 45% cached-input share. Codex/Claude counts are exact API reports.';
-  function isEstimatedRow(row) {
-    if (!row || typeof row !== 'object') return false;
-    if (row.estimated === true) return true;
-    if (String(row.token_source || '').toLowerCase() === 'estimated') return true;
-    if (row.metadata && (row.metadata.estimated === true || String(row.metadata.token_source || '').toLowerCase() === 'estimated')) return true;
+  const PROVENANCE_LABELS = {
+    reported: 'reported',
+    estimated: 'est.',
+    mixed: 'mixed',
+  };
+  function tokenProvenance(row) {
+    if (!row || typeof row !== 'object') return 'reported';
+    const source = String(row.token_source || (row.metadata && row.metadata.token_source) || '').toLowerCase();
+    if (source === 'estimated' || source === 'mixed' || source === 'reported') return source;
+    if (row.estimated === true || (row.metadata && row.metadata.estimated === true)) return 'estimated';
+    if (Object.prototype.hasOwnProperty.call(row, 'estimated') || Object.prototype.hasOwnProperty.call(row, 'token_source')) {
+      return 'reported';
+    }
     const tool = String(row.tool || '').toLowerCase();
-    return tool === 'antigravity' || tool === 'agy' || tool === 'google';
+    return tool === 'antigravity' || tool === 'agy' || tool === 'google' ? 'estimated' : 'reported';
+  }
+  function isEstimatedRow(row) {
+    return tokenProvenance(row) !== 'reported';
+  }
+  function provenanceLabel(row) {
+    return PROVENANCE_LABELS[tokenProvenance(row)] || PROVENANCE_LABELS.reported;
   }
 
   /**
@@ -185,7 +214,9 @@
     providerBadge,
     escapeHtml,
     showToast,
+    tokenProvenance,
     isEstimatedRow,
+    provenanceLabel,
     EST_TOOLTIP,
   };
 })();

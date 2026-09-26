@@ -1,18 +1,20 @@
 # AI Tools Usage & Cost Visualizer
 
-A local real-time dashboard that visualizes token usage and API inference costs for **OpenAI Codex**, **Claude Code**, and **Google Antigravity (AGY)** — directly from your filesystem, no external connections needed.
+A local real-time dashboard that visualizes token usage and API inference costs for **OpenAI Codex**, **Claude Code**, and **Google Antigravity (AGY)** — directly from your filesystem, with no API keys or telemetry uploads.
 
 ## Features
 
 - 🎰 **Mechanical rolling odometers** for Total Tokens, API Cost, Cached Tokens, Cache Hit Rate, Output Tokens, and Sessions
-- 📊 **Interactive Chart.js visualizers** — stacked token breakdown by model + dual-axis daily cost/token trend
+- 📊 **Interactive Chart.js visualizers** — token/model trends, tool spend, cache efficiency, hourly activity, and weekday/hour heatmap
 - 🔍 **Per-model granularity table** with 12 columns: uncached input, cached input, output, reasoning tokens, cache hit %, API rates, cost with/without caching, net savings
 - 🔄 **Live auto-refresh** (10s/30s/60s) with AbortController cancellation
 - 🔽 **Tool filter dropdown**: All Tools, OpenAI Codex, Claude Code, AGY (Google Antigravity)
-- 🗓️ **Time filter dropdown**: All time, This month, Past 30 days, Past 7 days, Past 24h
+- 🗓️ **Time filter dropdown**: All time, This month, Past 30 days, Past 7 days, Past 24h, Custom range
 - 📊 **Analytics snapshot**: API calls, averages, peak spend day, top-cost sessions, period comparison, and a 30-day cost projection from the selected filter's daily average
 - ⚡ **Fresh live polling**: source files are reparsed for each refresh, with parallel all-tool parsing
 - 🔎 **Session search** — filter across titles, models, and session IDs
+- ⬇️ **CSV export** — download the sessions in the selected range and search filter
+- ⚠️ **Cost provenance** — mixed, estimated, reported, and unpriced usage is surfaced explicitly
 
 ## Quickstart
 
@@ -39,6 +41,12 @@ bash launch_background.sh --stop
 ```
 
 Dashboard: http://127.0.0.1:8765
+
+Calendar-month and custom-date filters use the machine's DST-aware local timezone. To override it explicitly, set an IANA timezone before launch:
+
+```bash
+AI_USAGE_TIMEZONE=America/New_York python run.py
+```
 
 ## Data Sources
 
@@ -81,7 +89,12 @@ src/
 │   └── aggregator.py  # Registration-driven aggregator
 ├── static/js/
 │   ├── odometer.js    # RollingOdometer (zero-dependency)
-│   └── dashboard.js   # UI controller
+│   ├── utils.js       # Formatting, provenance, and toast helpers
+│   ├── api.js         # Fetch/cancellation and pricing metadata
+│   ├── charts.js      # Chart.js visualizations and heatmap
+│   ├── tables.js      # Model/session tables and CSV export
+│   ├── analytics.js   # Insights renderer
+│   └── dashboard.js   # UI orchestrator
 └── templates/
     └── index.html     # Dashboard layout
 ```

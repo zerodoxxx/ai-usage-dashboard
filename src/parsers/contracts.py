@@ -18,6 +18,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
+from src.timezones import as_utc
+
 
 def _non_negative_int(value: Any) -> int:
     """Convert a value to a non-negative integer without leaking bad input."""
@@ -41,7 +43,7 @@ def _timestamp(value: Any) -> datetime | None:
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, datetime):
-        return value.astimezone(timezone.utc)
+        return as_utc(value)
     if isinstance(value, (int, float)):
         try:
             seconds = float(value)
@@ -62,7 +64,7 @@ def _timestamp(value: Any) -> datetime | None:
         pass
     try:
         parsed = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw)
-        return parsed.astimezone(timezone.utc)
+        return as_utc(parsed)
     except (TypeError, ValueError, OverflowError):
         return None
 
@@ -71,14 +73,45 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
+def _reconcile_event_totals(events: list["UsageEvent"], target: int) -> None:
+    """Keep event totals aligned with an authoritative session total.
+
+    Providers can report a session-level total that differs from the sum of
+    their per-event totals (for example, cumulative Codex records). Preserve
+    the session value rather than inflating it from individual events, and
+    adjust only the event-level total fields used for time bucketing.
+    """
+    if not events or target <= 0:
+        return
+    current = sum(event.usage.total_tokens for event in events)
+    delta = target - current
+    if delta == 0:
+        return
+    if delta > 0:
+        events[-1].usage.total_tokens += delta
+        return
+
+    remaining = -delta
+    for event in reversed(events):
+        component_total = event.usage.total_input + event.usage.output_tokens
+        reducible = max(0, event.usage.total_tokens - component_total)
+        reduction = min(reducible, remaining)
+        if reduction:
+            event.usage.total_tokens -= reduction
+            remaining -= reduction
+        if remaining == 0:
+            break
+
+
 @dataclass(slots=True)
 class TokenUsage:
     """Normalized token counts for one call or an entire session.
 
-    ``input_tokens`` is the total input count.  ``cached_input_tokens`` is the
-    cache-read portion and ``uncached_input_tokens`` is derived from the two.
-    ``cache_read_tokens`` and ``cache_write_tokens`` retain provider-specific
-    cache accounting (not every provider reports cache writes).
+    ``input_tokens`` contains regular plus cache-read input. Cache writes remain
+    separate in ``cache_write_tokens`` so their billing can be modeled by TTL;
+    ``total_input`` combines both categories. ``cached_input_tokens`` is the
+    cache-read portion and ``uncached_input_tokens`` is derived from regular and
+    cache-read input. Not every provider reports cache writes.
     """
 
     input_tokens: int = 0
@@ -88,20 +121,33 @@ class TokenUsage:
     total_tokens: int = 0
     cache_read_tokens: int | None = None
     cache_write_tokens: int = 0
+    cache_write_5m_tokens: int = 0
+    cache_write_1h_tokens: int = 0
+    # Provider/session records may carry an authoritative nonzero total that
+    # differs from the sum of their component fields. Direct contract
+    # construction derives the component total; legacy ingestion opts into
+    # preserving the provider value.
+    preserve_total: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.input_tokens = _non_negative_int(self.input_tokens)
         self.cached_input_tokens = min(self.input_tokens, _non_negative_int(self.cached_input_tokens))
         self.output_tokens = _non_negative_int(self.output_tokens)
         self.reasoning_output_tokens = _non_negative_int(self.reasoning_output_tokens)
+        self.cache_write_5m_tokens = _non_negative_int(self.cache_write_5m_tokens)
+        self.cache_write_1h_tokens = _non_negative_int(self.cache_write_1h_tokens)
+        component_cache_writes = self.cache_write_5m_tokens + self.cache_write_1h_tokens
         self.cache_write_tokens = _non_negative_int(self.cache_write_tokens)
+        if self.cache_write_tokens == 0 and component_cache_writes:
+            self.cache_write_tokens = component_cache_writes
         self.cache_read_tokens = (
             self.cached_input_tokens if self.cache_read_tokens is None
             else min(self.input_tokens, _non_negative_int(self.cache_read_tokens))
         )
         self.total_tokens = _non_negative_int(self.total_tokens)
-        if self.total_tokens == 0:
-            self.total_tokens = self.input_tokens + self.output_tokens
+        component_total = self.total_input + self.output_tokens
+        if self.total_tokens == 0 or (not self.preserve_total and self.total_tokens < component_total):
+            self.total_tokens = component_total
 
     @property
     def uncached_input_tokens(self) -> int:
@@ -114,7 +160,8 @@ class TokenUsage:
 
     @property
     def total_input(self) -> int:
-        return self.input_tokens
+        """Return regular, cache-read, and cache-write input tokens."""
+        return self.input_tokens + self.cache_write_tokens
 
     @property
     def cached_input(self) -> int:
@@ -129,21 +176,58 @@ class TokenUsage:
         return self.reasoning_output_tokens
 
     @classmethod
-    def from_legacy_dict(cls, value: Mapping[str, Any] | None) -> "TokenUsage":
+    def from_legacy_dict(
+        cls,
+        value: Mapping[str, Any] | None,
+        *,
+        preserve_total: bool = False,
+    ) -> "TokenUsage":
         value = value or {}
-        input_tokens = value.get("input_tokens", value.get("total_input", 0))
         cached = value.get("cached_input_tokens", value.get("cached_input", value.get("cache_read_tokens", 0)))
+        cache_write = value.get(
+            "cache_write_tokens",
+            value.get(
+                "cache_write",
+                value.get("cache_creation_tokens", value.get("cache_write_input_tokens", 0)),
+            ),
+        )
+        cache_write_5m = value.get(
+            "cache_write_5m_tokens",
+            value.get("cache_write_5m", value.get("ephemeral_5m_input_tokens", 0)),
+        )
+        cache_write_1h = value.get(
+            "cache_write_1h_tokens",
+            value.get("cache_write_1h", value.get("ephemeral_1h_input_tokens", 0)),
+        )
+        cache_write_total = max(0, _non_negative_int(cache_write))
+        if not cache_write_total:
+            cache_write_total = _non_negative_int(cache_write_5m) + _non_negative_int(cache_write_1h)
+        if "input_tokens" in value:
+            input_tokens = value.get("input_tokens", 0)
+        elif "uncached_input" in value or "uncached_input_tokens" in value:
+            input_tokens = (
+                value.get("uncached_input", value.get("uncached_input_tokens", 0))
+                + cached
+            )
+        else:
+            # Legacy ``total_input`` includes cache writes in the corrected
+            # contract, while ``input_tokens`` remains regular + cache-read.
+            input_tokens = max(0, value.get("total_input", 0) - cache_write_total)
         output = value.get("output_tokens", value.get("output", 0))
         reasoning = value.get("reasoning_output_tokens", value.get("reasoning_output", 0))
-        return cls(
+        usage = cls(
             input_tokens=input_tokens,
             cached_input_tokens=cached,
             output_tokens=output,
             reasoning_output_tokens=reasoning,
             total_tokens=value.get("total_tokens", 0),
             cache_read_tokens=value.get("cache_read_tokens"),
-            cache_write_tokens=value.get("cache_write_tokens", value.get("cache_creation_tokens", 0)),
+            cache_write_tokens=cache_write_total,
+            cache_write_5m_tokens=cache_write_5m,
+            cache_write_1h_tokens=cache_write_1h,
+            preserve_total=preserve_total,
         )
+        return usage
 
     def to_legacy_dict(self) -> dict[str, int]:
         return {
@@ -155,6 +239,8 @@ class TokenUsage:
             "total_tokens": self.total_tokens,
             "cache_read_tokens": self.cache_read_tokens or 0,
             "cache_write_tokens": self.cache_write_tokens,
+            "cache_write_5m_tokens": self.cache_write_5m_tokens,
+            "cache_write_1h_tokens": self.cache_write_1h_tokens,
         }
 
     as_dict = to_legacy_dict
@@ -242,7 +328,7 @@ class UsageEvent:
     def __post_init__(self) -> None:
         self.timestamp = _timestamp(self.timestamp)
         if not isinstance(self.usage, TokenUsage):
-            self.usage = TokenUsage.from_legacy_dict(self.usage)  # type: ignore[arg-type]
+            self.usage = TokenUsage.from_legacy_dict(self.usage, preserve_total=True)  # type: ignore[arg-type]
         if self.cost is not None and not isinstance(self.cost, CostEstimate):
             self.cost = CostEstimate.from_legacy_dict(self.cost)  # type: ignore[arg-type]
         self.model = str(self.model).strip() if self.model is not None and str(self.model).strip() else None
@@ -262,7 +348,7 @@ class UsageEvent:
     def from_legacy_dict(cls, value: Mapping[str, Any]) -> "UsageEvent":
         return cls(
             timestamp=value.get("timestamp", value.get("created_at", value.get("start_time"))),
-            usage=TokenUsage.from_legacy_dict(value),
+            usage=TokenUsage.from_legacy_dict(value, preserve_total=True),
             model=value.get("model"),
             cost=CostEstimate.from_legacy_dict(value) if any(key in value for key in ("cost_cached_usd", "cost_uncached_usd", "savings_usd", "reported_cost_usd")) else None,
             event_id=value.get("event_id", value.get("id")),
@@ -319,7 +405,7 @@ class UsageSession:
         self.activity_at = _timestamp(self.activity_at)
         self.reasoning_effort = str(self.reasoning_effort) if self.reasoning_effort is not None else None
         if not isinstance(self.usage, TokenUsage):
-            self.usage = TokenUsage.from_legacy_dict(self.usage)  # type: ignore[arg-type]
+            self.usage = TokenUsage.from_legacy_dict(self.usage, preserve_total=True)  # type: ignore[arg-type]
         self.events = [
             event if isinstance(event, UsageEvent) else UsageEvent.from_legacy_dict(event)
             for event in (self.events or [])
@@ -341,20 +427,51 @@ class UsageSession:
                     total_tokens=sum(event.usage.total_tokens for event in self.events),
                     cache_read_tokens=sum(event.usage.cache_read_tokens or 0 for event in self.events),
                     cache_write_tokens=sum(event.usage.cache_write_tokens for event in self.events),
+                    cache_write_5m_tokens=sum(event.usage.cache_write_5m_tokens for event in self.events),
+                    cache_write_1h_tokens=sum(event.usage.cache_write_1h_tokens for event in self.events),
+                    preserve_total=True,
                 )
+                self.usage.total_tokens = sum(event.usage.total_tokens for event in self.events)
+            else:
+                event_cache_write = sum(event.usage.cache_write_tokens for event in self.events)
+                if event_cache_write > self.usage.cache_write_tokens:
+                    missing_cache_write = event_cache_write - self.usage.cache_write_tokens
+                    self.usage = TokenUsage(
+                        input_tokens=self.usage.input_tokens,
+                        cached_input_tokens=self.usage.cached_input_tokens,
+                        output_tokens=self.usage.output_tokens,
+                        reasoning_output_tokens=self.usage.reasoning_output_tokens,
+                        total_tokens=self.usage.total_tokens + missing_cache_write,
+                        cache_read_tokens=self.usage.cache_read_tokens,
+                        cache_write_tokens=event_cache_write,
+                        cache_write_5m_tokens=sum(event.usage.cache_write_5m_tokens for event in self.events),
+                        cache_write_1h_tokens=sum(event.usage.cache_write_1h_tokens for event in self.events),
+                        preserve_total=True,
+                    )
+            # Preserve the provider/session-level total while reconciling the
+            # per-event totals used by the time-window charts.
+            _reconcile_event_totals(self.events, self.usage.total_tokens)
             if self.cost is None and any(event.cost is not None for event in self.events):
                 event_costs = [event.cost for event in self.events if event.cost is not None]
-                self.cost = CostEstimate(
-                    cached_usd=sum((cost.cached_usd for cost in event_costs), Decimal("0")),
-                    uncached_usd=sum((cost.uncached_usd for cost in event_costs), Decimal("0")),
-                    savings_usd=sum((cost.savings_usd for cost in event_costs), Decimal("0")),
-                    reported_usd=(
-                        sum((cost.reported_usd for cost in event_costs if cost.reported_usd is not None), Decimal("0"))
-                        if any(cost.reported_usd is not None for cost in event_costs) else None
-                    ),
-                    currency=event_costs[0].currency,
-                    source="reported" if any(cost.reported_usd is not None for cost in event_costs) else "estimated",
-                )
+                if len(event_costs) == len(self.events):
+                    all_reported = all(cost.reported_usd is not None for cost in event_costs)
+                    has_reported = any(cost.reported_usd is not None for cost in event_costs)
+                    actual_total = sum((cost.total_usd for cost in event_costs), Decimal("0"))
+                    self.cost = CostEstimate(
+                        cached_usd=actual_total,
+                        uncached_usd=sum((cost.uncached_usd for cost in event_costs), Decimal("0")),
+                        savings_usd=sum((cost.savings_usd for cost in event_costs), Decimal("0")),
+                        reported_usd=(
+                            sum((cost.reported_usd for cost in event_costs if cost.reported_usd is not None), Decimal("0"))
+                            if all_reported else None
+                        ),
+                        currency=event_costs[0].currency,
+                        source=(
+                            "reported" if all_reported
+                            else "mixed" if has_reported
+                            else "estimated"
+                        ),
+                    )
         if self.cost is not None and not isinstance(self.cost, CostEstimate):
             self.cost = CostEstimate.from_legacy_dict(self.cost)  # type: ignore[arg-type]
         self.metadata = dict(self.metadata or {})
@@ -395,7 +512,7 @@ class UsageSession:
             end_time=value.get("end_time"),
             activity_at=value.get("activity_at"),
             reasoning_effort=value.get("reasoning_effort"),
-            usage=TokenUsage.from_legacy_dict(value),
+            usage=TokenUsage.from_legacy_dict(value, preserve_total=True),
             events=[UsageEvent.from_legacy_dict(event) for event in raw_events if isinstance(event, Mapping)],
             cost=CostEstimate.from_legacy_dict(value) if any(key in value for key in ("cost_cached_usd", "cost_uncached_usd", "savings_usd", "reported_cost_usd")) else None,
             metadata=value.get("metadata", {}),
@@ -416,7 +533,10 @@ class UsageSession:
             "call_count": self.call_count,
             "uncached_input": self.usage.uncached_input_tokens,
             "cached_input": self.usage.cached_input_tokens,
-            "total_input": self.usage.input_tokens,
+            "total_input": self.usage.total_input,
+            "cache_write": self.usage.cache_write_tokens,
+            "cache_write_5m": self.usage.cache_write_5m_tokens,
+            "cache_write_1h": self.usage.cache_write_1h_tokens,
             "output": self.usage.output_tokens,
             "reasoning_output": self.usage.reasoning_output_tokens,
             "total_tokens": self.usage.total_tokens,

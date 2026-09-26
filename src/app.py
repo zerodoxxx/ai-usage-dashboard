@@ -95,11 +95,11 @@ def api_usage(
     ),
     start: str | None = Query(
         default=None,
-        description="Inclusive custom-range start date (YYYY-MM-DD, UTC). Required when time_range=custom.",
+        description="Inclusive custom-range start date (YYYY-MM-DD, dashboard local time). Required when time_range=custom.",
     ),
     end: str | None = Query(
         default=None,
-        description="Inclusive custom-range end date (YYYY-MM-DD, UTC). Optional; defaults to the current instant when omitted.",
+        description="Inclusive custom-range end date (YYYY-MM-DD, dashboard local time). Optional; defaults to the current instant when omitted.",
     ),
 ) -> dict[str, Any]:
     """Return real-time usage metrics, summaries, model breakdowns, timelines, and sessions."""

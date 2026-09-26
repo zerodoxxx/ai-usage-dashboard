@@ -27,6 +27,32 @@ class ProviderContractTests(unittest.TestCase):
         self.assertEqual(restored.usage.total_tokens, 110)
         self.assertEqual(restored.events[0].timestamp, datetime(2026, 9, 8, 0, 1, tzinfo=timezone.utc))
 
+    def test_cache_writes_are_included_in_total_input_and_tokens(self) -> None:
+        usage = TokenUsage(
+            input_tokens=100,
+            output_tokens=10,
+            total_tokens=110,
+            cache_write_tokens=50,
+        )
+
+        self.assertEqual(usage.total_input, 150)
+        self.assertEqual(usage.total_tokens, 160)
+
+    def test_session_total_reconciles_corrected_event_totals(self) -> None:
+        session = UsageSession(
+            id="s2",
+            tool="codex",
+            usage=TokenUsage(input_tokens=100, output_tokens=10, total_tokens=110),
+            events=[UsageEvent(usage={
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "total_tokens": 100,
+            })],
+        )
+
+        self.assertEqual(session.events[0].usage.total_tokens, 110)
+        self.assertEqual(session.usage.total_tokens, 110)
+
     def test_registry_normalizes_and_rejects_duplicates(self) -> None:
         registry = SourceRegistry()
         source = DummySource()

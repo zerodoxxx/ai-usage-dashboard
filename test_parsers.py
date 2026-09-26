@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Verification test suite for AI Usage Dashboard parsers and pricing."""
 
+# ruff: noqa: E402
+
 from __future__ import annotations
 
 import json
@@ -17,7 +19,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.pricing import MODEL_PRICING, calculate_cost, get_pricing, get_pricing_strict
 from src.parsers.codex import _parse_rollout_file, parse_codex_usage
 from src.parsers.agy import parse_agy_usage
-from src.parsers.claude import parse_claude_code_usage
 from src.parsers.aggregator import (
     _filter_usage_data,
     _parse_custom_range,
@@ -151,7 +152,7 @@ def test_pricing() -> None:
     print("✓ Strict resolution verified for gpt-6-sol and gpt-6-luna.")
 
 
-def test_codex() -> dict:
+def test_codex() -> None:
     print("\n--- 2. Testing Codex Parser ---")
     data = parse_codex_usage()
     assert data["tool"] == "codex", f"Expected tool 'codex', got {data['tool']}"
@@ -165,7 +166,6 @@ def test_codex() -> dict:
     print(f"✓ Codex Models Found:   {len(data['models'])}")
     for m in data["models"][:3]:
         print(f"    - {m['model']}: {m['total_tokens']:,} tokens, ${m['est_cost_cached_usd']:.4f}")
-    return data
 
 
 def test_codex_event_deduplication() -> None:
@@ -224,7 +224,7 @@ def test_codex_event_deduplication() -> None:
     print("✓ Duplicate token record/status messages are counted once per API call.")
 
 
-def test_agy() -> dict:
+def test_agy() -> None:
     print("\n--- 3. Testing Antigravity (AGY) Parser ---")
     data = parse_agy_usage()
     assert data["tool"] == "antigravity", f"Expected tool 'antigravity', got {data['tool']}"
@@ -238,13 +238,12 @@ def test_agy() -> dict:
     print(f"✓ AGY Models Found:   {len(data['models'])}")
     for m in data["models"]:
         print(f"    - {m['model']}: {m['total_tokens']:,} tokens, ${m['est_cost_cached_usd']:.4f}")
-    return data
 
 
 def test_aggregator() -> None:
     print("\n--- 4. Testing Aggregator (All Tools) ---")
-    codex_data = parse_codex_usage()
-    agy_data = parse_agy_usage()
+    codex_data = get_tool_usage("codex")
+    agy_data = get_tool_usage("agy")
     claude_data = get_tool_usage("claude")
     all_data = get_tool_usage("all")
     assert all_data["tool"] == "all"
@@ -252,18 +251,7 @@ def test_aggregator() -> None:
 
     c_sum = codex_data["summary"]
     a_sum = agy_data["summary"]
-
-    # Verify odometer math (re-sync if live telemetry write occurred during test)
     cl_sum = claude_data["summary"]
-    if s["total_tokens"] != c_sum["total_tokens"] + a_sum["total_tokens"] + cl_sum["total_tokens"]:
-        codex_data = parse_codex_usage()
-        agy_data = parse_agy_usage()
-        claude_data = get_tool_usage("claude")
-        c_sum = codex_data["summary"]
-        a_sum = agy_data["summary"]
-        cl_sum = claude_data["summary"]
-        all_data = get_tool_usage("all")
-        s = all_data["summary"]
 
     assert s["total_tokens"] == c_sum["total_tokens"] + a_sum["total_tokens"] + cl_sum["total_tokens"]
     assert s["session_count"] == c_sum["session_count"] + a_sum["session_count"] + cl_sum["session_count"]
@@ -327,11 +315,12 @@ def test_time_filters() -> None:
         ],
     }
 
-    expected_tokens = {"month": 300, "30d": 700, "7d": 100, "24h": 100}
+    expected_tokens = {"month": 700, "30d": 700, "7d": 100, "24h": 100}
+    expected_sessions = {"month": 3, "30d": 3, "7d": 1, "24h": 1}
     for time_range, expected in expected_tokens.items():
         result = _filter_usage_data(data, time_range, now=now)
         assert result["summary"]["total_tokens"] == expected, (time_range, result["summary"])
-        assert result["summary"]["session_count"] == (2 if time_range == "month" else 1 if time_range in ("7d", "24h") else 3)
+        assert result["summary"]["session_count"] == expected_sessions[time_range]
         assert result["time_range"] == time_range
 
     seven = _filter_usage_data(data, "7d", now=now)
@@ -348,10 +337,11 @@ def test_time_filters() -> None:
     assert day["analytics"]["projected_30d_usd"] == _projected_30d_cost(0.1, 1.0)
 
     month = _filter_usage_data(data, "month", now=now)
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    month_days = max((now - month_start).total_seconds() / 86400.0, 1.0)
+    local_now = now.astimezone(_local_tz())
+    month_start = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_days = max((local_now - month_start).total_seconds() / 86400.0, 1.0)
     assert month["analytics"]["projection_basis"] == "current_month_run_rate"
-    assert month["analytics"]["projected_30d_usd"] == _projected_30d_cost(0.2, month_days)
+    assert month["analytics"]["projected_30d_usd"] == _projected_30d_cost(0.3, month_days)
 
     all_time = _filter_usage_data(data, "all", now=now)
     all_days = max(
@@ -415,7 +405,9 @@ def test_time_filters() -> None:
     rolling_result = _filter_usage_data(event_data, "7d", now=now)
     assert rolling_result["summary"]["total_tokens"] == 220
     assert rolling_result["summary"]["call_count"] == 1
-    assert rolling_result["sessions"][0]["activity_at"] == "2026-09-08T12:00:00+00:00"
+    assert rolling_result["sessions"][0]["activity_at"] == datetime.fromisoformat(
+        "2026-09-08T12:00:00+00:00"
+    ).astimezone(_local_tz()).isoformat()
     assert "usage_events" not in rolling_result["sessions"][0]
     assert _nonzero_timeline(rolling_result["timeline"]) == [
         (_local_date("2026-09-08T12:00:00+00:00"), 220, 1)
@@ -504,15 +496,16 @@ def test_custom_time_range() -> None:
     print("\n--- 7. Testing Custom Date Range Filtering & Validation ---")
 
     # 1. Test _parse_custom_range directly
-    # Valid date formats: returns UTC datetimes from 00:00:00 to 23:59:59.999999
+    # Valid date formats use the dashboard's DST-aware local calendar day.
+    dashboard_tz = _local_tz()
     start_dt, end_dt = _parse_custom_range("2026-09-01", "2026-09-08")
-    assert start_dt == datetime(2026, 9, 1, 0, 0, 0, 0, tzinfo=timezone.utc)
-    assert end_dt == datetime(2026, 9, 8, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    assert start_dt == datetime(2026, 9, 1, 0, 0, 0, 0, tzinfo=dashboard_tz)
+    assert end_dt == datetime(2026, 9, 8, 23, 59, 59, 999999, tzinfo=dashboard_tz)
 
     # Single-day range works
     s_dt, e_dt = _parse_custom_range("2026-09-05", "2026-09-05")
-    assert s_dt == datetime(2026, 9, 5, 0, 0, 0, 0, tzinfo=timezone.utc)
-    assert e_dt == datetime(2026, 9, 5, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    assert s_dt == datetime(2026, 9, 5, 0, 0, 0, 0, tzinfo=dashboard_tz)
+    assert e_dt == datetime(2026, 9, 5, 23, 59, 59, 999999, tzinfo=dashboard_tz)
 
     # Invalid range: start > end raises ValueError
     try:
@@ -548,7 +541,7 @@ def test_custom_time_range() -> None:
         except ValueError as exc:
             assert "Invalid custom end date" in str(exc)
 
-    print("✓ _parse_custom_range validated (UTC bounds, single-day, invalid bounds/formats).")
+    print("✓ _parse_custom_range validated (local-day bounds, single-day, invalid bounds/formats).")
 
     # 2. Test _filter_usage_data with time_range="custom"
     def make_session(identifier: str, created_at: str, tokens: int) -> dict:
@@ -624,7 +617,9 @@ def test_custom_time_range() -> None:
 
 
 def _local_tz():
-    return datetime.now().astimezone().tzinfo
+    from src.timezones import local_timezone
+
+    return local_timezone()
 
 
 def _local_date(iso_utc: str) -> str:

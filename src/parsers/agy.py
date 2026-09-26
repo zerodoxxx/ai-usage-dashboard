@@ -187,6 +187,7 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
             "uncached_input": 0,
             "cached_input": 0,
             "total_input": 0,
+            "cache_write": 0,
             "output": 0,
             "reasoning_output": 0,
             "cost_cached_usd": 0.0,
@@ -234,7 +235,6 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
             cursor.execute("SELECT * FROM sessions")
             for row in cursor.fetchall():
                 sid = row["session_id"]
-                db_session_ids.add(sid)
                 ev_cursor = conn.execute("SELECT * FROM token_events WHERE session_id = ? ORDER BY step_index", (sid,))
                 events = []
                 for ev in ev_cursor.fetchall():
@@ -244,28 +244,51 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                         "input_tokens": ev["input_tokens"],
                         "cached_input_tokens": ev["cached_input_tokens"],
                         "output_tokens": ev["output_tokens"],
-                        "cache_write_tokens": ev["cache_write_tokens"],
+                        # AGY's local database counts cache writes inside
+                        # input_tokens (input == cached + write), unlike
+                        # Anthropic-style additive cache-creation input.
+                        # Preserve the source value for diagnostics, but do
+                        # not expose it as an additional billable component.
+                        "cache_write_tokens": 0,
+                        "source_cache_write_tokens": ev["cache_write_tokens"],
                         "reasoning_output_tokens": ev["reasoning_output_tokens"],
                         "total_tokens": ev["total_tokens"],
                         "cost_usd": ev["cost_usd"],
                     })
-                inp = int(row["input_tokens"] or 0)
+                base_input = int(row["input_tokens"] or 0)
                 cached = int(row["cached_input_tokens"] or 0)
-                uncached = max(0, inp - cached)
+                # In the AGY local estimator, cache-write tokens are already
+                # part of input_tokens and total_tokens. They are not additive
+                # cache-creation input and must not be charged/totaled twice.
+                cache_write = 0
+                inp = base_input
+                uncached = max(0, base_input - cached)
                 out = int(row["output_tokens"] or 0)
                 tot = int(row["total_tokens"] or 0)
                 cost = float(row["cost_usd"] or 0.0)
-                hit_rate = round((cached / inp * 100.0), 2) if inp > 0 else 0.0
+                cacheable_input = max(0, base_input)
+                hit_rate = round((cached / cacheable_input * 100.0), 2) if cacheable_input > 0 else 0.0
+                if tot <= 0 and not any(
+                    int(event.get(field) or 0)
+                    for event in events
+                    for field in ("input_tokens", "cached_input_tokens", "output_tokens", "cache_write_tokens")
+                ):
+                    continue
+                db_session_ids.add(sid)
+                observed_calls = int(row["call_count"] or 0)
+                call_count = max(observed_calls, len(events), 1 if tot > 0 else 0)
 
                 db_sessions[sid] = {
                     "id": sid,
                     "title": row["title"] or f"AGY Session {sid[:8]}",
                     "tool": "antigravity",
                     "model": row["model"],
-                    "call_count": int(row["call_count"] or 1),
+                    "call_count": call_count,
                     "uncached_input": uncached,
                     "cached_input": cached,
                     "total_input": inp,
+                    "cache_write": cache_write,
+                    "cache_write_tokens": cache_write,
                     "output": out,
                     "reasoning_output": int(row["reasoning_output_tokens"] or 0),
                     "total_tokens": tot,
@@ -478,6 +501,11 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                 logger.warning("Error reading transcript for %s: %s", t_path, e)
                 continue
 
+            # User input without a model response is not billable API usage.
+            # Do not turn context characters or an implied step into tokens/calls.
+            if call_count == 0:
+                continue
+
             input_tokens = input_chars // 4
             cached_input = int(input_tokens * _AGY_CACHE_HIT_RATE_MULTI_TURN) if call_count > 1 else 0
             uncached_input = max(0, input_tokens - cached_input)
@@ -563,60 +591,10 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                 "usage_events": usage_events,
             })
         else:
-            steps = 0
-            if session_id in summaries:
-                steps = summaries[session_id].get("step_count") or 0
-            if not steps and session_id in conv_db_sessions:
-                steps = conv_db_sessions[session_id].get("step_count") or 0
-            steps = max(1, steps)
-
-            input_tokens = steps * 600
-            output_tokens = steps * 200
-            reasoning_output_tokens = int(output_tokens * 0.2)
-            call_count = steps
-            cached_input = int(input_tokens * _AGY_CACHE_HIT_RATE_MULTI_TURN) if call_count > 1 else 0
-            uncached_input = max(0, input_tokens - cached_input)
-            total_tokens = input_tokens + output_tokens
-
-            title = summaries.get(session_id, {}).get("title") or f"AGY Session {session_id[:8]}"
-            last_modified = summaries.get(session_id, {}).get("last_modified_time")
-            if not last_modified and session_id in conv_db_sessions:
-                last_modified = conv_db_sessions[session_id].get("mtime")
-            created_at_iso = _to_iso_string(last_modified)
-
-            cost = calculate_cost(configured_model, uncached_input, cached_input, output_tokens)
-            total_input = input_tokens
-            cache_hit_rate = round((cached_input / total_input * 100.0), 2) if total_input > 0 else 0.0
-            usage_events = [{
-                "timestamp": created_at_iso,
-                "input_tokens": input_tokens,
-                "cached_input_tokens": cached_input,
-                "output_tokens": output_tokens,
-                "reasoning_output_tokens": reasoning_output_tokens,
-                "total_tokens": total_tokens,
-            }] if total_tokens > 0 else []
-
-            sessions.append({
-                "id": session_id,
-                "title": title,
-                "tool": "antigravity",
-                "model": configured_model,
-                "call_count": call_count,
-                "uncached_input": uncached_input,
-                "cached_input": cached_input,
-                "total_input": total_input,
-                "output": output_tokens,
-                "reasoning_output": reasoning_output_tokens,
-                "total_tokens": total_tokens,
-                "cache_hit_rate": cache_hit_rate,
-                "cost_cached_usd": cost["cost_cached_usd"],
-                "cost_uncached_usd": cost["cost_uncached_usd"],
-                "savings_usd": cost["savings_usd"],
-                "created_at": created_at_iso,
-                "start_time": str(last_modified or ""),
-                "end_time": str(last_modified or ""),
-                "usage_events": usage_events,
-            })
+            # A summary row without a transcript or token-usage record proves
+            # that a conversation existed, not that an API call consumed tokens.
+            # Keep it out of usage totals rather than fabricating proxy usage.
+            continue
 
     # Reprice each call at its own timestamp so the legacy parser summary
     # agrees with the shared aggregator's time-range-aware totals.
@@ -639,6 +617,7 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                 "uncached_input": 0,
                 "cached_input": 0,
                 "total_input": 0,
+                "cache_write": 0,
                 "output": 0,
                 "reasoning_output": 0,
                 "total_tokens": 0,
@@ -653,6 +632,7 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
         entry["uncached_input"] += s["uncached_input"]
         entry["cached_input"] += s["cached_input"]
         entry["total_input"] += s["total_input"]
+        entry["cache_write"] += s.get("cache_write", 0)
         entry["output"] += s["output"]
         entry["reasoning_output"] += s["reasoning_output"]
         entry["total_tokens"] += s["total_tokens"]
@@ -661,8 +641,8 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
         entry["est_savings_usd"] += s.get("savings_usd", 0.0)
 
     for entry in models_dict.values():
-        tot_in = entry["total_input"]
-        entry["cache_hit_rate"] = round((entry["cached_input"] / tot_in * 100.0), 2) if tot_in > 0 else 0.0
+        cacheable_input = entry["uncached_input"] + entry["cached_input"]
+        entry["cache_hit_rate"] = round((entry["cached_input"] / cacheable_input * 100.0), 2) if cacheable_input > 0 else 0.0
         entry["est_cost_cached_usd"] = round(entry["est_cost_cached_usd"], 6)
         entry["est_cost_uncached_usd"] = round(entry["est_cost_uncached_usd"], 6)
         entry["est_savings_usd"] = round(entry["est_savings_usd"], 6)
@@ -675,6 +655,7 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
         "uncached_input": 0,
         "cached_input": 0,
         "total_input": 0,
+        "cache_write": 0,
         "output": 0,
         "reasoning_output": 0,
         "total_tokens": 0,
@@ -695,6 +676,7 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
         day["uncached_input"] += s["uncached_input"]
         day["cached_input"] += s["cached_input"]
         day["total_input"] += s["total_input"]
+        day["cache_write"] += s.get("cache_write", 0)
         day["output"] += s["output"]
         day["reasoning_output"] += s["reasoning_output"]
         day["total_tokens"] += s["total_tokens"]
@@ -715,20 +697,22 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
     # 6. Summary odometer totals
     tot_uncached = sum(s["uncached_input"] for s in sessions)
     tot_cached = sum(s["cached_input"] for s in sessions)
-    tot_input = tot_uncached + tot_cached
+    tot_cache_write = sum(s.get("cache_write", 0) for s in sessions)
+    tot_input = tot_uncached + tot_cached + tot_cache_write
     tot_output = sum(s["output"] for s in sessions)
     tot_reasoning = sum(s["reasoning_output"] for s in sessions)
     tot_tokens = sum(s["total_tokens"] for s in sessions)
     tot_cost_cached = round(sum(s.get("cost_cached_usd", s.get("cost_usd", 0.0)) for s in sessions), 6)
     tot_cost_uncached = round(sum(s.get("cost_uncached_usd", 0.0) for s in sessions), 6)
     tot_savings = round(sum(s.get("savings_usd", 0.0) for s in sessions), 6)
-    summary_cache_hit_rate = round((tot_cached / tot_input * 100.0), 2) if tot_input > 0 else 0.0
+    summary_cache_hit_rate = round((tot_cached / (tot_uncached + tot_cached) * 100.0), 2) if tot_uncached + tot_cached > 0 else 0.0
 
     summary = {
         "total_tokens": tot_tokens,
         "uncached_input": tot_uncached,
         "cached_input": tot_cached,
         "total_input": tot_input,
+        "cache_write": tot_cache_write,
         "output": tot_output,
         "reasoning_output": tot_reasoning,
         "cost_cached_usd": tot_cost_cached,

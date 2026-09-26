@@ -50,7 +50,7 @@ AGY stores conversation state differently. It uses:
 - **Conversation summaries DB** (`conversation_summaries.db`) — session titles, step counts, timestamps
 - **Brain transcripts** (`brain/<session-uuid>/.system_generated/logs/transcript.jsonl`) — step-by-step text records
 
-Because AGY doesn't store raw token counts locally (quota is tracked server-side by Google), **token counts are estimated** using a standard heuristic:
+Because transcript-based AGY sessions don't store raw token counts locally (quota is tracked server-side by Google), **their token counts are estimated** using a standard heuristic. When the optional `token_usage.db` is present, its exact local token records are marked reported instead:
 
 ```
 input_tokens  ≈ total_input_chars  // 4
@@ -59,7 +59,7 @@ output_tokens ≈ (output_chars + thinking_chars) // 4
 
 For multi-turn sessions (where prompt caching is very effective), a **45% cache hit rate** is assumed for input tokens. This is a conservative estimate based on typical coding session patterns. Single-turn sessions assume **0% cache** (no prior context to reuse). Both rules live in `src/parsers/agy.py` as `_AGY_CACHE_HIT_RATE_MULTI_TURN` with a rationale comment.
 
-Unlike Codex/Claude — which report exact per-call API counts — every AGY session and model row is marked estimated in the API (`estimated: true`, `token_source: "estimated"`, alongside the existing cost provenance `cost_source`/`pricing_status`). The dashboard renders these rows with a `~` prefix and an `est.` badge (hover for the heuristic), plus a footnote under the per-model table.
+Unlike Codex/Claude — which report exact per-call API counts — transcript-based AGY sessions are marked estimated in the API (`estimated: true`, `token_source: "estimated"`); `token_usage.db` sessions carry explicit reported provenance. A model containing both sources is marked `mixed`. The dashboard renders approximate rows with a `~` prefix and a provenance badge, plus a footnote under the per-model table.
 
 ### 3. Claude Code (`~/.claude/`)
 
@@ -114,7 +114,9 @@ This means after the first load, polling responses are nearly instant.
 
 Each parsed session retains internal per-call usage events. Codex events come from incremental token usage records. AGY transcripts do not expose token counts directly, so the parser estimates the session total and allocates it across model-response events according to their character weights. The API strips these internal records from its response, but the aggregator uses them when applying `month`, `30d`, `7d`, and `24h` windows.
 
-That means a long-running conversation is counted by the calls that actually occurred in the selected window, even when the session itself was created much earlier. Older or incomplete records fall back to the best session-level timestamp available.
+Segments sharing the same tool and session ID are merged before aggregation, and model totals are built from each event's model rather than a single session-level label. A session that genuinely used multiple models is exposed as `mixed`. Metadata-only AGY conversations and user-only transcripts do not create synthetic API calls, tokens, or cost.
+
+That means a long-running conversation is counted by the calls that actually occurred in the selected window, even when the session itself was created much earlier. Older or incomplete records fall back to the best session-level timestamp available. Preset ranges use exact instants, while calendar-month and custom-date boundaries use the dashboard's DST-aware local timezone. Set `AI_USAGE_TIMEZONE` to an IANA zone such as `America/New_York` to override the system timezone.
 
 ---
 
@@ -142,22 +144,23 @@ are supported for tests or explicitly switching the active storage snapshot,
 and the payload always reactivates the matching rates before returning its
 metadata.
 
-**Cost formula (cached):**
+**Cost formula (with caching):**
 ```
 cost = (uncached_input × uncached_rate
       + cached_input  × cached_rate
-      + output        × output_rate) / 1,000,000
+      + output        × output_rate
+      + cache_writes  × applicable_write_rate) / 1,000,000
 ```
 
 **Cost formula (without caching):**
 ```
-cost = ((uncached_input + cached_input) × uncached_rate
+cost = ((uncached_input + cached_input + cache_writes) × uncached_rate
       + output × output_rate) / 1,000,000
 ```
 
 **Net savings = cost_without_caching − cost_with_caching**
 
-This lets you see exactly how much you'd be paying if OpenAI/Google didn't have prompt caching — and how much the cache is saving you.
+Claude 5-minute and 1-hour writes are retained separately and priced at 1.25× and 2× the regular input rate. Expensive writes can therefore produce negative net savings instead of being hidden by a zero clamp. Cache-write tokens are included in `total_input` and `total_tokens`; cache-read percentage uses only regular plus cache-read input as its denominator. AGY's local estimator already includes its source cache-write count in `input_tokens`, so the adapter preserves that source diagnostic without adding the same tokens a second time.
 
 ---
 
@@ -166,10 +169,10 @@ This lets you see exactly how much you'd be paying if OpenAI/Google didn't have 
 1. **On load:** `dashboard.js` calls `GET /api/pricing` (once) then `GET /api/usage?tool=all&time_range=all`. The pricing response retains legacy model keys and adds reserved `__meta__` provenance/freshness data.
 2. **The API response** contains: `summary` (odometer values), `models` (per-model table rows), `timeline` (chart data), `sessions` (recent activity list), and `analytics` (derived insights for the selected window)
 3. **Odometers** (`odometer.js`): Each number is broken into digit characters. CSS 3D `translateY` shifts a vertical strip of 0–9 digits to land on the right number. Digits animate with staggered delays and `cubic-bezier(0.2, 0.9, 0.3, 1)` easing — right-to-left, like a real counter.
-4. **Charts** (Chart.js): Token breakdown (stacked bar) and daily cost + token + API-call trend (multi-axis line + bar)
+4. **Charts** (Chart.js): Token breakdown, daily cost/token/call trend, cost by tool, blended cost per 1M tokens, cache-efficiency trend, hourly activity, and a weekday/hour heatmap
 5. **Auto-refresh:** A configurable `setInterval` (10s / 30s / 60s) re-calls `GET /api/usage`. Each user-initiated action (tool switch, manual refresh) creates a new `AbortController`, cancelling any in-flight request before starting a fresh one.
-6. **Session search:** Client-side filtering on `state.allSessions` — no additional server calls.
-7. **Time filtering:** The header time selector requests one of `all`, `month`, `30d`, `7d`, or `24h`. The server slices per-call events where available, then rebuilds the summary, model, timeline, session, and analytics results together.
+6. **Session search and export:** Client-side filtering on `state.allSessions` — no additional server calls. The CSV export applies the same search filter and selected range.
+7. **Time filtering:** The header time selector requests one of `all`, `month`, `30d`, `7d`, `24h`, or `custom`. The server slices per-call events where available, then rebuilds the summary, model, timeline, session, and analytics results together.
 
 ---
 
@@ -187,7 +190,12 @@ This lets you see exactly how much you'd be paying if OpenAI/Google didn't have 
 | `src/parsers/claude.py` | Reads Claude Code session JSONL and normalizes API usage |
 | `src/parsers/aggregator.py` | Runs registered adapters, prices normalized sessions, slices time windows, and derives analytics |
 | `src/static/js/odometer.js` | `RollingOdometer` class — zero-dependency vertical digit animation |
-| `src/static/js/dashboard.js` | All frontend logic: state, polling, Chart.js, table rendering, search |
+| `src/static/js/utils.js` | Shared formatting, provenance, escaping, and toast helpers |
+| `src/static/js/api.js` | Usage/pricing requests, cancellation, and cache-busting |
+| `src/static/js/dashboard.js` | Frontend orchestrator: state, polling, filters, and CSV export wiring |
+| `src/static/js/charts.js` | Chart.js visualizations and activity heatmap |
+| `src/static/js/tables.js` | Model/session tables, search filtering, and CSV serialization |
+| `src/static/js/analytics.js` | Analytics and period-comparison renderer |
 | `src/static/css/dashboard.css` | Dark-mode styles — frosted glass cards, badge colours, table layout |
 | `src/templates/index.html` | Static HTML scaffold — odometer containers, chart canvases, tables |
 | `test_parsers.py` | Tests pricing engine + both parsers against live local data |

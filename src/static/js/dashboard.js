@@ -16,6 +16,7 @@
     currentTimeRange: 'all',
     customStart: '',
     customEnd: '',
+    customPending: false,
     autoRefreshInterval: 30000,
     refreshTimer: null,
     pricingData: null,
@@ -101,6 +102,13 @@
    * @param {boolean} [isUserInitiated=false]
    */
   async function fetchUsageData(isUserInitiated = false) {
+    if (state.customPending) {
+      if (isUserInitiated) {
+        window.DashboardUtils.showToast('Apply a custom date range before refreshing.', 'info');
+      }
+      return;
+    }
+
     const refreshIcon = elements.refreshBtn ? elements.refreshBtn.querySelector('.refresh-icon') : null;
     if (refreshIcon) refreshIcon.classList.add('spin');
 
@@ -120,10 +128,17 @@
       const data = result.data;
       state.currentUsageData = data;
       state.allSessions = Array.isArray(data.sessions) ? data.sessions : [];
+      if (elements.exportSessionsBtn) {
+        elements.exportSessionsBtn.disabled = state.customPending || state.allSessions.length === 0;
+      }
 
       // Update UI components
       updateMetricCards(data.summary || {}, data.analytics || {});
       const isCustom = state.currentTimeRange === 'custom' && state.customStart;
+      const rangeLabel = isCustom
+        ? `${state.customStart} → ${state.customEnd || 'Up to now'}`
+        : elements.timeRangeSelect?.selectedOptions?.[0]?.textContent;
+      const timezoneSuffix = data.timezone ? ` · ${data.timezone}` : '';
       window.DashboardAnalytics.updateAnalytics(data.analytics || {}, data.summary || {}, {
         analyticsWindowBadge: elements.analyticsWindowBadge,
         analyticsCallCount: elements.analyticsCallCount,
@@ -137,9 +152,8 @@
         topSessionsTableBody: elements.topSessionsTableBody,
         comparisonSubtitle: elements.comparisonSubtitle,
         comparisonContent: elements.comparisonContent,
-        selectedRangeLabel: isCustom
-          ? `${state.customStart} → ${state.customEnd || 'Up to now'}`
-          : elements.timeRangeSelect?.selectedOptions?.[0]?.textContent,
+        selectedRangeLabel: `${rangeLabel || 'Selected range'}${timezoneSuffix}`,
+        timezone: data.timezone || '',
       });
       window.DashboardTables.renderModelTable(data.models || [], {
         tbody: elements.modelsTableBody,
@@ -150,6 +164,7 @@
       window.DashboardTables.renderSessionsTable(state.allSessions, state.searchQuery, {
         tbody: elements.sessionsTableBody,
         countBadge: elements.sessionsCountBadge,
+        timezone: data.timezone || '',
       });
       window.DashboardCharts.updateCharts(data, {
         tokensCanvas: elements.chartTokensCanvas,
@@ -165,10 +180,12 @@
         sparklineSessions: elements.sparklineSessions,
       });
 
-      // Update last synced badge
-      const now = new Date();
-      const pad = (n) => String(n).padStart(2, '0');
-      const timeStr = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+      // Update last synced badge in the same timezone used by the API.
+      const synced = window.DashboardUtils.formatDateTime(
+        new Date().toISOString(),
+        data.timezone || '',
+      );
+      const timeStr = synced.includes(' ') ? synced.slice(11) : synced;
       if (elements.lastSyncedBadge) {
         elements.lastSyncedBadge.textContent = `Synced ${timeStr}`;
       }
@@ -193,13 +210,23 @@
     const details = analytics && typeof analytics === 'object' ? analytics : {};
     const { formatCompactNumber } = window.DashboardUtils;
     const totalTokens = Number(totals.total_tokens || 0);
+    const cacheWriteTokens = Number(totals.cache_write || 0);
     const totalCost = Number(totals.cost_cached_usd || 0);
     const uncachedCost = Number(totals.cost_uncached_usd || 0);
     const cacheHitRate = Number(totals.cache_hit_rate || 0);
     const sessionCount = Number(totals.session_count || 0);
     const savings = Number(totals.savings_usd || 0);
     const callCount = Number(totals.call_count || 0);
+    const unpricedCount = Number(totals.unpriced_model_count || 0);
     const burn = Number(details.projected_30d_usd ?? details.monthly_projection_usd ?? 0);
+
+    if (elements.unpricedSummaryBanner) {
+      const hasUnpriced = Number.isFinite(unpricedCount) && unpricedCount > 0;
+      elements.unpricedSummaryBanner.hidden = !hasUnpriced;
+      elements.unpricedSummaryBanner.textContent = hasUnpriced
+        ? `${unpricedCount.toLocaleString()} model${unpricedCount === 1 ? '' : 's'} lack a usable catalog rate. Spend totals are partial; see the Models tab for details.`
+        : '';
+    }
 
     if (odometers.totalCost) odometers.totalCost.update(Number.isFinite(totalCost) ? totalCost : 0);
     if (odometers.burnRate) odometers.burnRate.update(Number.isFinite(burn) ? burn : 0);
@@ -211,13 +238,20 @@
       if (Number.isFinite(uncachedCost) && uncachedCost > 0 && Math.abs(uncachedCost - totalCost) > 0.00005) {
         text += ` · $${totalCost.toFixed(2)} cached vs $${uncachedCost.toFixed(2)} uncached`;
       }
+      if (Number.isFinite(cacheWriteTokens) && cacheWriteTokens > 0) {
+        text += ` · ${formatCompactNumber(cacheWriteTokens)} cache-write`;
+      }
+      if (unpricedCount > 0) text += ' · partial cost';
       elements.cardSpendSubtext.textContent = text;
     }
     if (elements.cardBurnSubtext) {
       const labelFn = window.DashboardAnalytics && window.DashboardAnalytics.projectionBasisLabel;
-      elements.cardBurnSubtext.textContent = labelFn
+      const projectionLabel = labelFn
         ? labelFn(details.projection_basis)
         : 'Filter daily average × 30';
+      elements.cardBurnSubtext.textContent = unpricedCount > 0
+        ? `${projectionLabel} · partial cost`
+        : projectionLabel;
     }
     if (elements.cardSavingsSubtext) {
       const rate = Number.isFinite(cacheHitRate) ? cacheHitRate : 0;
@@ -254,6 +288,14 @@
     if (elements.customRangeApply) elements.customRangeApply.hidden = flag;
   }
 
+  /** Mark the visible custom range as a draft, or clear the draft marker. */
+  function setCustomPending(pending) {
+    state.customPending = Boolean(pending);
+    if (elements.exportSessionsBtn) {
+      elements.exportSessionsBtn.disabled = state.customPending || state.allSessions.length === 0;
+    }
+  }
+
   /** Show that a blank custom end date means the range ends at the current time. */
   function updateCustomEndHint() {
     if (elements.customEndNowLabel && elements.customEndDate) {
@@ -278,6 +320,7 @@
       elements.timeRangeSelect.addEventListener('change', (e) => {
         state.currentTimeRange = e.target.value;
         const isCustom = state.currentTimeRange === 'custom';
+        setCustomPending(isCustom);
         setCustomControlsVisible(isCustom);
         if (isCustom) {
           // Wait for explicit Apply; keep last custom dates in the inputs.
@@ -291,14 +334,18 @@
     // Custom date-range apply
     if (elements.customStartDate) {
       elements.customStartDate.addEventListener('change', () => {
-        // A new start date begins a fresh range ending at the current time.
+        // A new start date begins a fresh draft range ending at now.
+        setCustomPending(true);
         if (elements.customEndDate) elements.customEndDate.value = '';
         updateCustomEndHint();
       });
     }
 
     if (elements.customEndDate) {
-      elements.customEndDate.addEventListener('change', updateCustomEndHint);
+      elements.customEndDate.addEventListener('change', () => {
+        setCustomPending(true);
+        updateCustomEndHint();
+      });
     }
 
     if (elements.customRangeApply) {
@@ -315,6 +362,7 @@
         }
         state.customStart = start;
         state.customEnd = end;
+        setCustomPending(false);
         state.currentTimeRange = 'custom';
         if (elements.timeRangeSelect) elements.timeRangeSelect.value = 'custom';
         fetchUsageData(true).catch((err) => console.error('Error fetching usage data on custom range apply:', err));
@@ -343,6 +391,27 @@
       });
     }
 
+    // Export the active session set (including the active search filter)
+    if (elements.exportSessionsBtn) {
+      elements.exportSessionsBtn.addEventListener('click', () => {
+        const rangePart = state.currentTimeRange === 'custom'
+          ? `${state.customStart || 'start'}_to_${state.customEnd || 'now'}`
+          : state.currentTimeRange;
+        const filename = `ai-usage-${state.currentTool}-${rangePart}.csv`
+          .replace(/[^a-z0-9._-]+/gi, '-');
+        const exported = window.DashboardTables.exportSessionsCsv(
+          state.allSessions,
+          state.searchQuery,
+          filename,
+          state.currentUsageData?.timezone || '',
+        );
+        window.DashboardUtils.showToast(
+          exported > 0 ? `Exported ${exported.toLocaleString()} session${exported === 1 ? '' : 's'}.` : 'No sessions to export.',
+          'info',
+        );
+      });
+    }
+
     // Sessions search input
     if (elements.sessionsSearch) {
       elements.sessionsSearch.addEventListener('input', (e) => {
@@ -350,6 +419,7 @@
         window.DashboardTables.renderSessionsTable(state.allSessions, state.searchQuery, {
           tbody: elements.sessionsTableBody,
           countBadge: elements.sessionsCountBadge,
+          timezone: state.currentUsageData?.timezone || '',
         });
       });
     }
@@ -416,6 +486,7 @@
     elements.autoRefreshToggle = document.getElementById('auto-refresh-toggle');
     elements.refreshInterval = document.getElementById('refresh-interval');
     elements.refreshBtn = document.getElementById('refresh-btn');
+    elements.exportSessionsBtn = document.getElementById('export-sessions-btn');
     elements.lastSyncedBadge = document.getElementById('last-synced-badge');
 
     elements.cardSpendSubtext = document.getElementById('card-spend-subtext');
@@ -448,6 +519,7 @@
     elements.chartHourlyActivityCanvas = document.getElementById('chart-hourly-activity');
     elements.weekdayHeatmap = document.getElementById('weekday-hour-heatmap');
     elements.unpricedBanner = document.getElementById('unpriced-banner');
+    elements.unpricedSummaryBanner = document.getElementById('unpriced-summary-banner');
 
     elements.modelsCountBadge = document.getElementById('models-count-badge');
     elements.pricingStatus = document.getElementById('pricing-status');

@@ -47,9 +47,9 @@
             <option value="24h">Past 24h</option>
             <option value="custom">Custom…</option>
           </select>
-          <input type="date" id="custom-start-date" class="select-control date-input" title="Custom range start (UTC)" aria-label="Custom range start date" hidden>
+          <input type="date" id="custom-start-date" class="select-control date-input" title="Custom range start (dashboard local time)" aria-label="Custom range start date" hidden>
           <span id="custom-end-control" class="custom-end-control" hidden>
-            <input type="date" id="custom-end-date" class="select-control date-input" title="Custom range end (UTC); leave blank to include usage up to now" aria-label="Custom range end date; leave blank to include usage up to now">
+            <input type="date" id="custom-end-date" class="select-control date-input" title="Custom range end (dashboard local time); leave blank to include usage up to now" aria-label="Custom range end date; leave blank to include usage up to now">
             <span id="custom-end-now-label" class="custom-end-now-label">Up to now</span>
           </span>
           <button id="custom-range-apply" class="btn-refresh" title="Apply custom date range" hidden>Apply</button>
@@ -78,6 +78,14 @@
               <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
             </svg>
             Refresh Now
+          </button>
+          <button id="export-sessions-btn" class="btn-refresh" type="button" title="Export the sessions in the selected range as CSV" disabled>
+            <svg class="export-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3v12"></path>
+              <path d="m7 10 5 5 5-5"></path>
+              <path d="M5 21h14"></path>
+            </svg>
+            Export CSV
           </button>
         </div>
 
@@ -166,6 +174,7 @@
           <div id="sparkline-sessions" class="metric-sparkline" aria-hidden="true"></div>
         </div>
       </div>
+      <div id="unpriced-summary-banner" class="unpriced-summary-banner" role="status" aria-live="polite" hidden></div>
     </section>
 
     <!-- Charts Section -->
@@ -240,7 +249,7 @@
             <div class="chart-header">
               <div>
                 <div id="chart-cache-trend-title" class="chart-title">Cache-Efficiency Trend</div>
-                <div id="chart-cache-trend-desc" class="chart-subtitle">Daily prompt-cache hit rate (cached input / total input)</div>
+                <div id="chart-cache-trend-desc" class="chart-subtitle">Daily prompt-cache hit rate (cached input / cacheable input)</div>
               </div>
             </div>
             <div class="chart-canvas-wrap">
@@ -301,7 +310,7 @@
         </div>
 
         <div id="unpriced-banner" class="unpriced-banner" hidden></div>
-        <div class="table-responsive">
+        <div class="table-responsive" role="region" aria-label="Per-model usage table" tabindex="0">
           <table class="data-table">
             <caption class="visually-hidden">Per-model token usage, cache efficiency, rates, and estimated costs</caption>
             <thead>
@@ -335,7 +344,7 @@
             <line x1="12" y1="8" x2="12.01" y2="8"></line>
           </svg>
           <span>Calculation Formula:</span>
-          <code>API Cost = (Uncached Input × Rate + Cached Input × Rate + Output × Rate) / 1,000,000</code>
+          <code>API Cost = (Uncached Input × Rate + Cached Input × Rate + Output × Rate + Cache Writes × Write Rate) / 1,000,000</code>
         </div>
         <div class="table-footnote" id="models-est-footnote" style="display: none;">
           <svg class="footnote-icon footnote-icon-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -360,7 +369,7 @@
           </div>
         </div>
 
-        <div class="table-responsive">
+        <div class="table-responsive" role="region" aria-label="Tracked sessions table" tabindex="0">
           <table class="data-table">
             <caption class="visually-hidden">Tracked sessions with tool, model, token, cache, cost, and timestamp details</caption>
             <thead>
@@ -430,7 +439,7 @@
                 <div class="insight-subtitle">Highest estimated spend in the selected range</div>
               </div>
             </div>
-            <div class="table-responsive insight-table-wrap">
+            <div class="table-responsive insight-table-wrap" role="region" aria-label="Highest-cost sessions table" tabindex="0">
               <table class="data-table insight-table">
                 <caption class="visually-hidden">Highest-cost sessions in the selected range</caption>
                 <thead>

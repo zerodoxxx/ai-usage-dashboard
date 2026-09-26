@@ -5,10 +5,12 @@ from __future__ import annotations
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping, Iterator
 
 from ..pricing import MODEL_PRICING, PRICING_CATALOG, calculate_cost_strict
+from ..timezones import local_timezone, timezone_name
 from .agy import AntigravitySource
 from .claude import ClaudeCodeSource
 from .codex import CodexSource
@@ -39,8 +41,9 @@ def _parse_custom_range(
     start: str | None,
     end: str | None,
     now: datetime | None = None,
+    local_tz=None,
 ) -> tuple[datetime, datetime]:
-    """Parse UTC bounds for a custom range, defaulting a missing end to now."""
+    """Parse local-calendar bounds, defaulting a missing end to now."""
     if not start:
         raise ValueError("Custom time range requires a 'start' query parameter (YYYY-MM-DD).")
     try:
@@ -49,7 +52,8 @@ def _parse_custom_range(
         raise ValueError(
             f"Invalid custom start date: {start!r}. Expected format YYYY-MM-DD."
         )
-    start_dt = start_date.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+    dashboard_tz = local_tz or local_timezone()
+    start_dt = start_date.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=dashboard_tz)
     if end:
         try:
             end_date = datetime.strptime(str(end).strip(), "%Y-%m-%d")
@@ -58,13 +62,13 @@ def _parse_custom_range(
                 f"Invalid custom end date: {end!r}. Expected format YYYY-MM-DD."
             )
         end_dt = end_date.replace(
-            hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
+            hour=23, minute=59, second=59, microsecond=999999, tzinfo=dashboard_tz
         )
     else:
         current = now or datetime.now(timezone.utc)
         if current.tzinfo is None:
             current = current.replace(tzinfo=timezone.utc)
-        end_dt = current.astimezone(timezone.utc)
+        end_dt = current.astimezone(dashboard_tz)
     if start_dt > end_dt:
         if end:
             raise ValueError(
@@ -119,38 +123,36 @@ def _time_range_cutoff(
 ) -> tuple[datetime | None, datetime]:
     """Return the inclusive lower bound and current time for a range.
 
-    Calendar-month boundaries use the machine's local timezone. Relative ranges
-    are measured back from the current instant. Custom ranges use an inclusive
-    UTC start day and either an inclusive end day or the current instant when
-    ``end`` is omitted.
+    Calendar-month and custom-date boundaries use the dashboard's DST-aware
+    local timezone. Relative ranges are measured back from the current instant.
     """
     normalized = _normalize_time_range(time_range)
-    if normalized == "custom":
-        if now is None:
-            current = datetime.now().astimezone()
-        elif now.tzinfo is None:
-            current = now.replace(tzinfo=datetime.now().astimezone().tzinfo)
-        else:
-            current = now
-        custom_start, custom_end = _parse_custom_range(start, end, current)
-        return custom_start, custom_end
+    dashboard_tz = local_timezone()
     if now is None:
-        current = datetime.now().astimezone()
+        current = datetime.now(dashboard_tz)
     elif now.tzinfo is None:
-        current = now.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        current = now.replace(tzinfo=dashboard_tz)
     else:
-        current = now
+        current = now.astimezone(dashboard_tz)
 
+    if normalized == "custom":
+        custom_start, custom_end = _parse_custom_range(
+            start,
+            end,
+            current,
+            local_tz=dashboard_tz,
+        )
+        return custom_start, custom_end
     if normalized == "all":
         return None, current
     if normalized == "month":
         cutoff = current.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     elif normalized == "30d":
-        cutoff = current - timedelta(days=30)
+        cutoff = (current.astimezone(timezone.utc) - timedelta(days=30)).astimezone(current.tzinfo)
     elif normalized == "7d":
-        cutoff = current - timedelta(days=7)
+        cutoff = (current.astimezone(timezone.utc) - timedelta(days=7)).astimezone(current.tzinfo)
     else:  # 24h
-        cutoff = current - timedelta(hours=24)
+        cutoff = (current.astimezone(timezone.utc) - timedelta(hours=24)).astimezone(current.tzinfo)
     return cutoff, current
 
 
@@ -178,8 +180,8 @@ def _strip_usage_events(session: dict[str, Any]) -> dict[str, Any]:
     return public_session
 
 
-def _event_metrics(event: dict[str, Any]) -> tuple[int, int, int, int, int]:
-    """Read normalized input/output metrics from one usage event."""
+def _event_metrics(event: dict[str, Any]) -> tuple[int, int, int, int, int, int]:
+    """Read normalized token metrics from one usage event."""
     input_tokens = _as_int(event.get("input_tokens"))
     cached_input = _as_int(event.get("cached_input_tokens") or event.get("cached_input"))
     uncached_input = _as_int(event.get("uncached_input_tokens") or event.get("uncached_input"))
@@ -187,10 +189,21 @@ def _event_metrics(event: dict[str, Any]) -> tuple[int, int, int, int, int]:
         input_tokens = uncached_input + cached_input
     cached_input = min(input_tokens, cached_input)
     uncached_input = max(0, input_tokens - cached_input)
+    cache_write = _as_int(
+        event.get("cache_write_tokens")
+        or event.get("cache_creation_tokens")
+        or event.get("cache_write_input_tokens")
+    )
     output = _as_int(event.get("output_tokens") or event.get("output"))
     reasoning_output = _as_int(event.get("reasoning_output_tokens") or event.get("reasoning_output"))
-    total_tokens = _as_int(event.get("total_tokens")) or (input_tokens + output)
-    return uncached_input, cached_input, output, reasoning_output, total_tokens
+    reported_total = _as_int(event.get("total_tokens"))
+    component_total = input_tokens + cache_write + output
+    # Contract reconciliation may inflate an event's provider total to cover a
+    # session residual. Dashboard model/timeline rows must use the same
+    # component-derived basis as the merged session aggregate, while preserving
+    # a source total for events that provide no component fields at all.
+    total_tokens = component_total or reported_total
+    return uncached_input, cached_input, cache_write, output, reasoning_output, total_tokens
 
 
 def _event_call_count(event: Mapping[str, Any]) -> int:
@@ -218,6 +231,7 @@ def _event_cost(
     uncached_input: int,
     cached_input: int,
     output: int,
+    cache_write: int = 0,
 ) -> dict[str, float]:
     """Use reported/estimated event cost, or price tokens without fallback."""
     if event.get("reported_cost_usd") is not None:
@@ -229,13 +243,30 @@ def _event_cost(
             "savings_usd": float(
                 event.get("savings_usd")
                 if event.get("savings_usd") is not None
-                else max(0.0, baseline - actual)
+                else baseline - actual
             ),
+            "reported": True,
+        }
+    if session.get("reported_cost_usd") is not None:
+        total_tokens = _as_int(session.get("total_tokens"))
+        if total_tokens > 0:
+            weight = _as_int(event.get("total_tokens")) / total_tokens
+        else:
+            total_calls = max(1, _as_int(session.get("call_count")))
+            weight = min(1.0, _event_call_count(event) / total_calls)
+        actual = float(session.get("reported_cost_usd") or 0.0) * weight
+        baseline = float(session.get("cost_uncached_usd") or actual) * weight
+        return {
+            "cost_cached_usd": actual,
+            "cost_uncached_usd": baseline,
+            "savings_usd": float(session.get("savings_usd") or 0.0) * weight,
+            "reported": True,
         }
     event_model = str(event.get("model") or session.get("model") or "")
-    event_provider = str(session.get("provider") or session.get("tool") or "") or None
-    if event_model.casefold().startswith("deepseek"):
-        event_provider = "deepseek"
+    event_provider = _model_provider(
+        event_model,
+        str(session.get("provider") or session.get("tool") or "") or None,
+    )
     event_ts = event.get("timestamp") or session.get("created_at") or session.get("start_time")
     result = calculate_cost_strict(
         event_model,
@@ -243,9 +274,14 @@ def _event_cost(
         cached_input,
         output,
         provider=event_provider,
-        cache_write=_as_int(
-            event.get("cache_write_tokens")
-            or event.get("cache_creation_tokens")
+        cache_write=cache_write,
+        cache_write_5m=_as_int(
+            event.get("cache_write_5m_tokens")
+            or event.get("ephemeral_5m_input_tokens")
+        ),
+        cache_write_1h=_as_int(
+            event.get("cache_write_1h_tokens")
+            or event.get("ephemeral_1h_input_tokens")
         ),
         timestamp=event_ts,
     )
@@ -253,7 +289,85 @@ def _event_cost(
         "cost_cached_usd": float(result.get("cost_cached_usd") or 0.0),
         "cost_uncached_usd": float(result.get("cost_uncached_usd") or 0.0),
         "savings_usd": float(result.get("savings_usd") or 0.0),
+        "reported": False,
     }
+
+
+def _materialize_reported_call_events(session: UsageSession) -> None:
+    """Add deterministic zero-token events for authoritative call counts."""
+    cost = session.cost
+    if cost is None or cost.source != "reported" or cost.reported_usd is None:
+        return
+    represented_calls = sum(
+        _event_call_count(event.to_legacy_dict())
+        for event in session.events
+    )
+    missing_calls = max(0, session.call_count - represented_calls)
+    if missing_calls <= 0:
+        return
+    timestamp = (
+        session.created_at
+        or session.start_time
+        or session.end_time
+        or session.activity_at
+        or (session.events[-1].timestamp if session.events else None)
+    )
+    for index in range(missing_calls):
+        session.events.append(UsageEvent(
+            timestamp=timestamp,
+            model=session.model,
+            event_id=f"{session.id}:reported-call-{represented_calls + index + 1}",
+            metadata={"synthetic": "reported-call", "call_count": 1},
+        ))
+
+
+def _allocate_reported_cost_to_events(session: UsageSession) -> None:
+    """Allocate a session-level reported cost across retained events."""
+    cost = session.cost
+    if cost is None or cost.source != "reported" or cost.reported_usd is None or not session.events:
+        return
+    total_tokens = sum(event.usage.total_tokens for event in session.events)
+    total_calls = sum(
+        _event_call_count(event.to_legacy_dict())
+        for event in session.events
+    )
+    if total_tokens <= 0 and total_calls <= 0:
+        return
+    for event in session.events:
+        if event.cost is not None:
+            continue
+        if total_tokens > 0:
+            share = Decimal(event.usage.total_tokens) / Decimal(total_tokens)
+        else:
+            share = Decimal(_event_call_count(event.to_legacy_dict())) / Decimal(total_calls)
+        event.cost = CostEstimate(
+            cached_usd=cost.cached_usd * share,
+            uncached_usd=cost.uncached_usd * share,
+            savings_usd=cost.savings_usd * share,
+            reported_usd=cost.reported_usd * share,
+            currency=cost.currency,
+            source="reported",
+        )
+
+
+def _aggregate_event_costs(events: list[UsageEvent]) -> CostEstimate | None:
+    """Aggregate event costs without dropping mixed reported/estimated parts."""
+    costs = [event.cost for event in events if event.cost is not None]
+    if not costs or len(costs) != len(events):
+        return None
+    all_reported = all(cost.reported_usd is not None for cost in costs)
+    has_reported = any(cost.reported_usd is not None for cost in costs)
+    return CostEstimate(
+        cached_usd=sum((cost.total_usd for cost in costs), Decimal("0")),
+        uncached_usd=sum((cost.uncached_usd for cost in costs), Decimal("0")),
+        savings_usd=sum((cost.savings_usd for cost in costs), Decimal("0")),
+        reported_usd=(
+            sum((cost.reported_usd for cost in costs if cost.reported_usd is not None), Decimal("0"))
+            if all_reported else None
+        ),
+        currency=costs[0].currency,
+        source="reported" if all_reported else "mixed" if has_reported else "estimated",
+    )
 
 
 def _refresh_estimated_session_cost(session: UsageSession) -> None:
@@ -262,14 +376,27 @@ def _refresh_estimated_session_cost(session: UsageSession) -> None:
     Parser snapshots can outlive a pricing refresh. Repricing here keeps the
     dashboard current while preserving provider-reported costs verbatim.
     """
+    reported_session_cost = None
     if session.cost is not None and (
         session.cost.source == "reported" or session.cost.reported_usd is not None
     ):
-        return
+        reported_session_cost = session.cost
+        _materialize_reported_call_events(session)
+        _allocate_reported_cost_to_events(session)
+        all_events_reported = bool(session.events) and all(
+            event.cost is not None and event.cost.reported_usd is not None
+            for event in session.events
+        )
+        if not session.events or all_events_reported:
+            return
+        # A mixed session still needs its non-reported event costs repriced;
+        # the event aggregate below will retain the reported subtotal.
+        session.cost = None
 
-    provider = session.provider or session.tool
-    if str(session.model or "").casefold().startswith("deepseek"):
-        provider = "deepseek"
+    provider = _model_provider(
+        str(session.model or ""),
+        str(session.provider or session.tool or "") or None,
+    )
     usage = session.usage
     event_fallback_time = (
         session.created_at or session.start_time or session.end_time or session.activity_at
@@ -281,6 +408,8 @@ def _refresh_estimated_session_cost(session: UsageSession) -> None:
         usage.output_tokens,
         provider=provider,
         cache_write=usage.cache_write_tokens,
+        cache_write_5m=usage.cache_write_5m_tokens,
+        cache_write_1h=usage.cache_write_1h_tokens,
         timestamp=session.created_at or session.start_time or session.activity_at,
     )
     if resolved.get("status") == "known":
@@ -302,7 +431,10 @@ def _refresh_estimated_session_cost(session: UsageSession) -> None:
             continue
         event_model = event.model or session.model
         event_usage = event.usage
-        event_provider = "deepseek" if str(event_model or "").casefold().startswith("deepseek") else provider
+        event_provider = _model_provider(
+            str(event_model or ""),
+            provider,
+        )
         event_result = calculate_cost_strict(
             event_model,
             event_usage.uncached_input_tokens,
@@ -310,6 +442,8 @@ def _refresh_estimated_session_cost(session: UsageSession) -> None:
             event_usage.output_tokens,
             provider=event_provider,
             cache_write=event_usage.cache_write_tokens,
+            cache_write_5m=event_usage.cache_write_5m_tokens,
+            cache_write_1h=event_usage.cache_write_1h_tokens,
             timestamp=event.timestamp or event_fallback_time,
         )
         if event_result.get("status") == "known":
@@ -337,6 +471,8 @@ def _refresh_estimated_session_cost(session: UsageSession) -> None:
         event_reasoning = sum(event.usage.reasoning_output_tokens for event in session.events)
         event_total = sum(event.usage.total_tokens for event in session.events)
         event_cache_write = sum(event.usage.cache_write_tokens for event in session.events)
+        event_cache_write_5m = sum(event.usage.cache_write_5m_tokens for event in session.events)
+        event_cache_write_1h = sum(event.usage.cache_write_1h_tokens for event in session.events)
 
         # Some providers retain authoritative session totals when only part of
         # a transcript can be converted into timestamped usage events. Keep
@@ -348,6 +484,8 @@ def _refresh_estimated_session_cost(session: UsageSession) -> None:
         residual_reasoning = max(0, usage.reasoning_output_tokens - event_reasoning)
         residual_total = max(0, usage.total_tokens - event_total)
         residual_cache_write = max(0, usage.cache_write_tokens - event_cache_write)
+        residual_cache_write_5m = max(0, usage.cache_write_5m_tokens - event_cache_write_5m)
+        residual_cache_write_1h = max(0, usage.cache_write_1h_tokens - event_cache_write_1h)
         residual_cost_data: dict[str, Any] = {
             "status": "unknown",
             "cost_cached_usd": 0.0,
@@ -376,6 +514,8 @@ def _refresh_estimated_session_cost(session: UsageSession) -> None:
                 residual_output,
                 provider=provider,
                 cache_write=residual_cache_write,
+                cache_write_5m=residual_cache_write_5m,
+                cache_write_1h=residual_cache_write_1h,
                 timestamp=event_fallback_time,
             )
             residual_cost = (
@@ -397,6 +537,8 @@ def _refresh_estimated_session_cost(session: UsageSession) -> None:
                     reasoning_output_tokens=residual_reasoning,
                     total_tokens=residual_total,
                     cache_write_tokens=residual_cache_write,
+                    cache_write_5m_tokens=residual_cache_write_5m,
+                    cache_write_1h_tokens=residual_cache_write_1h,
                 ),
                 model=session.model,
                 cost=residual_cost,
@@ -419,16 +561,18 @@ def _refresh_estimated_session_cost(session: UsageSession) -> None:
                 ))
 
         event_costs = [event.cost for event in session.events if event.cost is not None]
+        if not event_costs and reported_session_cost is not None:
+            session.cost = reported_session_cost
+            return
         if event_costs:
             all_reported = (
                 len(event_costs) == len(session.events)
                 and all(cost.reported_usd is not None for cost in event_costs)
                 and not has_residual
             )
+            has_reported = any(cost.reported_usd is not None for cost in event_costs)
             event_cached_cost = sum(float(cost.total_usd) for cost in event_costs)
-            event_uncached_cost = sum(
-                float(cost.uncached_usd or cost.total_usd) for cost in event_costs
-            )
+            event_uncached_cost = sum(float(cost.uncached_usd) for cost in event_costs)
             event_savings = sum(float(cost.savings_usd) for cost in event_costs)
             session.cost = CostEstimate(
                 cached_usd=event_cached_cost,
@@ -439,7 +583,11 @@ def _refresh_estimated_session_cost(session: UsageSession) -> None:
                     if all_reported else None
                 ),
                 currency=event_costs[0].currency if event_costs else "USD",
-                source="reported" if all_reported else "estimated",
+                source=(
+                    "reported" if all_reported
+                    else "mixed" if has_reported
+                    else "estimated"
+                ),
             )
 
 
@@ -515,6 +663,9 @@ def _slice_session(
 
     uncached_input = 0
     cached_input = 0
+    cache_write = 0
+    cache_write_5m = 0
+    cache_write_1h = 0
     output = 0
     reasoning_output = 0
     total_tokens = 0
@@ -522,9 +673,12 @@ def _slice_session(
     cost_uncached = 0.0
     savings = 0.0
     for event, _event_time in selected_events:
-        event_uncached, event_cached, event_output, event_reasoning, event_total = _event_metrics(event)
+        event_uncached, event_cached, event_cache_write, event_output, event_reasoning, event_total = _event_metrics(event)
         uncached_input += event_uncached
         cached_input += event_cached
+        cache_write += event_cache_write
+        cache_write_5m += _as_int(event.get("cache_write_5m_tokens") or event.get("ephemeral_5m_input_tokens"))
+        cache_write_1h += _as_int(event.get("cache_write_1h_tokens") or event.get("ephemeral_1h_input_tokens"))
         output += event_output
         reasoning_output += event_reasoning
         total_tokens += event_total
@@ -534,6 +688,7 @@ def _slice_session(
             event_uncached,
             event_cached,
             event_output,
+            event_cache_write,
         )
         cost_cached += event_cost["cost_cached_usd"]
         cost_uncached += event_cost["cost_uncached_usd"]
@@ -545,7 +700,10 @@ def _slice_session(
         "call_count": sum(_event_call_count(event) for event, _event_time in selected_events),
         "uncached_input": uncached_input,
         "cached_input": cached_input,
-        "total_input": uncached_input + cached_input,
+        "total_input": uncached_input + cached_input + cache_write,
+        "cache_write": cache_write,
+        "cache_write_5m": cache_write_5m,
+        "cache_write_1h": cache_write_1h,
         "output": output,
         "reasoning_output": reasoning_output,
         "total_tokens": total_tokens,
@@ -621,9 +779,11 @@ def _blank_day_row(date_key: str = "") -> dict[str, Any]:
         "uncached_input": 0,
         "cached_input": 0,
         "total_input": 0,
+        "cache_write": 0,
         "output": 0,
         "reasoning_output": 0,
         "total_tokens": 0,
+        "cache_hit_rate": 0.0,
         "call_count": 0,
         "session_count": 0,
         "cost_cached_usd": 0.0,
@@ -640,9 +800,11 @@ def _blank_hour_row(hour: int) -> dict[str, Any]:
         "uncached_input": 0,
         "cached_input": 0,
         "total_input": 0,
+        "cache_write": 0,
         "output": 0,
         "reasoning_output": 0,
         "total_tokens": 0,
+        "cache_hit_rate": 0.0,
         "call_count": 0,
         "session_count": 0,
         "cost_cached_usd": 0.0,
@@ -676,6 +838,7 @@ def _add_token_metrics(
     row: dict[str, Any],
     uncached_input: int,
     cached_input: int,
+    cache_write: int,
     output: int,
     reasoning_output: int,
     total_tokens: int,
@@ -691,9 +854,15 @@ def _add_token_metrics(
     if "uncached_input" in row:
         row["uncached_input"] = int(row.get("uncached_input") or 0) + uncached_input
         row["cached_input"] = int(row.get("cached_input") or 0) + cached_input
-        row["total_input"] = int(row.get("total_input") or 0) + uncached_input + cached_input
+        row["cache_write"] = int(row.get("cache_write") or 0) + cache_write
+        row["total_input"] = int(row.get("total_input") or 0) + uncached_input + cached_input + cache_write
         row["output"] = int(row.get("output") or 0) + output
         row["reasoning_output"] = int(row.get("reasoning_output") or 0) + reasoning_output
+        cacheable_input = int(row.get("uncached_input") or 0) + int(row.get("cached_input") or 0)
+        row["cache_hit_rate"] = (
+            round(int(row.get("cached_input") or 0) / cacheable_input * 100.0, 2)
+            if cacheable_input > 0 else 0.0
+        )
         row["cost_uncached_usd"] = float(row.get("cost_uncached_usd") or 0.0) + float(
             cost.get("cost_uncached_usd") or 0.0
         )
@@ -758,6 +927,98 @@ def _day_has_usage(day: Mapping[str, Any]) -> bool:
     )
 
 
+def _model_provider(model_name: str, fallback: str | None) -> str | None:
+    """Infer the pricing provider from an explicit model identifier."""
+    normalized = str(model_name or "").strip().casefold()
+    if normalized.startswith("deepseek"):
+        return "deepseek"
+    if normalized.startswith("gemini"):
+        return "antigravity"
+    if normalized.startswith("claude"):
+        return "claude"
+    if normalized.startswith(("gpt-", "o1", "o3", "o4")):
+        return "codex"
+    return fallback
+
+
+def _session_model_contributions(
+    session: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Split one session into model-specific usage and cost contributions."""
+    raw_events = session.get("usage_events")
+    events = [event for event in raw_events if isinstance(event, dict)] if isinstance(raw_events, list) else []
+    contributions: list[dict[str, Any]] = []
+
+    if not events:
+        uncached = _as_int(session.get("uncached_input"))
+        cached = _as_int(session.get("cached_input"))
+        cache_write = _as_int(session.get("cache_write"))
+        output = _as_int(session.get("output"))
+        reasoning = _as_int(session.get("reasoning_output"))
+        return [{
+            "model": str(session.get("model") or "unknown"),
+            "uncached_input": uncached,
+            "cached_input": cached,
+            "cache_write": cache_write,
+            "output": output,
+            "reasoning_output": reasoning,
+            "total_tokens": _as_int(session.get("total_tokens")),
+            "call_count": _as_int(session.get("call_count")),
+            "cost": {
+                "cost_cached_usd": float(session.get("cost_cached_usd") or 0.0),
+                "cost_uncached_usd": float(session.get("cost_uncached_usd") or 0.0),
+                "savings_usd": float(session.get("savings_usd") or 0.0),
+                "reported": session.get("reported_cost_usd") is not None,
+            },
+        }]
+
+    for event in events:
+        uncached, cached, cache_write, output, reasoning, total = _event_metrics(event)
+        contributions.append({
+            "model": str(event.get("model") or session.get("model") or "unknown"),
+            "uncached_input": uncached,
+            "cached_input": cached,
+            "cache_write": cache_write,
+            "output": output,
+            "reasoning_output": reasoning,
+            "total_tokens": total,
+            "call_count": _event_call_count(event),
+            "cost": _event_cost(session, event, uncached, cached, output, cache_write),
+        })
+
+    event_calls = sum(contribution["call_count"] for contribution in contributions)
+    residual_uncached = max(0, _as_int(session.get("uncached_input")) - sum(c["uncached_input"] for c in contributions))
+    residual_cached = max(0, _as_int(session.get("cached_input")) - sum(c["cached_input"] for c in contributions))
+    residual_cache_write = max(0, _as_int(session.get("cache_write")) - sum(c["cache_write"] for c in contributions))
+    residual_output = max(0, _as_int(session.get("output")) - sum(c["output"] for c in contributions))
+    residual_reasoning = max(0, _as_int(session.get("reasoning_output")) - sum(c["reasoning_output"] for c in contributions))
+    residual_total = max(0, _as_int(session.get("total_tokens")) - sum(c["total_tokens"] for c in contributions))
+    residual_calls = max(0, _as_int(session.get("call_count")) - event_calls)
+    if any((residual_uncached, residual_cached, residual_cache_write, residual_output,
+            residual_reasoning, residual_total, residual_calls)):
+        event_cost = {
+            key: sum(float(contribution["cost"].get(key) or 0.0) for contribution in contributions)
+            for key in ("cost_cached_usd", "cost_uncached_usd", "savings_usd")
+        }
+        contributions.append({
+            "model": str(session.get("model") or "unknown"),
+            "uncached_input": residual_uncached,
+            "cached_input": residual_cached,
+            "cache_write": residual_cache_write,
+            "output": residual_output,
+            "reasoning_output": residual_reasoning,
+            "total_tokens": residual_total,
+            "call_count": residual_calls,
+            "cost": {
+                "cost_cached_usd": float(session.get("cost_cached_usd") or 0.0) - event_cost["cost_cached_usd"],
+                "cost_uncached_usd": float(session.get("cost_uncached_usd") or 0.0) - event_cost["cost_uncached_usd"],
+                "savings_usd": float(session.get("savings_usd") or 0.0) - event_cost["savings_usd"],
+                "reported": session.get("reported_cost_usd") is not None,
+            },
+        })
+    return contributions
+
+
 def _build_usage_data(
     sessions: list[dict[str, Any]],
     tool: str,
@@ -774,136 +1035,132 @@ def _build_usage_data(
         reverse=True,
     )
 
-    models_map: dict[str, dict[str, Any]] = {}
-    # Track pricing provenance per aggregated model so rows with no catalog
-    # rate can be surfaced as unpriced instead of silent $0.
-    model_statuses: dict[str, set[str]] = defaultdict(set)
-    model_providers: dict[str, set[str]] = defaultdict(set)
-    # Token provenance per aggregated model: "estimated" when every
-    # contributing session carries estimated token counts (AGY heuristic),
-    # "reported" when all counts are provider-reported (Codex/Claude),
-    # "mixed" when a canonical model merges both (tool=all view).
-    model_token_sources: dict[str, set[str]] = defaultdict(set)
-    for session in sessions_combined:
-        raw_model = str(session.get("model") or "unknown")
-        model_key = _canonical_model_name(raw_model) if tool == "all" else raw_model
-        tool_value = str(session.get("tool") or (tool if tool != "all" else "")).strip()
-        provider_hint = (
-            str(session.get("provider") or tool_value or "").strip() or None
+    models_map: dict[tuple[str, str], dict[str, Any]] = {}
+    model_statuses: dict[tuple[str, str], set[str]] = defaultdict(set)
+    model_token_sources: dict[tuple[str, str], set[str]] = defaultdict(set)
+    model_cost_sources: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for session_index, session in enumerate(sessions_combined):
+        session_key = f"{session.get('tool', '')}:{session.get('id', session_index)}"
+        session_token_source = str(
+            session.get("token_source")
+            or ("estimated" if session.get("estimated") else "reported")
         )
-        status = str(session.get("pricing_status") or "").strip()
-        resolved = PRICING_CATALOG.resolve(raw_model, provider_hint)
-        if status not in ("reported", "estimated", "known", "unpriced", "unknown", "ambiguous"):
-            status = resolved.status
-        canonical_model = resolved.canonical_model or model_key
-        model_statuses[model_key].add(status)
-        session_token_source = str(session.get("token_source") or ("estimated" if session.get("estimated") else "reported"))
-        model_token_sources[model_key].add(session_token_source)
-        if tool_value:
-            model_providers[model_key].add(tool_value)
-        elif provider_hint:
-            model_providers[model_key].add(provider_hint)
-
-        uncached_input = int(session.get("uncached_input") or 0)
-        cached_input = int(session.get("cached_input") or 0)
-        total_input = int(session.get("total_input") or (uncached_input + cached_input))
-        output = int(session.get("output") or 0)
-        reasoning_output = int(session.get("reasoning_output") or 0)
-        total_tokens = int(session.get("total_tokens") or 0)
-        call_count = int(session.get("call_count") or 0)
-        cost_cached = float(session.get("cost_cached_usd") or 0.0)
-        cost_uncached = float(session.get("cost_uncached_usd") or 0.0)
-        savings = float(session.get("savings_usd") or 0.0)
-
-        if model_key not in models_map:
-            models_map[model_key] = {
-                "model": model_key,
+        tool_value = str(session.get("tool") or (tool if tool != "all" else "")).strip()
+        provider_hint = str(session.get("provider") or tool_value or "").strip() or None
+        for contribution in _session_model_contributions(session):
+            raw_model = str(contribution["model"] or "unknown")
+            contribution_provider = _model_provider(raw_model, provider_hint)
+            resolved = PRICING_CATALOG.resolve(raw_model, contribution_provider)
+            canonical_model = resolved.canonical_model or _canonical_model_name(raw_model)
+            model_key = (contribution_provider or tool_value or "unknown", canonical_model)
+            uncached_input = int(contribution["uncached_input"])
+            cached_input = int(contribution["cached_input"])
+            cache_write = int(contribution["cache_write"])
+            total_input = uncached_input + cached_input + cache_write
+            cost = contribution["cost"]
+            if cost.get("reported"):
+                contribution_cost_source = "reported"
+            elif resolved.status == "known":
+                contribution_cost_source = "estimated"
+            else:
+                contribution_cost_source = "unavailable"
+            model = models_map.setdefault(model_key, {
+                "model": canonical_model,
                 "canonical_model": canonical_model,
                 "tool": tool_value,
-                "call_count": call_count,
-                "session_count": 1,
-                "uncached_input": uncached_input,
-                "cached_input": cached_input,
-                "total_input": total_input,
-                "output": output,
-                "reasoning_output": reasoning_output,
-                "total_tokens": total_tokens,
+                "provider": contribution_provider or tool_value,
+                "call_count": 0,
+                "session_ids": set(),
+                "uncached_input": 0,
+                "cached_input": 0,
+                "cache_write": 0,
+                "total_input": 0,
+                "output": 0,
+                "reasoning_output": 0,
+                "total_tokens": 0,
                 "cache_hit_rate": 0.0,
-                "est_cost_cached_usd": cost_cached,
-                "est_cost_uncached_usd": cost_uncached,
-                "est_savings_usd": savings,
-            }
-        else:
-            model = models_map[model_key]
-            if not model["tool"]:
-                model["tool"] = tool_value
-            elif tool_value and model["tool"] != tool_value:
+                "est_cost_cached_usd": 0.0,
+                "est_cost_uncached_usd": 0.0,
+                "est_savings_usd": 0.0,
+            })
+            if model["tool"] != tool_value:
                 model["tool"] = "all"
-            model["call_count"] += call_count
-            model["session_count"] += 1
+            model["call_count"] += int(contribution["call_count"])
+            model["session_ids"].add(session_key)
             model["uncached_input"] += uncached_input
             model["cached_input"] += cached_input
+            model["cache_write"] += cache_write
             model["total_input"] += total_input
-            model["output"] += output
-            model["reasoning_output"] += reasoning_output
-            model["total_tokens"] += total_tokens
-            model["est_cost_cached_usd"] += cost_cached
-            model["est_cost_uncached_usd"] += cost_uncached
-            model["est_savings_usd"] += savings
+            model["output"] += int(contribution["output"])
+            model["reasoning_output"] += int(contribution["reasoning_output"])
+            model["total_tokens"] += int(contribution["total_tokens"])
+            model["est_cost_cached_usd"] += float(cost["cost_cached_usd"])
+            model["est_cost_uncached_usd"] += float(cost["cost_uncached_usd"])
+            model["est_savings_usd"] += float(cost["savings_usd"])
+            model_cost_sources[model_key].add(contribution_cost_source)
+            model_statuses[model_key].add(resolved.status)
+            model_token_sources[model_key].add(session_token_source)
 
     models_list: list[dict[str, Any]] = []
-    local_tz = datetime.now().astimezone().tzinfo
-    for model in models_map.values():
-        total_input = int(model.get("total_input") or 0)
-        cached_input = int(model.get("cached_input") or 0)
-        model["cache_hit_rate"] = round((cached_input / total_input * 100.0), 2) if total_input > 0 else 0.0
-        model["est_cost_cached_usd"] = round(float(model.get("est_cost_cached_usd") or 0.0), 6)
-        model["est_cost_uncached_usd"] = round(float(model.get("est_cost_uncached_usd") or 0.0), 6)
-        model["est_savings_usd"] = round(float(model.get("est_savings_usd") or 0.0), 6)
-        if not model.get("tool"):
-            model["tool"] = tool
-        # Flag models with no catalog rate. Never invent fallback rates:
-        # unpriced rows keep cost 0 and carry provider/model identity.
-        statuses = model_statuses.get(str(model.get("model")), set())
-        priced = any(s in ("reported", "estimated", "known") for s in statuses)
-        if not priced and not statuses:
-            resolved = PRICING_CATALOG.resolve(
-                str(model.get("model")), str(model.get("tool") or "") or None
-            )
-            statuses = {resolved.status}
-            priced = resolved.priced
-        unpriced = not priced
-        if unpriced:
+    local_tz = (
+        window_end.tzinfo
+        if window_end is not None and window_end.tzinfo is not None
+        else window_start.tzinfo
+        if window_start is not None and window_start.tzinfo is not None
+        else local_timezone()
+    )
+    for model_key, model in models_map.items():
+        model["session_count"] = len(model.pop("session_ids"))
+        cacheable_input = int(model["uncached_input"]) + int(model["cached_input"])
+        model["cache_hit_rate"] = round(
+            int(model["cached_input"]) / cacheable_input * 100.0,
+            2,
+        ) if cacheable_input > 0 else 0.0
+        model["est_cost_cached_usd"] = round(float(model["est_cost_cached_usd"]), 6)
+        model["est_cost_uncached_usd"] = round(float(model["est_cost_uncached_usd"]), 6)
+        model["est_savings_usd"] = round(float(model["est_savings_usd"]), 6)
+        statuses = model_statuses[model_key]
+        cost_sources = model_cost_sources[model_key]
+        has_reported = "reported" in cost_sources
+        has_estimated = "estimated" in cost_sources
+        has_unavailable = "unavailable" in cost_sources
+        priced = not has_unavailable
+        unpriced = has_unavailable
+        if unpriced and not (has_reported or has_estimated):
             model["est_cost_cached_usd"] = 0.0
             model["est_cost_uncached_usd"] = 0.0
             model["est_savings_usd"] = 0.0
-        if "reported" in statuses:
-            pricing_status = "reported" if priced else "unknown"
-        elif "estimated" in statuses or "known" in statuses:
+        if has_reported and (has_estimated or has_unavailable):
+            pricing_status = "mixed"
+        elif has_reported:
+            pricing_status = "reported"
+        elif has_estimated:
             pricing_status = "known"
-        elif "unpriced" in statuses:
-            pricing_status = "unpriced"
         elif "ambiguous" in statuses:
             pricing_status = "ambiguous"
-        else:
+        elif "unpriced" in statuses:
+            pricing_status = "unpriced"
+        elif "unknown" in statuses:
             pricing_status = "unknown"
-        model["provider"] = str(model.get("tool") or "")
+        else:
+            pricing_status = "unavailable"
         model["pricing_status"] = pricing_status
+        model["cost_source"] = (
+            "mixed" if has_reported and (has_estimated or has_unavailable)
+            else "reported" if has_reported
+            else "estimated" if has_estimated
+            else "unavailable"
+        )
+        model["cost_available"] = not has_unavailable
         model["priced"] = priced
         model["unpriced"] = unpriced
-        token_sources = model_token_sources.get(str(model.get("model")), set())
-        if token_sources == {"estimated"}:
-            model["token_source"] = "estimated"
-            model["estimated"] = True
-        elif token_sources == {"reported"}:
-            model["token_source"] = "reported"
-            model["estimated"] = False
-        elif token_sources:
-            model["token_source"] = "mixed"
-            model["estimated"] = False
-        else:
-            model["token_source"] = "reported"
-            model["estimated"] = False
+        token_sources = model_token_sources[model_key]
+        model["token_source"] = (
+            "estimated" if token_sources == {"estimated"}
+            else "reported" if token_sources == {"reported"}
+            else "mixed"
+        )
+        model["estimated"] = model["token_source"] == "estimated"
         models_list.append(model)
     models_list.sort(key=lambda model: int(model.get("total_tokens") or 0), reverse=True)
 
@@ -917,7 +1174,7 @@ def _build_usage_data(
         for hour in range(24)
     }
     weekday_session_ids: dict[tuple[int, int], set[str]] = defaultdict(set)
-    reference_now = window_end if window_end is not None else datetime.now().astimezone()
+    reference_now = window_end if window_end is not None else datetime.now(local_tz)
     if reference_now.tzinfo is None:
         reference_now = reference_now.replace(tzinfo=local_tz)
 
@@ -926,6 +1183,7 @@ def _build_usage_data(
         session_key: str,
         uncached_input: int,
         cached_input: int,
+        cache_write: int,
         output: int,
         reasoning_output: int,
         total_tokens: int,
@@ -941,6 +1199,7 @@ def _build_usage_data(
             day,
             uncached_input,
             cached_input,
+            cache_write,
             output,
             reasoning_output,
             total_tokens,
@@ -955,6 +1214,7 @@ def _build_usage_data(
             hourly_map[hour],
             uncached_input,
             cached_input,
+            cache_write,
             output,
             reasoning_output,
             total_tokens,
@@ -967,6 +1227,7 @@ def _build_usage_data(
             weekday_hour_map[weekday_key],
             uncached_input,
             cached_input,
+            cache_write,
             output,
             reasoning_output,
             total_tokens,
@@ -976,7 +1237,7 @@ def _build_usage_data(
         weekday_session_ids[weekday_key].add(session_key)
 
     for session_index, session in enumerate(sessions_combined):
-        session_key = str(session.get("id") or f"session-{session_index}")
+        session_key = f"{session.get('tool', '')}:{session.get('id', f'session-{session_index}')}"
         event_rows: list[tuple[dict[str, Any], datetime]] = []
         fallback_event_time = _session_timestamp(session, local_tz)
         raw_events = session.get("usage_events")
@@ -994,19 +1255,21 @@ def _build_usage_data(
 
         if event_rows:
             for event, event_time in event_rows:
-                event_uncached, event_cached, event_output, event_reasoning, event_total = _event_metrics(event)
+                event_uncached, event_cached, event_cache_write, event_output, event_reasoning, event_total = _event_metrics(event)
                 event_cost = _event_cost(
                     session,
                     event,
                     event_uncached,
                     event_cached,
                     event_output,
+                    event_cache_write,
                 )
                 record_point(
                     event_time,
                     session_key,
                     event_uncached,
                     event_cached,
+                    event_cache_write,
                     event_output,
                     event_reasoning,
                     event_total,
@@ -1027,6 +1290,7 @@ def _build_usage_data(
                 session_key,
                 _as_int(session.get("uncached_input")),
                 _as_int(session.get("cached_input")),
+                _as_int(session.get("cache_write")),
                 _as_int(session.get("output")),
                 _as_int(session.get("reasoning_output")),
                 _as_int(session.get("total_tokens")),
@@ -1051,6 +1315,7 @@ def _build_usage_data(
             day,
             _as_int(session.get("uncached_input")),
             _as_int(session.get("cached_input")),
+            _as_int(session.get("cache_write")),
             _as_int(session.get("output")),
             _as_int(session.get("reasoning_output")),
             _as_int(session.get("total_tokens")),
@@ -1088,29 +1353,33 @@ def _build_usage_data(
 
     uncached_input = sum(int(s.get("uncached_input") or 0) for s in sessions_combined)
     cached_input = sum(int(s.get("cached_input") or 0) for s in sessions_combined)
-    total_input = uncached_input + cached_input
+    cache_write = sum(int(s.get("cache_write") or 0) for s in sessions_combined)
+    total_input = uncached_input + cached_input + cache_write
     output = sum(int(s.get("output") or 0) for s in sessions_combined)
     reasoning_output = sum(int(s.get("reasoning_output") or 0) for s in sessions_combined)
     total_tokens = sum(int(s.get("total_tokens") or 0) for s in sessions_combined)
     cost_cached = round(sum(float(s.get("cost_cached_usd") or 0.0) for s in sessions_combined), 6)
     cost_uncached = round(sum(float(s.get("cost_uncached_usd") or 0.0) for s in sessions_combined), 6)
     savings = round(sum(float(s.get("savings_usd") or 0.0) for s in sessions_combined), 6)
+    unpriced_count = sum(1 for m in models_list if m.get("unpriced"))
 
     summary = {
         "total_tokens": total_tokens,
         "uncached_input": uncached_input,
         "cached_input": cached_input,
         "total_input": total_input,
+        "cache_write": cache_write,
         "output": output,
         "reasoning_output": reasoning_output,
         "cost_cached_usd": cost_cached,
         "cost_uncached_usd": cost_uncached,
         "savings_usd": savings,
         "total_cost_usd": cost_cached,
-        "cache_hit_rate": round((cached_input / total_input * 100.0), 2) if total_input > 0 else 0.0,
+        "cache_hit_rate": round((cached_input / (uncached_input + cached_input) * 100.0), 2) if uncached_input + cached_input > 0 else 0.0,
         "session_count": len(sessions_combined),
         "call_count": sum(int(s.get("call_count") or 0) for s in sessions_combined),
-        "unpriced_model_count": sum(1 for m in models_list if m.get("unpriced")),
+        "unpriced_model_count": unpriced_count,
+        "cost_complete": unpriced_count == 0,
         "unpriced_models": sorted(
             str(m.get("model") or "unknown") for m in models_list if m.get("unpriced")
         ),
@@ -1128,6 +1397,7 @@ def _build_usage_data(
 
     return {
         "tool": tool,
+        "timezone": timezone_name(local_tz),
         "summary": summary,
         "models": models_list,
         "timeline": timeline_list,
@@ -1159,8 +1429,9 @@ def _previous_time_bounds(
         )
         return previous_month_start, cutoff
 
-    window_length = current - cutoff
-    return cutoff - window_length, cutoff
+    window_length = current.astimezone(timezone.utc) - cutoff.astimezone(timezone.utc)
+    previous_start = (cutoff.astimezone(timezone.utc) - window_length).astimezone(current.tzinfo)
+    return previous_start, cutoff
 
 
 def _percentage_change(current: float, previous: float) -> float | None:
@@ -1250,12 +1521,13 @@ def _filter_period_days(
     if start is None:
         start = _session_span_start(
             sessions,
-            current.tzinfo or datetime.now().astimezone().tzinfo,
+            current.tzinfo or local_timezone(),
             current,
         )
     if start is None:
         return 30.0 if sessions else 1.0
-    return max((current - start).total_seconds() / 86400.0, 1.0)
+    elapsed = current.astimezone(timezone.utc) - start.astimezone(timezone.utc)
+    return max(elapsed.total_seconds() / 86400.0, 1.0)
 
 
 def _projected_30d_cost(total_cost: float, period_days: float) -> float:
@@ -1295,6 +1567,9 @@ def _build_analytics(
             "cost_cached_usd": round(float(session.get("cost_cached_usd") or 0.0), 6),
             "estimated": bool(session.get("estimated")),
             "token_source": str(session.get("token_source") or ("estimated" if session.get("estimated") else "reported")),
+            "pricing_status": str(session.get("pricing_status") or session.get("cost_source") or "unknown"),
+            "cost_source": str(session.get("cost_source") or session.get("pricing_status") or "unknown"),
+            "cost_available": session.get("cost_available") is not False,
             "activity_at": str(
                 session.get("activity_at")
                 or session.get("created_at")
@@ -1428,6 +1703,303 @@ def _canonical_model_name(name: Any) -> str:
     resolved = PRICING_CATALOG.resolve(raw)
     return resolved.canonical_model if resolved.canonical_model else _CANONICAL_MODELS.get(raw.lower(), raw)
 
+
+def _sum_token_usage(usages: list[TokenUsage]) -> TokenUsage:
+    """Aggregate normalized token usage without losing cache-write components."""
+    total = sum(usage.total_tokens for usage in usages)
+    aggregate = TokenUsage(
+        input_tokens=sum(usage.input_tokens for usage in usages),
+        cached_input_tokens=sum(usage.cached_input_tokens for usage in usages),
+        output_tokens=sum(usage.output_tokens for usage in usages),
+        reasoning_output_tokens=sum(usage.reasoning_output_tokens for usage in usages),
+        total_tokens=total,
+        cache_read_tokens=sum(usage.cache_read_tokens or 0 for usage in usages),
+        cache_write_tokens=sum(usage.cache_write_tokens for usage in usages),
+        cache_write_5m_tokens=sum(usage.cache_write_5m_tokens for usage in usages),
+        cache_write_1h_tokens=sum(usage.cache_write_1h_tokens for usage in usages),
+        preserve_total=True,
+    )
+    # The sum of authoritative provider totals must not be raised to the
+    # component-derived bound during an intermediate merge.
+    aggregate.total_tokens = total
+    return aggregate
+
+
+def _max_token_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:
+    """Merge two cumulative usage snapshots without adding duplicate usage."""
+    return TokenUsage(
+        input_tokens=max(left.input_tokens, right.input_tokens),
+        cached_input_tokens=max(left.cached_input_tokens, right.cached_input_tokens),
+        output_tokens=max(left.output_tokens, right.output_tokens),
+        reasoning_output_tokens=max(left.reasoning_output_tokens, right.reasoning_output_tokens),
+        total_tokens=max(left.total_tokens, right.total_tokens),
+        cache_read_tokens=max(left.cache_read_tokens or 0, right.cache_read_tokens or 0),
+        cache_write_tokens=max(left.cache_write_tokens, right.cache_write_tokens),
+        cache_write_5m_tokens=max(left.cache_write_5m_tokens, right.cache_write_5m_tokens),
+        cache_write_1h_tokens=max(left.cache_write_1h_tokens, right.cache_write_1h_tokens),
+        preserve_total=True,
+    )
+
+
+def _sum_event_component_usage(events: list[UsageEvent]) -> TokenUsage:
+    """Aggregate event components without trusting reconciled event totals."""
+    aggregate = _sum_token_usage([event.usage for event in events])
+    component_total = aggregate.total_input + aggregate.output_tokens
+    aggregate.total_tokens = component_total or sum(event.usage.total_tokens for event in events)
+    return aggregate
+
+
+def _subtract_component_usage(total: TokenUsage, represented: TokenUsage) -> TokenUsage:
+    """Return component-level usage not present in a represented aggregate."""
+    input_tokens = max(0, total.input_tokens - represented.input_tokens)
+    cached_input = max(0, total.cached_input_tokens - represented.cached_input_tokens)
+    output_tokens = max(0, total.output_tokens - represented.output_tokens)
+    reasoning_output = max(
+        0,
+        total.reasoning_output_tokens - represented.reasoning_output_tokens,
+    )
+    cache_write = max(0, total.cache_write_tokens - represented.cache_write_tokens)
+    cache_write_5m = max(
+        0,
+        total.cache_write_5m_tokens - represented.cache_write_5m_tokens,
+    )
+    cache_write_1h = max(
+        0,
+        total.cache_write_1h_tokens - represented.cache_write_1h_tokens,
+    )
+    return TokenUsage(
+        input_tokens=input_tokens,
+        cached_input_tokens=cached_input,
+        output_tokens=output_tokens,
+        reasoning_output_tokens=reasoning_output,
+        total_tokens=max(
+            input_tokens + cache_write + output_tokens,
+            max(0, total.total_tokens - represented.total_tokens),
+        ),
+        cache_read_tokens=max(0, (total.cache_read_tokens or 0) - (represented.cache_read_tokens or 0)),
+        cache_write_tokens=cache_write,
+        cache_write_5m_tokens=cache_write_5m,
+        cache_write_1h_tokens=cache_write_1h,
+        preserve_total=True,
+    )
+
+
+def _has_component_usage(usage: TokenUsage) -> bool:
+    """Whether a usage aggregate contains any component-level tokens."""
+    return any((
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.output_tokens,
+        usage.reasoning_output_tokens,
+        usage.cache_write_tokens,
+        usage.total_tokens,
+    ))
+
+
+def _event_identity(event: UsageEvent) -> tuple[str, ...]:
+    """Return a stable identity for event-level cross-file deduplication."""
+    if event.event_id:
+        return ("event_id", str(event.event_id))
+    timestamp = event.timestamp.isoformat() if hasattr(event.timestamp, "isoformat") else str(event.timestamp or "")
+    usage = event.usage
+    return (
+        "fingerprint",
+        timestamp,
+        str(event.model or ""),
+        str(usage.input_tokens),
+        str(usage.cached_input_tokens),
+        str(usage.output_tokens),
+        str(usage.reasoning_output_tokens),
+        str(usage.cache_write_tokens),
+        str(usage.cache_write_5m_tokens),
+        str(usage.cache_write_1h_tokens),
+    )
+
+
+def _merge_usage_sessions(sessions: list[UsageSession]) -> list[UsageSession]:
+    """Merge segmented records that share one provider and canonical session ID."""
+    merged: dict[tuple[str, str], UsageSession] = {}
+    order: list[tuple[str, str]] = []
+    for session in sessions:
+        if session.cost is not None and (
+            session.cost.source == "reported" or session.cost.reported_usd is not None
+        ):
+            _materialize_reported_call_events(session)
+        key = (normalize_source_key(str(session.tool or session.provider or "")), str(session.id))
+        current = merged.get(key)
+        if current is None:
+            merged[key] = session
+            order.append(key)
+            continue
+
+        seen_event_ids = {
+            identity
+            for event in current.events
+            if (identity := _event_identity(event)) is not None
+        }
+        current_event_identities = set(seen_event_ids)
+        current_comparable_event_identities = {
+            _event_identity(event)
+            for event in current.events
+            if not event.metadata.get("synthetic")
+        } or current_event_identities
+        represented = _sum_event_component_usage(session.events)
+        residual = (
+            _subtract_component_usage(session.usage, represented)
+            if session.events
+            else session.usage
+        )
+        represented_calls = sum(
+            _event_call_count(event.to_legacy_dict())
+            for event in session.events
+        )
+        residual_calls = max(0, session.call_count - represented_calls)
+
+        current_is_reported = bool(
+            current.cost
+            and current.cost.source == "reported"
+            and current.cost.reported_usd is not None
+        )
+        incoming_is_reported = bool(
+            session.cost
+            and session.cost.source == "reported"
+            and session.cost.reported_usd is not None
+        )
+        duplicate_events: list[UsageEvent] = []
+        duplicate_calls = 0
+        new_events: list[UsageEvent] = []
+        for event in session.events:
+            identity = _event_identity(event)
+            if identity in seen_event_ids:
+                duplicate_events.append(event)
+                duplicate_calls += _event_call_count(event.to_legacy_dict())
+                continue
+            seen_event_ids.add(identity)
+            new_events.append(event)
+        duplicate_usage = _sum_event_component_usage(duplicate_events)
+        incoming_event_identities = {
+            _event_identity(event)
+            for event in session.events
+        }
+
+        # A fully duplicate segment contributes no tokens or calls again. A
+        # source record with no events can still contribute an authoritative
+        # session-level residual. Duplicate-event snapshots can also carry
+        # newer aggregate totals, which are cumulative and must be reconciled
+        # without counting their events again.
+        if not new_events and session.events:
+            current.usage = _max_token_usage(current.usage, session.usage)
+            current.call_count = max(current.call_count, session.call_count)
+            continue
+
+        if current_is_reported and not incoming_is_reported:
+            _allocate_reported_cost_to_events(current)
+        elif incoming_is_reported and not current_is_reported:
+            _allocate_reported_cost_to_events(session)
+        elif current_is_reported and incoming_is_reported:
+            for event in (*current.events, *new_events):
+                event.cost = None
+
+        current.events.extend(new_events)
+        combined_usage = _sum_event_component_usage(current.events)
+        missing_residual = _subtract_component_usage(residual, combined_usage)
+        current.usage = (
+            _sum_token_usage([combined_usage, missing_residual])
+            if _has_component_usage(missing_residual)
+            else combined_usage
+        )
+        new_call_count = sum(
+            _event_call_count(event.to_legacy_dict())
+            for event in new_events
+        )
+        residual_call_count = residual_calls
+        if new_events and _has_component_usage(residual) and not _has_component_usage(missing_residual):
+            residual_call_count = 0
+        current.call_count += new_call_count + residual_call_count
+        current.metadata.update(session.metadata)
+        current.metadata["merged_session_count"] = int(
+            current.metadata.get("merged_session_count", 1)
+        ) + 1
+
+        if current_is_reported and incoming_is_reported and current.cost and session.cost:
+            current_comparable = current_comparable_event_identities
+            incoming_comparable = {
+                _event_identity(event)
+                for event in session.events
+                if not event.metadata.get("synthetic")
+            } or incoming_event_identities
+            incoming_is_subset = incoming_comparable <= current_comparable
+            current_is_subset = current_comparable <= incoming_comparable
+            if incoming_is_subset:
+                # The incoming record contains no unique calls; its reported
+                # total is already covered by the current event set.
+                pass
+            elif current_is_subset:
+                # The incoming record is the more complete snapshot of the same
+                # authoritative session, regardless of merge order.
+                current.cost = session.cost
+            else:
+                session_total = represented.total_tokens
+                if session_total > 0:
+                    accepted_share = Decimal(
+                        max(0, session_total - duplicate_usage.total_tokens)
+                    ) / Decimal(session_total)
+                elif duplicate_calls > 0:
+                    accepted_share = Decimal(
+                        max(0, session.call_count - duplicate_calls)
+                    ) / Decimal(max(1, session.call_count))
+                else:
+                    accepted_share = Decimal(1)
+                current.cost = CostEstimate(
+                    cached_usd=current.cost.cached_usd + session.cost.cached_usd * accepted_share,
+                    uncached_usd=current.cost.uncached_usd + session.cost.uncached_usd * accepted_share,
+                    savings_usd=current.cost.savings_usd + session.cost.savings_usd * accepted_share,
+                    reported_usd=current.cost.reported_usd + session.cost.reported_usd * accepted_share,
+                    currency=current.cost.currency,
+                    source="reported",
+                )
+        elif current_is_reported != incoming_is_reported or not current_is_reported:
+            # Mixed provenance is rebuilt from event-level reported and
+            # estimated costs during the normal refresh pass.
+            current.cost = None
+
+        for timestamp_name, reducer in (
+            ("created_at", min),
+            ("start_time", min),
+        ):
+            values = [
+                value
+                for value in (getattr(current, timestamp_name), getattr(session, timestamp_name))
+                if value is not None
+            ]
+            if values:
+                setattr(current, timestamp_name, reducer(values))
+        for timestamp_name in ("end_time", "activity_at"):
+            values = [
+                value
+                for value in (getattr(current, timestamp_name), getattr(session, timestamp_name))
+                if value is not None
+            ]
+            if values:
+                setattr(current, timestamp_name, max(values))
+        if len(str(session.title or "")) > len(str(current.title or "")):
+            current.title = session.title
+
+    for key, session in merged.items():
+        models = {
+            str(model).strip()
+            for model in [session.model, *(event.model for event in session.events)]
+            if model and str(model).strip().lower() not in {"mixed", "unknown"}
+        }
+        if len(models) > 1:
+            session.model = "mixed"
+        elif models:
+            session.model = next(iter(models))
+        for event in session.events:
+            if event.model is None and session.model != "mixed":
+                event.model = session.model
+    return [merged[key] for key in order]
+
 def _serialize_extracted_session(session: UsageSession) -> dict[str, Any]:
     """Convert a normalized session into the dashboard's stable JSON shape.
 
@@ -1442,10 +2014,17 @@ def _serialize_extracted_session(session: UsageSession) -> dict[str, Any]:
     """
     _refresh_estimated_session_cost(session)
     serialized = session.to_legacy_dict(include_events=True)
+    component_total = int(session.usage.total_input + session.usage.output_tokens)
+    reported_total = int(session.usage.total_tokens)
+    serialized["total_tokens"] = component_total or reported_total
+    if component_total and component_total != reported_total:
+        serialized["reported_total_tokens"] = reported_total
     estimated = bool(session.metadata.get("estimated"))
     token_source = str(session.metadata.get("token_source") or ("estimated" if estimated else "reported"))
     serialized["estimated"] = estimated
     serialized["token_source"] = token_source
+    serialized["cost_available"] = session.cost is not None
+    serialized["cost_source"] = session.cost.source if session.cost is not None else "unavailable"
     if session.cost is not None:
         serialized["pricing_status"] = session.cost.source
         return serialized
@@ -1456,8 +2035,13 @@ def _serialize_extracted_session(session: UsageSession) -> dict[str, Any]:
         usage.uncached_input_tokens,
         usage.cached_input_tokens,
         usage.output_tokens,
-        provider=session.provider or session.tool,
+        provider=_model_provider(
+            str(session.model or ""),
+            str(session.provider or session.tool or "") or None,
+        ),
         cache_write=usage.cache_write_tokens,
+        cache_write_5m=usage.cache_write_5m_tokens,
+        cache_write_1h=usage.cache_write_1h_tokens,
         timestamp=session.created_at or session.start_time or session.activity_at,
     )
     serialized["pricing_status"] = resolved["status"]
@@ -1505,8 +2089,9 @@ def get_tool_usage(
 
     ``codex_dir`` and ``agy_dir`` remain for API compatibility. New providers
     receive paths through ``source_dirs`` and require no aggregator branches.
-    ``time_range=custom`` requires a UTC ``start`` date (YYYY-MM-DD); the
-    optional ``end`` date is inclusive and defaults to the current instant.
+    ``time_range=custom`` requires a local-calendar ``start`` date
+    (YYYY-MM-DD); the optional ``end`` date is inclusive and defaults to the
+    current instant in the dashboard timezone.
     """
     time_range_normalized = _normalize_time_range(time_range)
     if time_range_normalized == "custom":
@@ -1537,7 +2122,7 @@ def get_tool_usage(
         for source in sources
     ]
 
-    sessions: list[dict[str, Any]] = []
+    extracted_sessions: list[UsageSession] = []
     for future in futures:
         extracted = future.result()
         for session in extracted:
@@ -1546,7 +2131,12 @@ def get_tool_usage(
                     "Usage sources must return UsageSession instances; "
                     f"received {type(session).__name__}."
                 )
-            sessions.append(_serialize_extracted_session(session))
+            extracted_sessions.append(session)
+
+    sessions = [
+        _serialize_extracted_session(session)
+        for session in _merge_usage_sessions(extracted_sessions)
+    ]
 
     return _filter_usage_data(
         {"tool": result_tool, "sessions": sessions},
