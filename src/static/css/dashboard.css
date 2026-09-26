@@ -1087,6 +1087,12 @@ input:checked + .slider:before {
   cursor: help;
 }
 
+.mixed-badge {
+  background: rgba(139, 92, 246, 0.14);
+  border-color: rgba(139, 92, 246, 0.5);
+  color: #c4b5fd;
+}
+
 /* Cache hit rate pill */
 .hit-rate-pill {
   display: inline-block;
@@ -1196,6 +1202,16 @@ input:checked + .slider:before {
 
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.25);
+}
+
+.unpriced-summary-banner {
+  margin: 14px 0 0;
+  padding: 10px 14px;
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  border-radius: 10px;
+  background: rgba(245, 158, 11, 0.1);
+  color: #fbbf24;
+  font-size: 12px;
 }
 
 .unpriced-banner {
@@ -1379,8 +1395,9 @@ tr.unpriced-row {
   background: rgba(99, 102, 241, 0.08);
 }
 
-.heatmap-cell:hover {
-  outline: 1px solid rgba(255, 255, 255, 0.45);
+.heatmap-cell:hover,
+.heatmap-cell:focus-visible {
+  outline: 1px solid rgba(255, 255, 255, 0.65);
   outline-offset: 0;
 }
 
@@ -1406,6 +1423,12 @@ select:focus-visible,
 input:focus-visible,
 summary:focus-visible,
 .details-tab:focus-visible {
+  outline: 2px solid #a5b4fc;
+  outline-offset: 2px;
+}
+
+.table-responsive:focus-visible,
+.heatmap-grid:focus-visible {
   outline: 2px solid #a5b4fc;
   outline-offset: 2px;
 }

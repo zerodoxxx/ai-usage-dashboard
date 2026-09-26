@@ -174,6 +174,7 @@
           <div id="sparkline-sessions" class="metric-sparkline" aria-hidden="true"></div>
         </div>
       </div>
+      <div id="unpriced-summary-banner" class="unpriced-summary-banner" role="status" aria-live="polite" hidden></div>
     </section>
 
     <!-- Charts Section -->
@@ -309,7 +310,7 @@
         </div>
 
         <div id="unpriced-banner" class="unpriced-banner" hidden></div>
-        <div class="table-responsive">
+        <div class="table-responsive" role="region" aria-label="Per-model usage table" tabindex="0">
           <table class="data-table">
             <caption class="visually-hidden">Per-model token usage, cache efficiency, rates, and estimated costs</caption>
             <thead>
@@ -368,7 +369,7 @@
           </div>
         </div>
 
-        <div class="table-responsive">
+        <div class="table-responsive" role="region" aria-label="Tracked sessions table" tabindex="0">
           <table class="data-table">
             <caption class="visually-hidden">Tracked sessions with tool, model, token, cache, cost, and timestamp details</caption>
             <thead>
@@ -438,7 +439,7 @@
                 <div class="insight-subtitle">Highest estimated spend in the selected range</div>
               </div>
             </div>
-            <div class="table-responsive insight-table-wrap">
+            <div class="table-responsive insight-table-wrap" role="region" aria-label="Highest-cost sessions table" tabindex="0">
               <table class="data-table insight-table">
                 <caption class="visually-hidden">Highest-cost sessions in the selected range</caption>
                 <thead>

@@ -50,7 +50,7 @@ AGY stores conversation state differently. It uses:
 - **Conversation summaries DB** (`conversation_summaries.db`) — session titles, step counts, timestamps
 - **Brain transcripts** (`brain/<session-uuid>/.system_generated/logs/transcript.jsonl`) — step-by-step text records
 
-Because AGY doesn't store raw token counts locally (quota is tracked server-side by Google), **token counts are estimated** using a standard heuristic:
+Because transcript-based AGY sessions don't store raw token counts locally (quota is tracked server-side by Google), **their token counts are estimated** using a standard heuristic. When the optional `token_usage.db` is present, its exact local token records are marked reported instead:
 
 ```
 input_tokens  ≈ total_input_chars  // 4
@@ -59,7 +59,7 @@ output_tokens ≈ (output_chars + thinking_chars) // 4
 
 For multi-turn sessions (where prompt caching is very effective), a **45% cache hit rate** is assumed for input tokens. This is a conservative estimate based on typical coding session patterns. Single-turn sessions assume **0% cache** (no prior context to reuse). Both rules live in `src/parsers/agy.py` as `_AGY_CACHE_HIT_RATE_MULTI_TURN` with a rationale comment.
 
-Unlike Codex/Claude — which report exact per-call API counts — every AGY session and model row is marked estimated in the API (`estimated: true`, `token_source: "estimated"`, alongside the existing cost provenance `cost_source`/`pricing_status`). The dashboard renders these rows with a `~` prefix and an `est.` badge (hover for the heuristic), plus a footnote under the per-model table.
+Unlike Codex/Claude — which report exact per-call API counts — transcript-based AGY sessions are marked estimated in the API (`estimated: true`, `token_source: "estimated"`); `token_usage.db` sessions carry explicit reported provenance. A model containing both sources is marked `mixed`. The dashboard renders approximate rows with a `~` prefix and a provenance badge, plus a footnote under the per-model table.
 
 ### 3. Claude Code (`~/.claude/`)
 

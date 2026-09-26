@@ -1038,7 +1038,7 @@ def _build_usage_data(
     models_map: dict[tuple[str, str], dict[str, Any]] = {}
     model_statuses: dict[tuple[str, str], set[str]] = defaultdict(set)
     model_token_sources: dict[tuple[str, str], set[str]] = defaultdict(set)
-    model_reported_costs: set[tuple[str, str]] = set()
+    model_cost_sources: dict[tuple[str, str], set[str]] = defaultdict(set)
     for session_index, session in enumerate(sessions_combined):
         session_key = f"{session.get('tool', '')}:{session.get('id', session_index)}"
         session_token_source = str(
@@ -1058,6 +1058,12 @@ def _build_usage_data(
             cache_write = int(contribution["cache_write"])
             total_input = uncached_input + cached_input + cache_write
             cost = contribution["cost"]
+            if cost.get("reported"):
+                contribution_cost_source = "reported"
+            elif resolved.status == "known":
+                contribution_cost_source = "estimated"
+            else:
+                contribution_cost_source = "unavailable"
             model = models_map.setdefault(model_key, {
                 "model": canonical_model,
                 "canonical_model": canonical_model,
@@ -1091,8 +1097,7 @@ def _build_usage_data(
             model["est_cost_cached_usd"] += float(cost["cost_cached_usd"])
             model["est_cost_uncached_usd"] += float(cost["cost_uncached_usd"])
             model["est_savings_usd"] += float(cost["savings_usd"])
-            if cost.get("reported"):
-                model_reported_costs.add(model_key)
+            model_cost_sources[model_key].add(contribution_cost_source)
             model_statuses[model_key].add(resolved.status)
             model_token_sources[model_key].add(session_token_source)
 
@@ -1115,15 +1120,22 @@ def _build_usage_data(
         model["est_cost_uncached_usd"] = round(float(model["est_cost_uncached_usd"]), 6)
         model["est_savings_usd"] = round(float(model["est_savings_usd"]), 6)
         statuses = model_statuses[model_key]
-        reported = model_key in model_reported_costs
-        priced = reported or (bool(statuses) and all(status == "known" for status in statuses))
-        unpriced = not priced
-        if unpriced:
+        cost_sources = model_cost_sources[model_key]
+        has_reported = "reported" in cost_sources
+        has_estimated = "estimated" in cost_sources
+        has_unavailable = "unavailable" in cost_sources
+        priced = not has_unavailable
+        unpriced = has_unavailable
+        if unpriced and not (has_reported or has_estimated):
             model["est_cost_cached_usd"] = 0.0
             model["est_cost_uncached_usd"] = 0.0
             model["est_savings_usd"] = 0.0
-        if reported:
+        if has_reported and (has_estimated or has_unavailable):
+            pricing_status = "mixed"
+        elif has_reported:
             pricing_status = "reported"
+        elif has_estimated:
+            pricing_status = "known"
         elif "ambiguous" in statuses:
             pricing_status = "ambiguous"
         elif "unpriced" in statuses:
@@ -1131,8 +1143,15 @@ def _build_usage_data(
         elif "unknown" in statuses:
             pricing_status = "unknown"
         else:
-            pricing_status = "known"
+            pricing_status = "unavailable"
         model["pricing_status"] = pricing_status
+        model["cost_source"] = (
+            "mixed" if has_reported and (has_estimated or has_unavailable)
+            else "reported" if has_reported
+            else "estimated" if has_estimated
+            else "unavailable"
+        )
+        model["cost_available"] = not has_unavailable
         model["priced"] = priced
         model["unpriced"] = unpriced
         token_sources = model_token_sources[model_key]
@@ -1342,6 +1361,7 @@ def _build_usage_data(
     cost_cached = round(sum(float(s.get("cost_cached_usd") or 0.0) for s in sessions_combined), 6)
     cost_uncached = round(sum(float(s.get("cost_uncached_usd") or 0.0) for s in sessions_combined), 6)
     savings = round(sum(float(s.get("savings_usd") or 0.0) for s in sessions_combined), 6)
+    unpriced_count = sum(1 for m in models_list if m.get("unpriced"))
 
     summary = {
         "total_tokens": total_tokens,
@@ -1358,7 +1378,8 @@ def _build_usage_data(
         "cache_hit_rate": round((cached_input / (uncached_input + cached_input) * 100.0), 2) if uncached_input + cached_input > 0 else 0.0,
         "session_count": len(sessions_combined),
         "call_count": sum(int(s.get("call_count") or 0) for s in sessions_combined),
-        "unpriced_model_count": sum(1 for m in models_list if m.get("unpriced")),
+        "unpriced_model_count": unpriced_count,
+        "cost_complete": unpriced_count == 0,
         "unpriced_models": sorted(
             str(m.get("model") or "unknown") for m in models_list if m.get("unpriced")
         ),
@@ -1546,6 +1567,9 @@ def _build_analytics(
             "cost_cached_usd": round(float(session.get("cost_cached_usd") or 0.0), 6),
             "estimated": bool(session.get("estimated")),
             "token_source": str(session.get("token_source") or ("estimated" if session.get("estimated") else "reported")),
+            "pricing_status": str(session.get("pricing_status") or session.get("cost_source") or "unknown"),
+            "cost_source": str(session.get("cost_source") or session.get("pricing_status") or "unknown"),
+            "cost_available": session.get("cost_available") is not False,
             "activity_at": str(
                 session.get("activity_at")
                 or session.get("created_at")
@@ -1704,7 +1728,8 @@ def _sum_token_usage(usages: list[TokenUsage]) -> TokenUsage:
 def _sum_event_component_usage(events: list[UsageEvent]) -> TokenUsage:
     """Aggregate event components without trusting reconciled event totals."""
     aggregate = _sum_token_usage([event.usage for event in events])
-    aggregate.total_tokens = aggregate.total_input + aggregate.output_tokens
+    component_total = aggregate.total_input + aggregate.output_tokens
+    aggregate.total_tokens = component_total or sum(event.usage.total_tokens for event in events)
     return aggregate
 
 
@@ -1965,10 +1990,17 @@ def _serialize_extracted_session(session: UsageSession) -> dict[str, Any]:
     """
     _refresh_estimated_session_cost(session)
     serialized = session.to_legacy_dict(include_events=True)
+    component_total = int(session.usage.total_input + session.usage.output_tokens)
+    reported_total = int(session.usage.total_tokens)
+    serialized["total_tokens"] = component_total or reported_total
+    if component_total and component_total != reported_total:
+        serialized["reported_total_tokens"] = reported_total
     estimated = bool(session.metadata.get("estimated"))
     token_source = str(session.metadata.get("token_source") or ("estimated" if estimated else "reported"))
     serialized["estimated"] = estimated
     serialized["token_source"] = token_source
+    serialized["cost_available"] = session.cost is not None
+    serialized["cost_source"] = session.cost.source if session.cost is not None else "unavailable"
     if session.cost is not None:
         serialized["pricing_status"] = session.cost.source
         return serialized

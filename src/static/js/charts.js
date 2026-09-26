@@ -361,7 +361,14 @@
     if (!canvas) return;
 
     const list = (Array.isArray(models) ? models : [])
-      .filter((m) => m && typeof m === 'object' && Number(m.total_tokens || 0) > 0)
+      .filter((m) => (
+        m
+        && typeof m === 'object'
+        && Number(m.total_tokens || 0) > 0
+        && m.cost_available !== false
+        && m.unpriced !== true
+        && m.priced !== false
+      ))
       .sort((a, b) => Number(b.total_tokens || 0) - Number(a.total_tokens || 0))
       .slice(0, 8);
 
@@ -551,12 +558,12 @@
     const maxVal = useTokens ? maxTokens : maxCalls;
 
     const hourHeaders = Array.from({ length: 24 }, (_, hour) => (
-      `<div class="heatmap-hour">${String(hour).padStart(2, '0')}</div>`
+      `<div class="heatmap-hour" role="columnheader" aria-label="Hour ${String(hour).padStart(2, '0')}">${String(hour).padStart(2, '0')}</div>`
     )).join('');
 
-    let body = `<div class="heatmap-corner"></div>${hourHeaders}`;
+    let body = `<div class="heatmap-corner" role="columnheader" aria-label="Weekday"></div>${hourHeaders}`;
     WEEKDAY_LABELS.forEach((label, day) => {
-      body += `<div class="heatmap-weekday">${label}</div>`;
+      body += `<div class="heatmap-weekday" role="rowheader">${label}</div>`;
       for (let hour = 0; hour < 24; hour += 1) {
         const cell = grid[day][hour];
         const value = useTokens ? cell.total_tokens : cell.call_count;
@@ -564,13 +571,13 @@
         const alpha = (0.08 + t * 0.87).toFixed(3);
         const weekdayLabel = cell.weekday_label || label;
         const title = heatmapCellTitle(weekdayLabel, hour, cell);
-        body += `<div class="heatmap-cell" style="background:rgba(99,102,241,${alpha})" title="${escapeHtml(title)}"></div>`;
+        body += `<div class="heatmap-cell" role="gridcell" tabindex="0" aria-label="${escapeHtml(title)}" style="background:rgba(99,102,241,${alpha})" title="${escapeHtml(title)}"></div>`;
       }
     });
 
     container.innerHTML = `
       <div class="heatmap-scroll">
-        <div class="heatmap-grid" role="img" aria-label="Weekday by hour activity heatmap">${body}</div>
+        <div class="heatmap-grid" role="grid" aria-label="Weekday by hour activity heatmap" aria-rowcount="8" aria-colcount="25">${body}</div>
       </div>
       <div class="heatmap-legend">
         <span>Low</span>

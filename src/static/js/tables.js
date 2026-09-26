@@ -122,6 +122,9 @@
       const unpricedPill = isUnpricedRow
         ? ` <span class="unpriced-pill" title="${escapeHtml(unpricedTitle)}">unpriced</span>`
         : '';
+      const mixedCostPill = m.pricing_status === 'mixed'
+        ? ' <span class="mixed-badge" title="Some cost contributions are reported and others are estimated">mixed cost</span>'
+        : '';
       const costTitle = isUnpricedRow ? ` title="${escapeHtml(unpricedTitle)}"` : tokTitle;
       const unavailableCost = `<strong class="cost-unavailable" title="${escapeHtml(unpricedTitle)}" aria-label="Unavailable; no catalog rate">—</strong>`;
       const cachedCost = isUnpricedRow ? unavailableCost : `<strong>${usd(m.est_cost_cached_usd)}</strong>`;
@@ -137,7 +140,7 @@
         <tr class="${isUnpricedRow ? 'unpriced-row' : ''}">
           <td>
             <strong>${escapeHtml(modelName)}</strong>
-            <span class="provider-badge ${badge.className}" style="margin-left: 8px;">${badge.text}</span>${estBadge}${unpricedPill}
+            <span class="provider-badge ${badge.className}" style="margin-left: 8px;">${badge.text}</span>${estBadge}${unpricedPill}${mixedCostPill}
           </td>
           <td class="cell-mono cell-right"${tokTitle}>${tok(m.uncached_input)}</td>
           <td class="cell-mono cell-right"${tokTitle}>${tok(m.cached_input)}</td>
@@ -205,8 +208,18 @@
       'Cost (USD)',
       'Date / Time',
       'Token Source',
+      'Pricing Status',
+      'Cost Available',
     ];
-    const rows = sessions.map((session) => [
+    const rows = sessions.map((session) => {
+      const pricingStatus = String(session.pricing_status || session.cost_source || '').toLowerCase();
+      const costAvailable = (
+        session.cost_available === true
+        || (session.cost_available !== false
+          && session.cost_cached_usd !== undefined
+          && !['unknown', 'unpriced', 'ambiguous'].includes(pricingStatus))
+      );
+      return [
       csvText(session.id || ''),
       csvText(session.title || 'Untitled Session'),
       csvText(session.tool || ''),
@@ -214,13 +227,16 @@
       Number(session.call_count || 0),
       Number(session.total_tokens || 0),
       Number(session.cache_hit_rate || 0).toFixed(2),
-      Number(session.cost_cached_usd || 0).toFixed(6),
+      costAvailable ? Number(session.cost_cached_usd || 0).toFixed(6) : 'N/A',
       csvText(formatDateTime(
         session.activity_at || session.created_at || session.start_time,
         timezone,
       )),
       tokenProvenance(session),
-    ]);
+      csvText(session.pricing_status || session.cost_source || 'unknown'),
+      costAvailable ? 'yes' : 'no',
+      ];
+    });
     const csv = `\uFEFF${[header, ...rows].map((row) => row.map(csvCell).join(',')).join('\r\n')}\r\n`;
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
     const urlApi = window.URL || URL;
@@ -300,8 +316,12 @@
       const idStr = String(s.id || '');
       const modelStr = String(s.model || 'unknown');
       const costStatus = String(s.pricing_status || s.cost_source || '').toLowerCase();
-      const costAvailable = s.cost_available !== false
-        && !['unknown', 'unpriced', 'ambiguous'].includes(costStatus);
+      const costAvailable = (
+        s.cost_available === true
+        || (s.cost_available !== false
+          && s.cost_cached_usd !== undefined
+          && !['unknown', 'unpriced', 'ambiguous'].includes(costStatus))
+      );
       const costTitle = costAvailable
         ? (est ? ` title="${escapeHtml(EST_TOOLTIP)}"` : '')
         : ' title="Cost unavailable: no catalog rate" aria-label="Cost unavailable"';
@@ -319,14 +339,14 @@
             <div class="text-muted" style="font-size: 11px; font-family: var(--font-mono);">${escapeHtml(idStr)}</div>
           </td>
           <td>
-            <span class="provider-badge ${badge.className}">${badge.text}</span>${estBadge}
+            <span class="provider-badge ${badge.className}">${badge.text}</span>${estBadge}${unpricedBadge}
           </td>
           <td class="cell-mono">${escapeHtml(modelStr)}</td>
           <td class="cell-mono cell-right"${tokTitle}><strong>${tokPrefix}${(s.total_tokens || 0).toLocaleString()}</strong></td>
           <td class="cell-right">
             <span class="hit-rate-pill ${hitRateClass}">${hitRate.toFixed(1)}%</span>
           </td>
-          <td class="cell-mono cell-right text-success"${tokTitle}>${tokPrefix}$${(s.cost_cached_usd || 0).toFixed(4)}</td>
+          <td class="cell-mono cell-right ${costAvailable ? 'text-success' : 'text-muted'}"${costTitle}>${costText}</td>
           <td class="cell-mono cell-right text-muted">${dateStr}</td>
         </tr>
       `;

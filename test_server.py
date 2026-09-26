@@ -126,6 +126,7 @@ def main() -> None:
     assert "models-table-body" in html
     assert "time-range-select" in html
     assert "export-sessions-btn" in html
+    assert "unpriced-summary-banner" in html
     assert "Projected 30 Day Cost" in html
     assert "Projected Monthly Cost" not in html
     assert "/static/js/charts.js?v=" in html

@@ -1,6 +1,6 @@
 # AI Tools Usage & Cost Visualizer
 
-A local real-time dashboard that visualizes token usage and API inference costs for **OpenAI Codex**, **Claude Code**, and **Google Antigravity (AGY)** — directly from your filesystem, no external connections needed.
+A local real-time dashboard that visualizes token usage and API inference costs for **OpenAI Codex**, **Claude Code**, and **Google Antigravity (AGY)** — directly from your filesystem, with no API keys or telemetry uploads.
 
 ## Features
 
@@ -14,6 +14,7 @@ A local real-time dashboard that visualizes token usage and API inference costs 
 - ⚡ **Fresh live polling**: source files are reparsed for each refresh, with parallel all-tool parsing
 - 🔎 **Session search** — filter across titles, models, and session IDs
 - ⬇️ **CSV export** — download the sessions in the selected range and search filter
+- ⚠️ **Cost provenance** — mixed, estimated, reported, and unpriced usage is surfaced explicitly
 
 ## Quickstart
 

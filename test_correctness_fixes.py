@@ -236,6 +236,55 @@ def test_aggregate_cache_write_remainder_is_priced_end_to_end() -> None:
     assert float(session.cost.uncached_usd) == expected["cost_uncached_usd"]
 
 
+def test_serialized_totals_reconcile_components_when_provider_total_is_lower() -> None:
+    from src.parsers.aggregator import get_tool_usage
+    from src.parsers.source_registry import SourceRegistry
+
+    usage = TokenUsage.from_legacy_dict(
+        {
+            "input_tokens": 100,
+            "cached_input_tokens": 0,
+            "cache_write_tokens": 50,
+            "output_tokens": 10,
+            "total_tokens": 110,
+        },
+        preserve_total=True,
+    )
+    event = UsageEvent.from_legacy_dict({
+        "timestamp": "2026-09-18T10:00:00+00:00",
+        "model": "gpt-5.6-luna",
+        "input_tokens": 100,
+        "cached_input_tokens": 0,
+        "cache_write_tokens": 50,
+        "output_tokens": 10,
+        "total_tokens": 110,
+    })
+
+    class ComponentTotalSource:
+        key = "component-total-source"
+        aliases = ()
+        provider = "codex"
+
+        def extract_sessions(self, root=None):
+            return [UsageSession(
+                id="component-total",
+                tool=self.key,
+                provider=self.provider,
+                model="gpt-5.6-luna",
+                created_at=datetime(2026, 9, 18, tzinfo=timezone.utc),
+                usage=usage,
+                events=[event],
+            )]
+
+    result = get_tool_usage("all", registry=SourceRegistry((ComponentTotalSource(),)))
+
+    assert result["summary"]["total_tokens"] == 160
+    assert result["models"][0]["total_tokens"] == 160
+    assert result["timeline"][0]["total_tokens"] == 160
+    assert result["sessions"][0]["total_tokens"] == 160
+    assert result["sessions"][0]["reported_total_tokens"] == 110
+
+
 def test_cache_write_fields_round_trip_through_legacy_session_contract() -> None:
     usage = TokenUsage(
         input_tokens=100,
@@ -648,6 +697,9 @@ def test_reported_cost_is_consistent_across_session_models_and_timeline() -> Non
     assert result["sessions"][0]["cost_cached_usd"] == 5.0
     assert result["models"][0]["est_cost_cached_usd"] == 5.0
     assert result["models"][0]["pricing_status"] == "reported"
+    assert result["models"][0]["cost_available"] is True
+    assert result["sessions"][0]["cost_available"] is True
+    assert result["analytics"]["top_sessions"][0]["cost_available"] is True
     assert result["timeline"][0]["cost_cached_usd"] == 5.0
 
 

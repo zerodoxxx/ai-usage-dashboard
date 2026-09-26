@@ -105,6 +105,7 @@
           minute: '2-digit',
           second: '2-digit',
           hour12: false,
+          hourCycle: 'h23',
         }).formatToParts(d);
         const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
         return `${values.year}-${values.month}-${values.day} ${values.hour}:${values.minute}:${values.second}`;

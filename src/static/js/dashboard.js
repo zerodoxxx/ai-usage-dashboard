@@ -217,7 +217,16 @@
     const sessionCount = Number(totals.session_count || 0);
     const savings = Number(totals.savings_usd || 0);
     const callCount = Number(totals.call_count || 0);
+    const unpricedCount = Number(totals.unpriced_model_count || 0);
     const burn = Number(details.projected_30d_usd ?? details.monthly_projection_usd ?? 0);
+
+    if (elements.unpricedSummaryBanner) {
+      const hasUnpriced = Number.isFinite(unpricedCount) && unpricedCount > 0;
+      elements.unpricedSummaryBanner.hidden = !hasUnpriced;
+      elements.unpricedSummaryBanner.textContent = hasUnpriced
+        ? `${unpricedCount.toLocaleString()} model${unpricedCount === 1 ? '' : 's'} lack a usable catalog rate. Spend totals are partial; see the Models tab for details.`
+        : '';
+    }
 
     if (odometers.totalCost) odometers.totalCost.update(Number.isFinite(totalCost) ? totalCost : 0);
     if (odometers.burnRate) odometers.burnRate.update(Number.isFinite(burn) ? burn : 0);
@@ -232,13 +241,17 @@
       if (Number.isFinite(cacheWriteTokens) && cacheWriteTokens > 0) {
         text += ` · ${formatCompactNumber(cacheWriteTokens)} cache-write`;
       }
+      if (unpricedCount > 0) text += ' · partial cost';
       elements.cardSpendSubtext.textContent = text;
     }
     if (elements.cardBurnSubtext) {
       const labelFn = window.DashboardAnalytics && window.DashboardAnalytics.projectionBasisLabel;
-      elements.cardBurnSubtext.textContent = labelFn
+      const projectionLabel = labelFn
         ? labelFn(details.projection_basis)
         : 'Filter daily average × 30';
+      elements.cardBurnSubtext.textContent = unpricedCount > 0
+        ? `${projectionLabel} · partial cost`
+        : projectionLabel;
     }
     if (elements.cardSavingsSubtext) {
       const rate = Number.isFinite(cacheHitRate) ? cacheHitRate : 0;
@@ -505,6 +518,7 @@
     elements.chartHourlyActivityCanvas = document.getElementById('chart-hourly-activity');
     elements.weekdayHeatmap = document.getElementById('weekday-hour-heatmap');
     elements.unpricedBanner = document.getElementById('unpriced-banner');
+    elements.unpricedSummaryBanner = document.getElementById('unpriced-summary-banner');
 
     elements.modelsCountBadge = document.getElementById('models-count-badge');
     elements.pricingStatus = document.getElementById('pricing-status');
