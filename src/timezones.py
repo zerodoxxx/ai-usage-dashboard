@@ -39,7 +39,7 @@ def local_timezone_name() -> str:
         try:
             ZoneInfo(name)
             return name
-        except ZoneInfoNotFoundError:
+        except (ZoneInfoNotFoundError, ValueError):
             pass
     return "UTC"
 

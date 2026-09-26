@@ -93,7 +93,8 @@ def _reconcile_event_totals(events: list["UsageEvent"], target: int) -> None:
 
     remaining = -delta
     for event in reversed(events):
-        reducible = max(0, event.usage.total_tokens)
+        component_total = event.usage.total_input + event.usage.output_tokens
+        reducible = max(0, event.usage.total_tokens - component_total)
         reduction = min(reducible, remaining)
         if reduction:
             event.usage.total_tokens -= reduction

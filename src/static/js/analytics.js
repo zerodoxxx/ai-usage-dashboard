@@ -166,7 +166,7 @@
       const costAvailable = (
         session.cost_available === true
         || (session.cost_available !== false
-          && session.cost_cached_usd !== undefined
+          && session.cost_cached_usd != null
           && !['unknown', 'unpriced', 'ambiguous'].includes(costStatus))
       );
       const costText = costAvailable

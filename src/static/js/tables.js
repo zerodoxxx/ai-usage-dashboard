@@ -187,7 +187,7 @@
   function csvText(value) {
     const text = String(value ?? '');
     // Prevent spreadsheet formula execution for user-controlled titles/IDs.
-    return /^[=+\-@]/.test(text) ? `'${text}` : text;
+    return /^[\s\t]*[=+\-@|%]/.test(text) ? `'${text}` : text;
   }
 
   /**
@@ -216,7 +216,7 @@
       const costAvailable = (
         session.cost_available === true
         || (session.cost_available !== false
-          && session.cost_cached_usd !== undefined
+          && session.cost_cached_usd != null
           && !['unknown', 'unpriced', 'ambiguous'].includes(pricingStatus))
       );
       return [
@@ -319,7 +319,7 @@
       const costAvailable = (
         s.cost_available === true
         || (s.cost_available !== false
-          && s.cost_cached_usd !== undefined
+          && s.cost_cached_usd != null
           && !['unknown', 'unpriced', 'ambiguous'].includes(costStatus))
       );
       const costTitle = costAvailable

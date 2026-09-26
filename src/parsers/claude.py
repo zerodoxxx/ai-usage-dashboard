@@ -59,7 +59,7 @@ def _cache_creation_components(usage: dict[str, Any]) -> tuple[int, int, int]:
     writes_1h = _as_int(nested.get("ephemeral_1h_input_tokens"))
     if direct and not (writes_5m or writes_1h):
         writes_5m = direct
-    return writes_5m + writes_1h, writes_5m, writes_1h
+    return max(direct, writes_5m + writes_1h), writes_5m, writes_1h
 
 
 def _usage_event(

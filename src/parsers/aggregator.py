@@ -1772,7 +1772,10 @@ def _subtract_component_usage(total: TokenUsage, represented: TokenUsage) -> Tok
         cached_input_tokens=cached_input,
         output_tokens=output_tokens,
         reasoning_output_tokens=reasoning_output,
-        total_tokens=input_tokens + cache_write + output_tokens,
+        total_tokens=max(
+            input_tokens + cache_write + output_tokens,
+            max(0, total.total_tokens - represented.total_tokens),
+        ),
         cache_read_tokens=max(0, (total.cache_read_tokens or 0) - (represented.cache_read_tokens or 0)),
         cache_write_tokens=cache_write,
         cache_write_5m_tokens=cache_write_5m,
@@ -1789,6 +1792,7 @@ def _has_component_usage(usage: TokenUsage) -> bool:
         usage.output_tokens,
         usage.reasoning_output_tokens,
         usage.cache_write_tokens,
+        usage.total_tokens,
     ))
 
 

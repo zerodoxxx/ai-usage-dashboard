@@ -279,7 +279,7 @@ def to_utc_datetime(dt: Any) -> datetime | None:
                 raw = raw[:-1] + "+00:00"
             try:
                 parsed_dt = datetime.fromisoformat(raw)
-            except Exception:
+            except (TypeError, ValueError, OverflowError):
                 return None
     else:
         return None
@@ -289,7 +289,7 @@ def to_utc_datetime(dt: Any) -> datetime | None:
 
     try:
         return as_utc(parsed_dt)
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         return None
 
 

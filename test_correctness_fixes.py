@@ -1060,3 +1060,96 @@ def test_activity_buckets_keep_cache_writes_separate_from_output() -> None:
     assert row["output"] == 7
     assert row["total_input"] == 125
     assert row["total_tokens"] == 132
+
+
+def test_local_timezone_name_invalid_or_path_fallback(monkeypatch) -> None:
+    from src.timezones import local_timezone_name
+
+    monkeypatch.setenv("AI_USAGE_TIMEZONE", "/etc/localtime")
+    assert local_timezone_name() == "UTC"
+
+    monkeypatch.setenv("AI_USAGE_TIMEZONE", "/usr/share/zoneinfo/UTC")
+    assert local_timezone_name() == "UTC"
+
+    monkeypatch.setenv("AI_USAGE_TIMEZONE", "Invalid/Timezone_Name")
+    assert local_timezone_name() == "UTC"
+
+    monkeypatch.delenv("AI_USAGE_TIMEZONE", raising=False)
+    monkeypatch.setenv("TZ", "/etc/localtime")
+    assert local_timezone_name() == "UTC"
+
+
+def test_reconcile_event_totals_preserves_component_floor() -> None:
+    from src.parsers.contracts import _reconcile_event_totals
+
+    event = UsageEvent(
+        timestamp=datetime(2026, 9, 18, 10, tzinfo=timezone.utc),
+        usage=TokenUsage(
+            input_tokens=100,
+            cache_write_tokens=20,
+            output_tokens=30,
+            total_tokens=200,
+        ),
+    )
+    # Component floor = total_input (100 + 20 = 120) + output_tokens (30) = 150.
+    # Current total_tokens = 200. Target session total = 100 (delta = -100).
+    # Event total_tokens should only be reduced down to 150 (the component floor),
+    # not below it to 100.
+    _reconcile_event_totals([event], target=100)
+    assert event.usage.total_tokens == 150
+
+
+def test_merge_usage_sessions_preserves_total_only_residual() -> None:
+    from src.parsers.aggregator import _merge_usage_sessions
+
+    event = UsageEvent(
+        event_id="call-1",
+        timestamp=datetime(2026, 9, 18, 10, tzinfo=timezone.utc),
+        usage=TokenUsage(input_tokens=100, output_tokens=20, total_tokens=120),
+    )
+    session1 = UsageSession(
+        id="session-residual",
+        tool="codex",
+        provider="codex",
+        usage=TokenUsage(input_tokens=100, output_tokens=20, total_tokens=120),
+        events=[event],
+        call_count=1,
+    )
+    session2 = UsageSession(
+        id="session-residual",
+        tool="codex",
+        provider="codex",
+        usage=TokenUsage(total_tokens=200, preserve_total=True),
+        events=[],
+        call_count=1,
+    )
+
+    merged = _merge_usage_sessions([session1, session2])
+    assert len(merged) == 1
+    assert merged[0].usage.total_tokens == 200
+
+
+def test_cache_creation_components_future_ttl_duration() -> None:
+    from src.parsers.claude import _cache_creation_components
+
+    usage = {
+        "cache_creation_input_tokens": 1500,
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": 500,
+            "ephemeral_1h_input_tokens": 400,
+        },
+    }
+    total_write, writes_5m, writes_1h = _cache_creation_components(usage)
+    assert total_write == 1500
+    assert writes_5m == 500
+    assert writes_1h == 400
+
+
+def test_to_utc_datetime_narrowed_exceptions() -> None:
+    from src.pricing import to_utc_datetime
+
+    assert to_utc_datetime(None) is None
+    assert to_utc_datetime("not-a-date") is None
+    assert to_utc_datetime(1e30) is None
+    dt = to_utc_datetime("2026-09-18T10:00:00Z")
+    assert dt == datetime(2026, 9, 18, 10, 0, tzinfo=timezone.utc)
