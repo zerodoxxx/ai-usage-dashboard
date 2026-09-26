@@ -419,6 +419,7 @@
         window.DashboardTables.renderSessionsTable(state.allSessions, state.searchQuery, {
           tbody: elements.sessionsTableBody,
           countBadge: elements.sessionsCountBadge,
+          timezone: state.currentUsageData?.timezone || '',
         });
       });
     }

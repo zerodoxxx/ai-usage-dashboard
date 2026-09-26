@@ -1725,6 +1725,22 @@ def _sum_token_usage(usages: list[TokenUsage]) -> TokenUsage:
     return aggregate
 
 
+def _max_token_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:
+    """Merge two cumulative usage snapshots without adding duplicate usage."""
+    return TokenUsage(
+        input_tokens=max(left.input_tokens, right.input_tokens),
+        cached_input_tokens=max(left.cached_input_tokens, right.cached_input_tokens),
+        output_tokens=max(left.output_tokens, right.output_tokens),
+        reasoning_output_tokens=max(left.reasoning_output_tokens, right.reasoning_output_tokens),
+        total_tokens=max(left.total_tokens, right.total_tokens),
+        cache_read_tokens=max(left.cache_read_tokens or 0, right.cache_read_tokens or 0),
+        cache_write_tokens=max(left.cache_write_tokens, right.cache_write_tokens),
+        cache_write_5m_tokens=max(left.cache_write_5m_tokens, right.cache_write_5m_tokens),
+        cache_write_1h_tokens=max(left.cache_write_1h_tokens, right.cache_write_1h_tokens),
+        preserve_total=True,
+    )
+
+
 def _sum_event_component_usage(events: list[UsageEvent]) -> TokenUsage:
     """Aggregate event components without trusting reconciled event totals."""
     aggregate = _sum_token_usage([event.usage for event in events])
@@ -1864,8 +1880,12 @@ def _merge_usage_sessions(sessions: list[UsageSession]) -> list[UsageSession]:
 
         # A fully duplicate segment contributes no tokens or calls again. A
         # source record with no events can still contribute an authoritative
-        # session-level residual, so only retain the latter case.
+        # session-level residual. Duplicate-event snapshots can also carry
+        # newer aggregate totals, which are cumulative and must be reconciled
+        # without counting their events again.
         if not new_events and session.events:
+            current.usage = _max_token_usage(current.usage, session.usage)
+            current.call_count = max(current.call_count, session.call_count)
             continue
 
         if current_is_reported and not incoming_is_reported:
