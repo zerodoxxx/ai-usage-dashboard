@@ -128,9 +128,6 @@
       const data = result.data;
       state.currentUsageData = data;
       state.allSessions = Array.isArray(data.sessions) ? data.sessions : [];
-      if (elements.exportSessionsBtn) {
-        elements.exportSessionsBtn.disabled = state.customPending || state.allSessions.length === 0;
-      }
 
       // Update UI components
       updateMetricCards(data.summary || {}, data.analytics || {});
@@ -291,9 +288,6 @@
   /** Mark the visible custom range as a draft, or clear the draft marker. */
   function setCustomPending(pending) {
     state.customPending = Boolean(pending);
-    if (elements.exportSessionsBtn) {
-      elements.exportSessionsBtn.disabled = state.customPending || state.allSessions.length === 0;
-    }
   }
 
   /** Show that a blank custom end date means the range ends at the current time. */
@@ -391,27 +385,6 @@
       });
     }
 
-    // Export the active session set (including the active search filter)
-    if (elements.exportSessionsBtn) {
-      elements.exportSessionsBtn.addEventListener('click', () => {
-        const rangePart = state.currentTimeRange === 'custom'
-          ? `${state.customStart || 'start'}_to_${state.customEnd || 'now'}`
-          : state.currentTimeRange;
-        const filename = `ai-usage-${state.currentTool}-${rangePart}.csv`
-          .replace(/[^a-z0-9._-]+/gi, '-');
-        const exported = window.DashboardTables.exportSessionsCsv(
-          state.allSessions,
-          state.searchQuery,
-          filename,
-          state.currentUsageData?.timezone || '',
-        );
-        window.DashboardUtils.showToast(
-          exported > 0 ? `Exported ${exported.toLocaleString()} session${exported === 1 ? '' : 's'}.` : 'No sessions to export.',
-          'info',
-        );
-      });
-    }
-
     // Sessions search input
     if (elements.sessionsSearch) {
       elements.sessionsSearch.addEventListener('input', (e) => {
@@ -486,7 +459,6 @@
     elements.autoRefreshToggle = document.getElementById('auto-refresh-toggle');
     elements.refreshInterval = document.getElementById('refresh-interval');
     elements.refreshBtn = document.getElementById('refresh-btn');
-    elements.exportSessionsBtn = document.getElementById('export-sessions-btn');
     elements.lastSyncedBadge = document.getElementById('last-synced-badge');
 
     elements.cardSpendSubtext = document.getElementById('card-spend-subtext');

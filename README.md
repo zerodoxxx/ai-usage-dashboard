@@ -13,7 +13,6 @@ A local real-time dashboard that visualizes token usage and API inference costs 
 - 📊 **Analytics snapshot**: API calls, averages, peak spend day, top-cost sessions, period comparison, and a 30-day cost projection from the selected filter's daily average
 - ⚡ **Fresh live polling**: source files are reparsed for each refresh, with parallel all-tool parsing
 - 🔎 **Session search** — filter across titles, models, and session IDs
-- ⬇️ **CSV export** — download the sessions in the selected range and search filter
 - ⚠️ **Cost provenance** — mixed, estimated, reported, and unpriced usage is surfaced explicitly
 
 ## Quickstart
@@ -92,7 +91,7 @@ src/
 │   ├── utils.js       # Formatting, provenance, and toast helpers
 │   ├── api.js         # Fetch/cancellation and pricing metadata
 │   ├── charts.js      # Chart.js visualizations and heatmap
-│   ├── tables.js      # Model/session tables and CSV export
+│   ├── tables.js      # Model/session tables and search filtering
 │   ├── analytics.js   # Insights renderer
 │   └── dashboard.js   # UI orchestrator
 └── templates/

@@ -310,12 +310,6 @@ input:checked + .slider:before {
   transition: transform 0.3s ease;
 }
 
-.export-icon {
-  width: 14px;
-  height: 14px;
-  flex-shrink: 0;
-}
-
 .refresh-icon.spin {
   animation: spin 0.8s linear infinite;
 }

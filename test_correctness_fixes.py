@@ -1270,8 +1270,3 @@ def test_timezone_name_from_system_strips_leading_colon(monkeypatch) -> None:
     monkeypatch.setenv("AI_USAGE_TIMEZONE", ":UTC")
     assert _timezone_name_from_system() == "UTC"
     assert local_timezone_name() == "UTC"
-
-
-def test_csv_text_formula_injection_guard() -> None:
-    tables_js = (Path(__file__).parent / "src" / "static" / "js" / "tables.js").read_text(encoding="utf-8")
-    assert r"^[\s\x00-\x1f]*[=+\-@|%]" in tables_js

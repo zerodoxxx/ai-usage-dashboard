@@ -179,79 +179,6 @@
     });
   }
 
-  function csvCell(value) {
-    const text = String(value ?? '');
-    return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-  }
-
-  function csvText(value) {
-    const text = String(value ?? '');
-    // Prevent spreadsheet formula execution for user-controlled titles/IDs.
-    return /^[\s\x00-\x1f]*[=+\-@|%]/.test(text) ? `'${text}` : text;
-  }
-
-  /**
-   * Download the sessions in the active time range (and active search) as CSV.
-   * @returns {number} number of exported session rows
-   */
-  function exportSessionsCsv(allSessions, searchQuery, filename = 'ai-usage-sessions.csv', timezone = '', doc = document) {
-    const sessions = filterSessions(allSessions, searchQuery);
-    const { formatDateTime, tokenProvenance } = window.DashboardUtils;
-    const header = [
-      'Session ID',
-      'Title',
-      'Tool',
-      'Model',
-      'Call Count',
-      'Total Tokens',
-      'Cache Hit %',
-      'Cost (USD)',
-      'Date / Time',
-      'Token Source',
-      'Pricing Status',
-      'Cost Available',
-    ];
-    const rows = sessions.map((session) => {
-      const pricingStatus = String(session.pricing_status || session.cost_source || '').toLowerCase();
-      const costAvailable = (
-        session.cost_available === true
-        || (session.cost_available !== false
-          && session.cost_cached_usd != null
-          && !['unknown', 'unpriced', 'ambiguous'].includes(pricingStatus))
-      );
-      return [
-      csvText(session.id || ''),
-      csvText(session.title || 'Untitled Session'),
-      csvText(session.tool || ''),
-      csvText(session.model || 'unknown'),
-      Number(session.call_count || 0),
-      Number(session.total_tokens || 0),
-      Number(session.cache_hit_rate || 0).toFixed(2),
-      costAvailable ? Number(session.cost_cached_usd || 0).toFixed(6) : 'N/A',
-      csvText(formatDateTime(
-        session.activity_at || session.created_at || session.start_time,
-        timezone,
-      )),
-      tokenProvenance(session),
-      csvText(session.pricing_status || session.cost_source || 'unknown'),
-      costAvailable ? 'yes' : 'no',
-      ];
-    });
-    const csv = `\uFEFF${[header, ...rows].map((row) => row.map(csvCell).join(',')).join('\r\n')}\r\n`;
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-    const urlApi = window.URL || URL;
-    const url = urlApi.createObjectURL(blob);
-    const link = doc.createElement('a');
-    link.href = url;
-    link.download = String(filename || 'ai-usage-sessions.csv');
-    link.style.display = 'none';
-    doc.body.appendChild(link);
-    link.click();
-    link.remove();
-    window.setTimeout(() => urlApi.revokeObjectURL(url), 0);
-    return rows.length;
-  }
-
   /**
    * Render Recent Sessions Explorer with real-time text search filtering.
    * @param {Array} allSessions
@@ -361,6 +288,5 @@
     normalizeSessionTitle,
     sessionCountLabel,
     filterSessions,
-    exportSessionsCsv,
   };
 })();

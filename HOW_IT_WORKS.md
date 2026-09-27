@@ -171,7 +171,7 @@ Claude 5-minute and 1-hour writes are retained separately and priced at 1.25× a
 3. **Odometers** (`odometer.js`): Each number is broken into digit characters. CSS 3D `translateY` shifts a vertical strip of 0–9 digits to land on the right number. Digits animate with staggered delays and `cubic-bezier(0.2, 0.9, 0.3, 1)` easing — right-to-left, like a real counter.
 4. **Charts** (Chart.js): Token breakdown, daily cost/token/call trend, cost by tool, blended cost per 1M tokens, cache-efficiency trend, hourly activity, and a weekday/hour heatmap
 5. **Auto-refresh:** A configurable `setInterval` (10s / 30s / 60s) re-calls `GET /api/usage`. Each user-initiated action (tool switch, manual refresh) creates a new `AbortController`, cancelling any in-flight request before starting a fresh one.
-6. **Session search and export:** Client-side filtering on `state.allSessions` — no additional server calls. The CSV export applies the same search filter and selected range.
+6. **Session search:** Client-side filtering on `state.allSessions` — no additional server calls.
 7. **Time filtering:** The header time selector requests one of `all`, `month`, `30d`, `7d`, `24h`, or `custom`. The server slices per-call events where available, then rebuilds the summary, model, timeline, session, and analytics results together.
 
 ---
@@ -192,9 +192,9 @@ Claude 5-minute and 1-hour writes are retained separately and priced at 1.25× a
 | `src/static/js/odometer.js` | `RollingOdometer` class — zero-dependency vertical digit animation |
 | `src/static/js/utils.js` | Shared formatting, provenance, escaping, and toast helpers |
 | `src/static/js/api.js` | Usage/pricing requests, cancellation, and cache-busting |
-| `src/static/js/dashboard.js` | Frontend orchestrator: state, polling, filters, and CSV export wiring |
+| `src/static/js/dashboard.js` | Frontend orchestrator: state, polling, and filters |
 | `src/static/js/charts.js` | Chart.js visualizations and activity heatmap |
-| `src/static/js/tables.js` | Model/session tables, search filtering, and CSV serialization |
+| `src/static/js/tables.js` | Model/session tables and search filtering |
 | `src/static/js/analytics.js` | Analytics and period-comparison renderer |
 | `src/static/css/dashboard.css` | Dark-mode styles — frosted glass cards, badge colours, table layout |
 | `src/templates/index.html` | Static HTML scaffold — odometer containers, chart canvases, tables |
