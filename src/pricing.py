@@ -27,6 +27,8 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from src.timezones import as_utc
+
 
 # This is the legacy, provider-less representation consumed by the existing
 # API and frontend. Keep its keys and the three standard rate fields stable.
@@ -132,6 +134,8 @@ class PricingRates:
     output: float
     cache_write: float | None = None
     cache_creation: float | None = None
+    cache_write_5m: float | None = None
+    cache_write_1h: float | None = None
 
     def as_dict(self, *, include_optional: bool = True) -> dict[str, float]:
         """Return serializable rates, omitting unset optional fields."""
@@ -141,6 +145,10 @@ class PricingRates:
                 result["cache_write"] = self.cache_write
             if self.cache_creation is not None:
                 result["cache_creation"] = self.cache_creation
+            if self.cache_write_5m is not None:
+                result["cache_write_5m"] = self.cache_write_5m
+            if self.cache_write_1h is not None:
+                result["cache_write_1h"] = self.cache_write_1h
         return result
 
     @classmethod
@@ -151,6 +159,12 @@ class PricingRates:
             cache_write=_optional_float(rates.get("cache_write", rates.get("cache_write_input"))),
             cache_creation=_optional_float(
                 rates.get("cache_creation", rates.get("cache_creation_input"))
+            ),
+            cache_write_5m=_optional_float(
+                rates.get("cache_write_5m", rates.get("cache_creation_5m"))
+            ),
+            cache_write_1h=_optional_float(
+                rates.get("cache_write_1h", rates.get("cache_creation_1h"))
             ),
         )
 
@@ -265,7 +279,7 @@ def to_utc_datetime(dt: Any) -> datetime | None:
                 raw = raw[:-1] + "+00:00"
             try:
                 parsed_dt = datetime.fromisoformat(raw)
-            except Exception:
+            except (TypeError, ValueError, OverflowError):
                 return None
     else:
         return None
@@ -274,9 +288,8 @@ def to_utc_datetime(dt: Any) -> datetime | None:
         return None
 
     try:
-        # If naive, astimezone(timezone.utc) interprets it as local time and converts to UTC
-        return parsed_dt.astimezone(timezone.utc)
-    except Exception:
+        return as_utc(parsed_dt)
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -334,6 +347,8 @@ class PricingCatalog:
         output: float | None = None,
         cache_write: float | None = None,
         cache_creation: float | None = None,
+        cache_write_5m: float | None = None,
+        cache_write_1h: float | None = None,
         off_peak_rates: PricingRates | Mapping[str, Any] | None = None,
     ) -> PricingEntry:
         """Register a model, including a known model with ``rates=None``.
@@ -346,7 +361,13 @@ class PricingCatalog:
             if any(value is None for value in fields):
                 raise ValueError("uncached_input, cached_input, and output must be supplied together")
             rates = PricingRates(
-                float(uncached_input), float(cached_input), float(output), cache_write, cache_creation
+                float(uncached_input),
+                float(cached_input),
+                float(output),
+                cache_write,
+                cache_creation,
+                cache_write_5m,
+                cache_write_1h,
             )
         parsed = rates if isinstance(rates, PricingRates) or rates is None else PricingRates.from_mapping(rates)
         parsed_off_peak = (
@@ -457,7 +478,12 @@ def _build_catalog() -> PricingCatalog:
             provider = "codex"
         aliases = tuple(alias for alias, target in _ALIASES if target == model)
         if provider == "claude":
-            rates = {**rates, "cache_creation": rates["uncached_input"] * 1.25}
+            rates = {
+                **rates,
+                "cache_creation": rates["uncached_input"] * 1.25,
+                "cache_write_5m": rates["uncached_input"] * 1.25,
+                "cache_write_1h": rates["uncached_input"] * 2.0,
+            }
         off_peak = DEEPSEEK_OFF_PEAK_PRICING.get(model) if provider == "deepseek" else None
         catalog.register(provider, model, rates, aliases=aliases, off_peak_rates=off_peak)
     return catalog
@@ -749,7 +775,17 @@ def _read_pricing_cache(path: Path) -> tuple[dict[str, PricingRates], dict[str, 
             required = ("uncached_input", "cached_input", "output")
             if any(key not in value for key in required):
                 return None
-            numeric_fields = (*required, "cache_write", "cache_write_input", "cache_creation", "cache_creation_input")
+            numeric_fields = (
+                *required,
+                "cache_write",
+                "cache_write_input",
+                "cache_creation",
+                "cache_creation_input",
+                "cache_write_5m",
+                "cache_write_1h",
+                "cache_creation_5m",
+                "cache_creation_1h",
+            )
             if any(
                 key in value and value[key] is not None
                 and (isinstance(value[key], bool) or not isinstance(value[key], (int, float)))
@@ -770,6 +806,11 @@ def _read_pricing_cache(path: Path) -> tuple[dict[str, PricingRates], dict[str, 
                 not math.isfinite(parsed_rates.cache_creation) or parsed_rates.cache_creation < 0
             ):
                 return None
+            for ttl_rate in (parsed_rates.cache_write_5m, parsed_rates.cache_write_1h):
+                if ttl_rate is not None and (
+                    not math.isfinite(ttl_rate) or ttl_rate < 0
+                ):
+                    return None
             rates[model] = parsed_rates
             normalized_model_ids.add(_normalize(model))
         try:
@@ -1020,30 +1061,55 @@ def _token_count(value: int | None) -> int:
 
 
 def _calculate_with_rates(
-    rates: PricingRates, uncached_input: int | None, cached_input: int | None, output: int | None,
-    cache_write: int | None = None, cache_creation: int | None = None,
+    rates: PricingRates,
+    uncached_input: int | None,
+    cached_input: int | None,
+    output: int | None,
+    cache_write: int | None = None,
+    cache_creation: int | None = None,
+    cache_write_5m: int | None = None,
+    cache_write_1h: int | None = None,
 ) -> dict[str, float]:
     u_in, c_in, out = _token_count(uncached_input), _token_count(cached_input), _token_count(output)
-    writes, creations = _token_count(cache_write), _token_count(cache_creation)
+    raw_writes = _token_count(cache_write)
+    raw_creations = _token_count(cache_creation)
+    writes_5m = _token_count(cache_write_5m)
+    writes_1h = _token_count(cache_write_1h)
+    ttl_writes = writes_5m + writes_1h
+
+    # Public callers may pass an aggregate write count together with its TTL
+    # components. Subtract those components before applying generic rates so the
+    # aggregate is not charged twice.
+    generic_writes = max(0, raw_writes - ttl_writes)
+    generic_creations = max(0, raw_creations - ttl_writes)
+    generic_write_rate = rates.cache_write if rates.cache_write is not None else rates.cache_creation
+    generic_creation_rate = rates.cache_creation if rates.cache_creation is not None else rates.cache_write
+    write_5m_rate = rates.cache_write_5m if rates.cache_write_5m is not None else generic_write_rate
+    write_1h_rate = rates.cache_write_1h if rates.cache_write_1h is not None else generic_creation_rate
+    write_cost = generic_writes * (generic_write_rate or 0.0) / 1_000_000.0
+    creation_cost = generic_creations * (generic_creation_rate or 0.0) / 1_000_000.0
+    creation_cost += writes_5m * (write_5m_rate or 0.0) / 1_000_000.0
+    creation_cost += writes_1h * (write_1h_rate or 0.0) / 1_000_000.0
+
     cost_cached = (u_in * rates.uncached_input + c_in * rates.cached_input + out * rates.output) / 1_000_000.0
-    # Providers use both "cache write" and "cache creation" for the same
-    # billing concept. Fall back across the aliases when only one is defined.
-    write_rate = rates.cache_write if rates.cache_write is not None else rates.cache_creation
-    creation_rate = rates.cache_creation if rates.cache_creation is not None else rates.cache_write
-    write_cost = writes * (write_rate or 0.0) / 1_000_000.0
-    creation_cost = creations * (creation_rate or 0.0) / 1_000_000.0
     cost_cached += write_cost + creation_cost
-    cost_uncached = ((u_in + c_in) * rates.uncached_input + out * rates.output) / 1_000_000.0
-    cost_uncached += write_cost + creation_cost
+
+    # The no-cache counterfactual prices every input token at the regular input
+    # rate. Cache-write premiums therefore disappear, and expensive writes can
+    # correctly produce negative net savings.
+    total_input = u_in + c_in + generic_writes + generic_creations + writes_5m + writes_1h
+    cost_uncached = (total_input * rates.uncached_input + out * rates.output) / 1_000_000.0
     return {
-        "cost_cached_usd": round(cost_cached, 6), "cost_uncached_usd": round(cost_uncached, 6),
-        "savings_usd": round(max(0.0, cost_uncached - cost_cached), 6),
+        "cost_cached_usd": round(cost_cached, 6),
+        "cost_uncached_usd": round(cost_uncached, 6),
+        "savings_usd": round(cost_uncached - cost_cached, 6),
     }
 
 
 def calculate_cost(
     model_name: str | None, uncached_input: int | None, cached_input: int | None, output: int | None,
     cache_write: int | None = None, cache_creation: int | None = None, *,
+    cache_write_5m: int | None = None, cache_write_1h: int | None = None,
     provider: str | None = None, timestamp: Any = None, catalog: PricingCatalog | None = None,
 ) -> dict[str, float]:
     """Calculate cost, preserving the original fallback behavior."""
@@ -1051,12 +1117,22 @@ def calculate_cost(
     rates = active_catalog.resolve(model_name, provider, timestamp=timestamp).rates
     if rates is None:
         rates = PricingRates.from_mapping(get_pricing(model_name, provider, timestamp=timestamp))
-    return _calculate_with_rates(rates, uncached_input, cached_input, output, cache_write, cache_creation)
+    return _calculate_with_rates(
+        rates,
+        uncached_input,
+        cached_input,
+        output,
+        cache_write,
+        cache_creation,
+        cache_write_5m,
+        cache_write_1h,
+    )
 
 
 def calculate_cost_strict(
     model_name: str | None, uncached_input: int | None, cached_input: int | None, output: int | None, *,
     provider: str | None = None, cache_write: int | None = None, cache_creation: int | None = None,
+    cache_write_5m: int | None = None, cache_write_1h: int | None = None,
     timestamp: Any = None, catalog: PricingCatalog | None = None,
 ) -> dict[str, Any]:
     """Calculate cost without fallback and include model-resolution status."""
@@ -1066,7 +1142,14 @@ def calculate_cost_strict(
         result.update({"cost_cached_usd": None, "cost_uncached_usd": None, "savings_usd": None})
     else:
         result.update(_calculate_with_rates(
-            resolution.rates, uncached_input, cached_input, output, cache_write, cache_creation
+            resolution.rates,
+            uncached_input,
+            cached_input,
+            output,
+            cache_write,
+            cache_creation,
+            cache_write_5m,
+            cache_write_1h,
         ))
     return result
 

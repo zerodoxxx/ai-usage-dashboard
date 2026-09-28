@@ -148,7 +148,6 @@ gh pr create --title "feat: AI Usage & Cost Visualizer" --body "Initial implemen
 ### P2 — Optional Enhancements
 1. **Custom date range** — user-selected start/end dates beyond the preset time windows
 2. **Claude Cost Tracker integration** — add `src/parsers/claude.py` reading `~/.claude-cost-tracker/usage.db` (schema: session_id, model, input/output/cache tokens, estimated_cost_usd) + 3rd dropdown option
-3. **Export button** — convert `state.allSessions` to CSV blob in `dashboard.js`
 
 ### P3 — Code Quality
 - `dashboard.js` is 1,037 lines — extract `chart-helpers.js`, `analytics-renderer.js`, and `table-renderer.js`

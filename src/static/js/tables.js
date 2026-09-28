@@ -45,7 +45,13 @@
   function renderModelTable(models, ctx) {
     const tbody = ctx && ctx.tbody;
     if (!tbody) return;
-    const { escapeHtml, providerBadge, isEstimatedRow, EST_TOOLTIP } = window.DashboardUtils;
+    const {
+      escapeHtml,
+      providerBadge,
+      tokenProvenance,
+      provenanceLabel,
+      EST_TOOLTIP,
+    } = window.DashboardUtils;
 
     const modelList = Array.isArray(models) ? models : [];
 
@@ -85,11 +91,12 @@
     modelList.forEach((m) => {
       const modelName = String(m.model || 'unknown');
       const badge = providerBadge(m.tool || (/gpt|o1|o3/i.test(modelName) ? 'codex' : 'antigravity'));
-      const est = isEstimatedRow(m);
+      const provenance = tokenProvenance(m);
+      const est = provenance !== 'reported';
       if (est) hasEstimated = true;
-      // "~" prefix + "est." badge mark heuristic counts; title/aria carry the rationale.
+      // "~" prefix + provenance badge mark heuristic or mixed counts.
       const estBadge = est
-        ? ` <span class="est-badge" title="${escapeHtml(EST_TOOLTIP)}" aria-label="Estimated tokens">est.</span>`
+        ? ` <span class="est-badge ${provenance === 'mixed' ? 'mixed-badge' : ''}" title="${escapeHtml(EST_TOOLTIP)}" aria-label="${escapeHtml(provenanceLabel(m))} token provenance">${escapeHtml(provenanceLabel(m))}</span>`
         : '';
       const tok = (v) => (est ? '~' : '') + (v || 0).toLocaleString();
       const usd = (v) => (est ? '~' : '') + '$' + (v || 0).toFixed(4);
@@ -115,17 +122,25 @@
       const unpricedPill = isUnpricedRow
         ? ` <span class="unpriced-pill" title="${escapeHtml(unpricedTitle)}">unpriced</span>`
         : '';
+      const mixedCostPill = m.pricing_status === 'mixed'
+        ? ' <span class="mixed-badge" title="Some cost contributions are reported and others are estimated">mixed cost</span>'
+        : '';
       const costTitle = isUnpricedRow ? ` title="${escapeHtml(unpricedTitle)}"` : tokTitle;
       const unavailableCost = `<strong class="cost-unavailable" title="${escapeHtml(unpricedTitle)}" aria-label="Unavailable; no catalog rate">—</strong>`;
       const cachedCost = isUnpricedRow ? unavailableCost : `<strong>${usd(m.est_cost_cached_usd)}</strong>`;
       const uncachedCost = isUnpricedRow ? unavailableCost : usd(m.est_cost_uncached_usd);
-      const savingsCost = isUnpricedRow ? unavailableCost : `+${usd(m.est_savings_usd)}`;
+      const savingsValue = Number(m.est_savings_usd || 0);
+      const savingsPrefix = savingsValue > 0 ? '+' : '';
+      const savingsClass = savingsValue < 0 ? 'text-negative' : 'text-success';
+      const savingsCost = isUnpricedRow
+        ? unavailableCost
+        : `${savingsPrefix}${usd(savingsValue)}`;
 
       rowsHtml += `
         <tr class="${isUnpricedRow ? 'unpriced-row' : ''}">
           <td>
             <strong>${escapeHtml(modelName)}</strong>
-            <span class="provider-badge ${badge.className}" style="margin-left: 8px;">${badge.text}</span>${estBadge}${unpricedPill}
+            <span class="provider-badge ${badge.className}" style="margin-left: 8px;">${badge.text}</span>${estBadge}${unpricedPill}${mixedCostPill}
           </td>
           <td class="cell-mono cell-right"${tokTitle}>${tok(m.uncached_input)}</td>
           <td class="cell-mono cell-right"${tokTitle}>${tok(m.cached_input)}</td>
@@ -139,7 +154,7 @@
           <td class="cell-mono cell-right text-muted">${ratesStr}</td>
           <td class="cell-mono cell-right"${costTitle}>${cachedCost}</td>
           <td class="cell-mono cell-right text-muted"${costTitle}>${uncachedCost}</td>
-          <td class="cell-mono cell-right ${isUnpricedRow ? 'text-muted' : 'text-success'}"${costTitle}>${savingsCost}</td>
+          <td class="cell-mono cell-right ${isUnpricedRow ? 'text-muted' : savingsClass}"${costTitle}>${savingsCost}</td>
         </tr>
       `;
     });
@@ -149,33 +164,41 @@
     updateUnpricedBanner();
   }
 
+  function filterSessions(allSessions, searchQuery) {
+    const query = String(searchQuery || '').trim().toLowerCase();
+    const sessions = (Array.isArray(allSessions) ? allSessions : []).filter(
+      (session) => session && typeof session === 'object'
+    );
+    if (!query) return sessions;
+    return sessions.filter((session) => {
+      const title = String(session.title || '').toLowerCase();
+      const model = String(session.model || '').toLowerCase();
+      const tool = String(session.tool || '').toLowerCase();
+      const id = String(session.id || '').toLowerCase();
+      return title.includes(query) || model.includes(query) || tool.includes(query) || id.includes(query);
+    });
+  }
+
   /**
    * Render Recent Sessions Explorer with real-time text search filtering.
    * @param {Array} allSessions
    * @param {string} searchQuery
-   * @param {object} ctx { tbody, countBadge }
+   * @param {object} ctx { tbody, countBadge, timezone }
    */
   function renderSessionsTable(allSessions, searchQuery, ctx) {
     const tbody = ctx && ctx.tbody;
     if (!tbody) return;
-    const { escapeHtml, formatDateTime, providerBadge, isEstimatedRow, EST_TOOLTIP } = window.DashboardUtils;
+    const {
+      escapeHtml,
+      formatDateTime,
+      providerBadge,
+      tokenProvenance,
+      provenanceLabel,
+      EST_TOOLTIP,
+    } = window.DashboardUtils;
 
     const query = String(searchQuery || '').trim().toLowerCase();
-    const sessionList = (Array.isArray(allSessions) ? allSessions : []).filter(
-      (s) => s && typeof s === 'object'
-    );
-    let filtered = sessionList;
-
-    if (query) {
-      filtered = sessionList.filter((s) => {
-        if (!s || typeof s !== 'object') return false;
-        const title = String(s.title || '').toLowerCase();
-        const model = String(s.model || '').toLowerCase();
-        const tool = String(s.tool || '').toLowerCase();
-        const id = String(s.id || '').toLowerCase();
-        return title.includes(query) || model.includes(query) || tool.includes(query) || id.includes(query);
-      });
-    }
+    const filtered = filterSessions(allSessions, searchQuery);
 
     if (ctx.countBadge) {
       ctx.countBadge.textContent = sessionCountLabel(
@@ -198,9 +221,10 @@
       if (!s || typeof s !== 'object') return;
       const toolStr = String(s.tool || '');
       const badge = providerBadge(toolStr);
-      const est = isEstimatedRow(s);
+      const provenance = tokenProvenance(s);
+      const est = provenance !== 'reported';
       const estBadge = est
-        ? ` <span class="est-badge" title="${escapeHtml(EST_TOOLTIP)}" aria-label="Estimated tokens">est.</span>`
+        ? ` <span class="est-badge ${provenance === 'mixed' ? 'mixed-badge' : ''}" title="${escapeHtml(EST_TOOLTIP)}" aria-label="${escapeHtml(provenanceLabel(s))} token provenance">${escapeHtml(provenanceLabel(s))}</span>`
         : '';
       const tokTitle = est ? ` title="${escapeHtml(EST_TOOLTIP)}"` : '';
       const tokPrefix = est ? '~' : '';
@@ -210,11 +234,30 @@
       if (hitRate >= 75) hitRateClass = 'hit-rate-high';
       else if (hitRate >= 35) hitRateClass = 'hit-rate-mid';
 
-      const dateStr = formatDateTime(s.activity_at || s.created_at || s.start_time);
+      const dateStr = formatDateTime(
+        s.activity_at || s.created_at || s.start_time,
+        ctx.timezone,
+      );
       const titleStr = normalizeSessionTitle(s.title);
       const fullTitle = fullSessionTitle(s.title);
       const idStr = String(s.id || '');
       const modelStr = String(s.model || 'unknown');
+      const costStatus = String(s.pricing_status || s.cost_source || '').toLowerCase();
+      const costAvailable = (
+        s.cost_available === true
+        || (s.cost_available !== false
+          && s.cost_cached_usd != null
+          && !['unknown', 'unpriced', 'ambiguous'].includes(costStatus))
+      );
+      const costTitle = costAvailable
+        ? (est ? ` title="${escapeHtml(EST_TOOLTIP)}"` : '')
+        : ' title="Cost unavailable: no catalog rate" aria-label="Cost unavailable"';
+      const costText = costAvailable
+        ? `${tokPrefix}$${(s.cost_cached_usd || 0).toFixed(4)}`
+        : '<strong class="cost-unavailable" aria-label="Cost unavailable">—</strong>';
+      const unpricedBadge = costAvailable
+        ? ''
+        : ' <span class="unpriced-pill" title="Cost unavailable: no catalog rate">unpriced</span>';
 
       rowsHtml += `
         <tr>
@@ -223,14 +266,14 @@
             <div class="text-muted" style="font-size: 11px; font-family: var(--font-mono);">${escapeHtml(idStr)}</div>
           </td>
           <td>
-            <span class="provider-badge ${badge.className}">${badge.text}</span>${estBadge}
+            <span class="provider-badge ${badge.className}">${badge.text}</span>${estBadge}${unpricedBadge}
           </td>
           <td class="cell-mono">${escapeHtml(modelStr)}</td>
           <td class="cell-mono cell-right"${tokTitle}><strong>${tokPrefix}${(s.total_tokens || 0).toLocaleString()}</strong></td>
           <td class="cell-right">
             <span class="hit-rate-pill ${hitRateClass}">${hitRate.toFixed(1)}%</span>
           </td>
-          <td class="cell-mono cell-right text-success"${tokTitle}>${tokPrefix}$${(s.cost_cached_usd || 0).toFixed(4)}</td>
+          <td class="cell-mono cell-right ${costAvailable ? 'text-success' : 'text-muted'}"${costTitle}>${costText}</td>
           <td class="cell-mono cell-right text-muted">${dateStr}</td>
         </tr>
       `;
@@ -244,5 +287,6 @@
     renderSessionsTable,
     normalizeSessionTitle,
     sessionCountLabel,
+    filterSessions,
   };
 })();
