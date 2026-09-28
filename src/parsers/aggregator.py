@@ -1662,6 +1662,175 @@ def _build_analytics(
     }
 
 
+def _heatmap_rows_from_timeline(
+    timeline: list[dict[str, Any]],
+    start_day: date,
+    end_day: date,
+) -> list[dict[str, Any]]:
+    """Select an exact local-date window from an already-built daily timeline."""
+    rows_by_date = {
+        str(row.get("date")): row
+        for row in timeline
+        if isinstance(row, dict) and row.get("date")
+    }
+    rows: list[dict[str, Any]] = []
+    for day in _iter_dates(start_day, end_day):
+        date_key = day.isoformat()
+        existing = rows_by_date.get(date_key)
+        rows.append(
+            _round_cost_fields(dict(existing))
+            if existing is not None
+            else _blank_day_row(date_key)
+        )
+    return rows
+
+
+def _build_heatmap_daily(
+    sessions: list[dict[str, Any]],
+    start_day: date,
+    end_day: date,
+    local_tz,
+    reference_now: datetime,
+) -> list[dict[str, Any]]:
+    """Aggregate only daily heatmap metrics for source sessions in the date window."""
+    rows = {
+        day.isoformat(): _blank_day_row(day.isoformat())
+        for day in _iter_dates(start_day, end_day)
+    }
+    session_ids: dict[str, set[str]] = defaultdict(set)
+
+    def record_point(
+        when: datetime,
+        session_key: str,
+        uncached_input: int,
+        cached_input: int,
+        cache_write: int,
+        output: int,
+        reasoning_output: int,
+        total_tokens: int,
+        call_count: int,
+        cost: Mapping[str, float],
+    ) -> None:
+        if not _is_plausible_usage_time(when, reference_now):
+            return
+        date_key = when.date().isoformat()
+        row = rows.get(date_key)
+        if row is None:
+            return
+        _add_token_metrics(
+            row,
+            uncached_input,
+            cached_input,
+            cache_write,
+            output,
+            reasoning_output,
+            total_tokens,
+            call_count,
+            cost,
+        )
+        session_ids[date_key].add(session_key)
+
+    for session_index, session in enumerate(sessions):
+        session_key = f"{session.get('tool', '')}:{session.get('id', f'session-{session_index}')}"
+        event_rows: list[tuple[dict[str, Any], datetime]] = []
+        fallback_event_time = _session_timestamp(session, local_tz)
+        raw_events = session.get("usage_events")
+        if isinstance(raw_events, list):
+            for event in raw_events:
+                if not isinstance(event, dict):
+                    continue
+                event_time = _event_timestamp(event, local_tz)
+                if event_time is None and fallback_event_time is not None:
+                    event = dict(event)
+                    event["timestamp"] = fallback_event_time.isoformat()
+                    event_time = fallback_event_time
+                if event_time is not None:
+                    event_rows.append((event, event_time))
+
+        if event_rows:
+            for event, event_time in event_rows:
+                if (
+                    event_time.date() < start_day
+                    or event_time.date() > end_day
+                    or not _is_plausible_usage_time(event_time, reference_now)
+                ):
+                    continue
+                event_uncached, event_cached, event_cache_write, event_output, event_reasoning, event_total = _event_metrics(event)
+                event_cost = _event_cost(
+                    session,
+                    event,
+                    event_uncached,
+                    event_cached,
+                    event_output,
+                    event_cache_write,
+                )
+                record_point(
+                    event_time,
+                    session_key,
+                    event_uncached,
+                    event_cached,
+                    event_cache_write,
+                    event_output,
+                    event_reasoning,
+                    event_total,
+                    _event_call_count(event),
+                    event_cost,
+                )
+            continue
+
+        activity_time = _session_activity_time(session, local_tz)
+        session_cost = {
+            "cost_cached_usd": float(session.get("cost_cached_usd") or 0.0),
+            "cost_uncached_usd": float(session.get("cost_uncached_usd") or 0.0),
+            "savings_usd": float(session.get("savings_usd") or 0.0),
+        }
+        if activity_time is not None:
+            record_point(
+                activity_time,
+                session_key,
+                _as_int(session.get("uncached_input")),
+                _as_int(session.get("cached_input")),
+                _as_int(session.get("cache_write")),
+                _as_int(session.get("output")),
+                _as_int(session.get("reasoning_output")),
+                _as_int(session.get("total_tokens")),
+                _as_int(session.get("call_count")),
+                session_cost,
+            )
+            continue
+
+        date_key = _session_date(session, local_tz)
+        if date_key == "unknown":
+            continue
+        try:
+            parsed_day = date.fromisoformat(date_key)
+            dated = datetime(parsed_day.year, parsed_day.month, parsed_day.day, tzinfo=local_tz)
+        except ValueError:
+            continue
+        if (
+            start_day <= parsed_day <= end_day
+            and _is_plausible_usage_time(dated, reference_now)
+        ):
+            row = rows[date_key]
+            _add_token_metrics(
+                row,
+                _as_int(session.get("uncached_input")),
+                _as_int(session.get("cached_input")),
+                _as_int(session.get("cache_write")),
+                _as_int(session.get("output")),
+                _as_int(session.get("reasoning_output")),
+                _as_int(session.get("total_tokens")),
+                _as_int(session.get("call_count")),
+                session_cost,
+            )
+            session_ids[date_key].add(session_key)
+
+    for date_key, row in rows.items():
+        row["session_count"] = len(session_ids.get(date_key, set()))
+        _round_cost_fields(row)
+    return list(rows.values())
+
+
 def _filter_usage_data(
     data: dict[str, Any],
     time_range: str,
@@ -1672,6 +1841,27 @@ def _filter_usage_data(
     """Apply a time range and rebuild all derived metrics."""
     normalized = _normalize_time_range(time_range)
     source_sessions = [s for s in list(data.get("sessions") or []) if isinstance(s, dict)]
+
+    # The activity heatmap always describes the current local calendar date
+    # and the 29 dates before it, regardless of the selected dashboard range.
+    # Keep this reference separate from ``current`` below because custom
+    # ranges can end on a historical date.
+    heatmap_tz = local_timezone()
+    if now is None:
+        heatmap_now = datetime.now(heatmap_tz)
+    elif now.tzinfo is None:
+        heatmap_now = now.replace(tzinfo=heatmap_tz)
+    else:
+        heatmap_now = now.astimezone(heatmap_tz)
+    heatmap_end_day = heatmap_now.date()
+    heatmap_start_day = heatmap_end_day - timedelta(days=29)
+    heatmap_start = datetime(
+        heatmap_start_day.year,
+        heatmap_start_day.month,
+        heatmap_start_day.day,
+        tzinfo=heatmap_tz,
+    )
+
     cutoff, current = _time_range_cutoff(normalized, now, start, end)
     if normalized == "all":
         result = _build_usage_data(
@@ -1688,6 +1878,21 @@ def _filter_usage_data(
             str(data.get("tool") or "all"),
             window_start=cutoff,
             window_end=current,
+        )
+
+    if normalized == "all":
+        result["heatmap_daily"] = _heatmap_rows_from_timeline(
+            result["timeline"],
+            heatmap_start_day,
+            heatmap_end_day,
+        )
+    else:
+        result["heatmap_daily"] = _build_heatmap_daily(
+            source_sessions,
+            heatmap_start_day,
+            heatmap_end_day,
+            heatmap_tz,
+            heatmap_now,
         )
     result["time_range"] = normalized
     analytics_now = current if normalized == "custom" and not end else now

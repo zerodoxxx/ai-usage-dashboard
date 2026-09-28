@@ -122,7 +122,8 @@ def main() -> None:
     assert "Tracked sessions" in html
     assert "odo-total-cost" in html
     assert "chart-tokens" in html
-    assert "weekday-hour-heatmap" in html
+    assert "daily-usage-heatmap" in html
+    assert "Past 30 Days" in html
     assert "models-table-body" in html
     assert "time-range-select" in html
     assert "export-sessions-btn" not in html
@@ -157,8 +158,10 @@ def main() -> None:
     assert "no-store" in headers.get("cache-control", "")
     assert "summary" in usage_all and "models" in usage_all and "timeline" in usage_all and "sessions" in usage_all
     assert "hourly_timeline" in usage_all and "weekday_hour" in usage_all
+    assert "heatmap_daily" in usage_all
     assert len(usage_all["hourly_timeline"]) == 24
     assert len(usage_all["weekday_hour"]) == 168
+    assert len(usage_all["heatmap_daily"]) == 30
     assert "analytics" in usage_all
     assert {
         "top_sessions",

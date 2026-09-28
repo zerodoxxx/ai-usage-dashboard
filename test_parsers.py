@@ -811,6 +811,85 @@ def test_activity_timelines() -> None:
     print("✓ Event-based hourly timeline, weekday heatmap, and zero-filled days verified.")
 
 
+def test_daily_heatmap_independent_of_filter() -> None:
+    print("\n--- 9. Testing fixed 30-day daily heatmap ---")
+    local_tz = _local_tz()
+    now = datetime(2026, 9, 28, 12, 0, 0, tzinfo=local_tz)
+    aug_30 = datetime(2026, 8, 30, 10, 0, 0, tzinfo=local_tz)
+    sep_20 = datetime(2026, 9, 20, 14, 0, 0, tzinfo=local_tz)
+    event_data = {
+        "tool": "codex",
+        "summary": {},
+        "models": [],
+        "timeline": [],
+        "sessions": [{
+            "id": "daily-heatmap",
+            "tool": "codex",
+            "model": "gpt-6-luna",
+            "created_at": aug_30.isoformat(),
+            "start_time": aug_30.isoformat(),
+            "call_count": 2,
+            "uncached_input": 44,
+            "cached_input": 16,
+            "cache_write": 7,
+            "output": 15,
+            "total_tokens": 82,
+            "cost_cached_usd": 0.375,
+            "usage_events": [
+                {
+                    "timestamp": aug_30.isoformat(),
+                    "input_tokens": 40,
+                    "cached_input_tokens": 12,
+                    "cache_write_tokens": 5,
+                    "output_tokens": 8,
+                    "total_tokens": 53,
+                    "reported_cost_usd": 0.25,
+                },
+                {
+                    "timestamp": sep_20.isoformat(),
+                    "input_tokens": 20,
+                    "cached_input_tokens": 4,
+                    "cache_write_tokens": 2,
+                    "output_tokens": 7,
+                    "total_tokens": 29,
+                    "reported_cost_usd": 0.125,
+                },
+            ],
+        }],
+    }
+
+    result = _filter_usage_data(
+        event_data,
+        "custom",
+        now=now,
+        start="2026-08-30",
+        end="2026-08-31",
+    )
+    heatmap = result["heatmap_daily"]
+    expected_start = now.date() - timedelta(days=29)
+    expected_dates = [
+        (expected_start + timedelta(days=offset)).isoformat()
+        for offset in range(30)
+    ]
+    assert [row["date"] for row in heatmap] == expected_dates
+    assert len(heatmap) == 30
+    assert result["summary"]["total_tokens"] == 53
+
+    by_date = {row["date"]: row for row in heatmap}
+    early_day = by_date[aug_30.date().isoformat()]
+    late_day = by_date[sep_20.date().isoformat()]
+    assert early_day["total_tokens"] == 53
+    assert early_day["uncached_input"] == 28
+    assert early_day["cached_input"] == 12
+    assert early_day["cache_write"] == 5
+    assert early_day["output"] == 8
+    assert early_day["cost_cached_usd"] == 0.25
+    assert late_day["total_tokens"] == 29
+    assert late_day["cost_cached_usd"] == 0.125
+    assert by_date["2026-09-10"]["total_tokens"] == 0
+    print("✓ Heatmap stays at 30 local dates and includes usage outside a historical custom range.")
+
+
 if __name__ == "__main__":
     test_pricing()
     codex_res = test_codex()
@@ -821,6 +900,7 @@ if __name__ == "__main__":
     test_agy_estimated_provenance()
     test_custom_time_range()
     test_activity_timelines()
+    test_daily_heatmap_independent_of_filter()
     print("\n========================================")
     print("  ALL PARSER & PRICING TESTS PASSED!  ")
     print("========================================\n")

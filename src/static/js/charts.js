@@ -12,6 +12,15 @@
   let chartCacheTrend = null;
   let chartCostPer1k = null;
   let chartHourlyActivity = null;
+  let heatmapDetailCard = null;
+  let heatmapDetailPinnedCell = null;
+  let heatmapDetailAnchorCell = null;
+  let heatmapHoveredCell = null;
+  let heatmapFocusedCell = null;
+  let heatmapSuppressedCell = null;
+  let heatmapPreviewMode = 'pointer';
+  let heatmapInteractionsBound = false;
+  const heatmapCellData = new WeakMap();
 
   const FONT_FAMILY = '-apple-system, BlinkMacSystemFont, sans-serif';
   const COLOR_MUTED = '#94a3b8';
@@ -106,7 +115,7 @@
       el.hourlyActivityCanvas,
       data && data.timezone
     );
-    updateWeekdayHeatmap((data && data.weekday_hour) || [], el.weekdayHeatmap);
+    updateDailyHeatmap((data && data.heatmap_daily) || [], el.dailyHeatmap);
     updateSparklines((data && data.timeline) || [], el);
   }
 
@@ -508,76 +517,303 @@
 
   const WEEKDAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
-  function heatmapCellTitle(weekdayLabel, hour, cell) {
-    const tokens = Number(cell.total_tokens || 0).toLocaleString();
-    const calls = Number(cell.call_count || 0).toLocaleString();
-    const cost = Number(cell.cost_cached_usd || 0).toFixed(4);
-    const hh = String(hour).padStart(2, '0');
-    return `${weekdayLabel} ${hh}:00 — ${tokens} tokens, ${calls} calls, $${cost}`;
+  function weekdayColumn(dateValue) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateValue || ''));
+    if (!match) return 0;
+    const weekday = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]))).getUTCDay();
+    return (weekday + 6) % 7;
   }
 
-  /**
-   * 7×24 weekday × hour heatmap (HTML/CSS grid). Intensity uses total_tokens,
-   * or call_count if tokens are all zero. Empty input still renders a dim grid.
-   */
-  function updateWeekdayHeatmap(cells, container) {
-    if (!container) return;
-    const escapeHtml = (utils().escapeHtml) || ((s) => String(s));
-    const grid = Array.from({ length: 7 }, () => Array.from({ length: 24 }, () => ({
-      total_tokens: 0,
-      call_count: 0,
-      cost_cached_usd: 0,
-      session_count: 0,
-    })));
+  function heatmapDateLabel(dateValue) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateValue || ''));
+    if (!match) return String(dateValue || 'Unknown date');
+    const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+    return new Intl.DateTimeFormat(undefined, {
+      year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC',
+    }).format(date);
+  }
 
-    const list = Array.isArray(cells) ? cells : [];
-    for (const cell of list) {
-      if (!cell || typeof cell !== 'object') continue;
-      const day = Math.trunc(Number(cell.weekday));
-      const hour = Math.trunc(Number(cell.hour));
-      if (!Number.isFinite(day) || day < 0 || day > 6) continue;
-      if (!Number.isFinite(hour) || hour < 0 || hour > 23) continue;
-      grid[day][hour] = {
-        total_tokens: Number(cell.total_tokens || 0) || 0,
-        call_count: Number(cell.call_count || 0) || 0,
-        cost_cached_usd: Number(cell.cost_cached_usd || 0) || 0,
-        session_count: Number(cell.session_count || 0) || 0,
-        weekday_label: cell.weekday_label,
-      };
-    }
-
-    let maxTokens = 0;
-    let maxCalls = 0;
-    for (const row of grid) {
-      for (const cell of row) {
-        maxTokens = Math.max(maxTokens, cell.total_tokens);
-        maxCalls = Math.max(maxCalls, cell.call_count);
-      }
-    }
-    const useTokens = maxTokens > 0;
-    const maxVal = useTokens ? maxTokens : maxCalls;
-
-    const hourHeaders = Array.from({ length: 24 }, (_, hour) => (
-      `<div class="heatmap-hour" role="columnheader" aria-label="Hour ${String(hour).padStart(2, '0')}">${String(hour).padStart(2, '0')}</div>`
-    )).join('');
-
-    let body = `<div class="heatmap-corner" role="columnheader" aria-label="Weekday"></div>${hourHeaders}`;
-    WEEKDAY_LABELS.forEach((label, day) => {
-      body += `<div class="heatmap-weekday" role="rowheader">${label}</div>`;
-      for (let hour = 0; hour < 24; hour += 1) {
-        const cell = grid[day][hour];
-        const value = useTokens ? cell.total_tokens : cell.call_count;
-        const t = maxVal > 0 ? value / maxVal : 0;
-        const alpha = (0.08 + t * 0.87).toFixed(3);
-        const weekdayLabel = cell.weekday_label || label;
-        const title = heatmapCellTitle(weekdayLabel, hour, cell);
-        body += `<div class="heatmap-cell" role="gridcell" tabindex="0" aria-label="${escapeHtml(title)}" style="background:rgba(99,102,241,${alpha})" title="${escapeHtml(title)}"></div>`;
-      }
+  function heatmapCost(value) {
+    return Number(value || 0).toLocaleString(undefined, {
+      minimumFractionDigits: 6,
+      maximumFractionDigits: 6,
     });
+  }
+
+  function heatmapCount(value) {
+    return Number(value || 0).toLocaleString();
+  }
+
+  function ensureHeatmapDetailCard() {
+    if (heatmapDetailCard && heatmapDetailCard.isConnected) return heatmapDetailCard;
+
+    heatmapDetailCard = document.createElement('div');
+    heatmapDetailCard.id = 'heatmap-detail-card';
+    heatmapDetailCard.className = 'heatmap-detail-card';
+    heatmapDetailCard.hidden = true;
+    heatmapDetailCard.addEventListener('click', (event) => {
+      if (!event.target.closest('.heatmap-detail-close')) return;
+      dismissHeatmapDetail({ restoreFocus: true });
+    });
+    document.body.appendChild(heatmapDetailCard);
+    return heatmapDetailCard;
+  }
+
+  function heatmapDetailMarkup(cell, pinned) {
+    const escapeHtml = utils().escapeHtml || ((value) => String(value).replace(/[&<>"']/g, (char) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    })[char]));
+    const labels = [
+      ['Cache write', cell.cache_write],
+      ['Cache reads', cell.cached_input],
+      ['Input', cell.uncached_input],
+      ['Output', cell.output],
+    ];
+    const breakdown = labels.map(([label, value]) => (
+      `<div class="heatmap-detail-metric"><span>${label}</span><strong>${heatmapCount(value)}</strong></div>`
+    )).join('');
+    return `
+      <div class="heatmap-detail-header">
+        <div>
+          <span class="heatmap-detail-eyebrow">Daily usage</span>
+          <h3 id="heatmap-detail-title">${escapeHtml(heatmapDateLabel(cell.date))}</h3>
+        </div>
+        <button type="button" class="heatmap-detail-close" aria-label="Close daily usage details"${pinned ? '' : ' hidden'}>×</button>
+      </div>
+      <div class="heatmap-detail-totals" id="heatmap-detail-totals">
+        <div class="heatmap-detail-total"><span>Total cost</span><strong>$${heatmapCost(cell.cost_cached_usd)}</strong></div>
+        <div class="heatmap-detail-total"><span>Total tokens</span><strong>${heatmapCount(cell.total_tokens)}</strong></div>
+      </div>
+      <div class="heatmap-detail-breakdown" id="heatmap-detail-breakdown" aria-label="Token breakdown">${breakdown}</div>
+    `;
+  }
+
+  function positionHeatmapDetail(anchor) {
+    if (!heatmapDetailCard || heatmapDetailCard.hidden || !anchor?.isConnected) return;
+    const margin = 12;
+    const anchorRect = anchor.getBoundingClientRect();
+    const cardRect = heatmapDetailCard.getBoundingClientRect();
+    const cardWidth = cardRect.width;
+    const cardHeight = cardRect.height;
+    const left = Math.max(
+      margin,
+      Math.min(anchorRect.left + anchorRect.width / 2 - cardWidth / 2, window.innerWidth - cardWidth - margin),
+    );
+    const above = anchorRect.top - cardHeight - 10;
+    const below = anchorRect.bottom + 10;
+    const spaceAbove = anchorRect.top - margin;
+    const spaceBelow = window.innerHeight - anchorRect.bottom - margin;
+    let top = spaceBelow >= cardHeight || spaceBelow >= spaceAbove ? below : above;
+    top = Math.max(margin, Math.min(top, window.innerHeight - cardHeight - margin));
+    heatmapDetailCard.style.left = `${left}px`;
+    heatmapDetailCard.style.top = `${top}px`;
+  }
+
+  function showHeatmapDetail(cellElement, pinned = false) {
+    const cell = heatmapCellData.get(cellElement);
+    if (!cell) return;
+    const card = ensureHeatmapDetailCard();
+    if (heatmapDetailAnchorCell && heatmapDetailAnchorCell !== cellElement) {
+      heatmapDetailAnchorCell.removeAttribute('aria-describedby');
+      heatmapDetailAnchorCell.setAttribute('aria-expanded', 'false');
+    }
+    heatmapDetailAnchorCell = cellElement;
+    cellElement.setAttribute('aria-describedby', card.id);
+    cellElement.setAttribute('aria-expanded', pinned ? 'true' : 'false');
+    card.innerHTML = heatmapDetailMarkup(cell, pinned);
+    card.setAttribute('role', pinned ? 'dialog' : 'tooltip');
+    card.setAttribute('aria-label', `Daily usage details for ${heatmapDateLabel(cell.date)}`);
+    card.dataset.pinned = pinned ? 'true' : 'false';
+    if (pinned) {
+      card.setAttribute('aria-labelledby', 'heatmap-detail-title');
+      card.setAttribute('aria-describedby', 'heatmap-detail-totals heatmap-detail-breakdown');
+    } else {
+      card.removeAttribute('aria-labelledby');
+      card.removeAttribute('aria-describedby');
+    }
+    card.hidden = false;
+    positionHeatmapDetail(cellElement);
+  }
+
+  function hideHeatmapDetail({ suppress = false, clearPreviews = false, restoreFocus = false } = {}) {
+    const activeCell = heatmapDetailPinnedCell || heatmapDetailAnchorCell;
+    if (suppress) {
+      heatmapSuppressedCell = activeCell || heatmapHoveredCell || heatmapFocusedCell;
+    }
+    if (clearPreviews) {
+      heatmapHoveredCell = null;
+      heatmapFocusedCell = null;
+    }
+    if (activeCell) {
+      activeCell.removeAttribute('aria-describedby');
+      activeCell.setAttribute('aria-expanded', 'false');
+    }
+    heatmapDetailPinnedCell = null;
+    heatmapDetailAnchorCell = null;
+    if (heatmapDetailCard) {
+      heatmapDetailCard.hidden = true;
+      heatmapDetailCard.dataset.pinned = 'false';
+      heatmapDetailCard.removeAttribute('role');
+      heatmapDetailCard.removeAttribute('aria-labelledby');
+      heatmapDetailCard.removeAttribute('aria-describedby');
+    }
+    if (restoreFocus && activeCell?.isConnected) activeCell.focus();
+  }
+
+  function dismissHeatmapDetail({ restoreFocus = false } = {}) {
+    hideHeatmapDetail({ suppress: true, clearPreviews: true, restoreFocus });
+  }
+
+  function refreshHeatmapPreview() {
+    if (heatmapDetailPinnedCell) return;
+    let candidate = heatmapPreviewMode === 'focus' ? heatmapFocusedCell : heatmapHoveredCell;
+    if (!candidate || candidate === heatmapSuppressedCell) {
+      const fallback = heatmapPreviewMode === 'focus' ? heatmapHoveredCell : heatmapFocusedCell;
+      candidate = fallback === heatmapSuppressedCell ? null : fallback;
+    }
+    if (!candidate) {
+      hideHeatmapDetail();
+      return;
+    }
+    heatmapSuppressedCell = null;
+    showHeatmapDetail(candidate, false);
+  }
+
+  function toggleHeatmapPin(cellElement, focusCloseButton = false) {
+    if (heatmapDetailPinnedCell === cellElement) {
+      dismissHeatmapDetail({
+        restoreFocus: heatmapDetailCard?.contains(document.activeElement),
+      });
+      return;
+    }
+    heatmapSuppressedCell = null;
+    heatmapDetailPinnedCell = cellElement;
+    showHeatmapDetail(cellElement, true);
+    if (focusCloseButton) {
+      heatmapDetailCard.querySelector('.heatmap-detail-close')?.focus();
+    }
+  }
+
+  function attachHeatmapInteractions(container) {
+    if (heatmapInteractionsBound) return;
+    heatmapInteractionsBound = true;
+    ensureHeatmapDetailCard();
+
+    container.addEventListener('pointerover', (event) => {
+      const cell = event.target.closest('.heatmap-cell');
+      if (!cell || !container.contains(cell) || (event.relatedTarget && cell.contains(event.relatedTarget))) return;
+      heatmapHoveredCell = cell;
+      heatmapPreviewMode = 'pointer';
+      if (heatmapSuppressedCell !== cell) heatmapSuppressedCell = null;
+      refreshHeatmapPreview();
+    });
+    container.addEventListener('pointerout', (event) => {
+      const cell = event.target.closest('.heatmap-cell');
+      if (!cell || !container.contains(cell) || (event.relatedTarget && cell.contains(event.relatedTarget))) return;
+      if (heatmapHoveredCell === cell) heatmapHoveredCell = null;
+      if (heatmapSuppressedCell === cell && heatmapFocusedCell !== cell) heatmapSuppressedCell = null;
+      refreshHeatmapPreview();
+    });
+    container.addEventListener('focusin', (event) => {
+      const cell = event.target.closest('.heatmap-cell');
+      if (!cell || !container.contains(cell)) return;
+      heatmapFocusedCell = cell;
+      heatmapPreviewMode = 'focus';
+      if (heatmapSuppressedCell !== cell) heatmapSuppressedCell = null;
+      refreshHeatmapPreview();
+    });
+    container.addEventListener('focusout', (event) => {
+      const cell = event.target.closest('.heatmap-cell');
+      if (!cell || !container.contains(cell)) return;
+      if (heatmapFocusedCell === cell) heatmapFocusedCell = null;
+      if (heatmapSuppressedCell === cell && heatmapHoveredCell !== cell) heatmapSuppressedCell = null;
+      refreshHeatmapPreview();
+    });
+    container.addEventListener('click', (event) => {
+      const cell = event.target.closest('.heatmap-cell');
+      if (cell && container.contains(cell)) toggleHeatmapPin(cell);
+    });
+    container.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ' && event.key !== 'Spacebar') return;
+      const cell = event.target.closest('.heatmap-cell');
+      if (!cell || !container.contains(cell)) return;
+      event.preventDefault();
+      toggleHeatmapPin(cell, true);
+    });
+
+    document.addEventListener('pointerdown', (event) => {
+      if (!heatmapDetailPinnedCell && !heatmapDetailAnchorCell) return;
+      if (heatmapDetailCard?.contains(event.target)) return;
+      if (event.target.closest?.('.heatmap-cell') && container.contains(event.target.closest('.heatmap-cell'))) return;
+      dismissHeatmapDetail({
+        restoreFocus: heatmapDetailCard?.contains(document.activeElement),
+      });
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape' || !heatmapDetailAnchorCell) return;
+      const focusCloseButton = heatmapDetailCard?.contains(document.activeElement);
+      event.preventDefault();
+      dismissHeatmapDetail({ restoreFocus: focusCloseButton });
+    });
+    window.addEventListener('resize', () => positionHeatmapDetail(heatmapDetailAnchorCell));
+    window.addEventListener('scroll', () => positionHeatmapDetail(heatmapDetailAnchorCell), true);
+  }
+
+  /** Render the API's 30 local calendar dates as a seven-column calendar grid. */
+  function updateDailyHeatmap(cells, container) {
+    if (!container) return;
+    const activeElement = document.activeElement;
+    const focusedGridCell = container.contains(activeElement) ? activeElement.closest('.heatmap-cell') : null;
+    const restoreDate = focusedGridCell?.dataset.date
+      || (heatmapDetailCard?.contains(activeElement) ? heatmapDetailAnchorCell?.dataset.date : null);
+    hideHeatmapDetail();
+    heatmapHoveredCell = null;
+    heatmapFocusedCell = null;
+    heatmapSuppressedCell = null;
+    const escapeHtml = (utils().escapeHtml) || ((s) => String(s));
+    const list = (Array.isArray(cells) ? cells : [])
+      .filter((cell) => cell && typeof cell === 'object' && /^\d{4}-\d{2}-\d{2}$/.test(String(cell.date || '')))
+      .sort((a, b) => String(a.date).localeCompare(String(b.date)))
+      .slice(-30);
+    const maxTokens = list.reduce((max, cell) => Math.max(max, Number(cell.total_tokens || 0)), 0);
+    const maxCost = list.reduce((max, cell) => Math.max(max, Number(cell.cost_cached_usd || 0)), 0);
+    const useTokens = maxTokens > 0;
+    const maxValue = useTokens ? maxTokens : maxCost;
+
+    const firstOffset = list.length ? weekdayColumn(list[0].date) : 0;
+    const headerRow = `<div class="heatmap-row heatmap-header-row" role="row">${WEEKDAY_LABELS.map((label, index) => (
+      `<div class="heatmap-weekday" role="columnheader" aria-colindex="${index + 1}">${label}</div>`
+    )).join('')}</div>`;
+    const dayRows = [];
+    let rowCells = [];
+    for (let index = 0; index < firstOffset; index += 1) {
+      rowCells.push('<div class="heatmap-spacer" role="presentation" aria-hidden="true"></div>');
+    }
+    for (let index = 0; index < list.length; index += 1) {
+      const cell = list[index];
+      const value = useTokens ? Number(cell.total_tokens || 0) : Number(cell.cost_cached_usd || 0);
+      const intensity = maxValue > 0 ? value / maxValue : 0;
+      const alpha = (0.08 + intensity * 0.87).toFixed(3);
+      const dayNumber = String(cell.date).slice(-2);
+      const columnIndex = ((firstOffset + index) % 7) + 1;
+      const accessibleLabel = `${cell.date}, daily usage. Press Enter or Space to pin details.`;
+      rowCells.push(`<div class="heatmap-cell" role="gridcell" aria-colindex="${columnIndex}" aria-haspopup="dialog" aria-controls="heatmap-detail-card" aria-expanded="false" tabindex="0" aria-label="${escapeHtml(accessibleLabel)}" data-date="${escapeHtml(cell.date)}" style="background:rgba(99,102,241,${alpha})"><span aria-hidden="true">${dayNumber}</span></div>`);
+      if (rowCells.length === 7) {
+        dayRows.push(`<div class="heatmap-row" role="row">${rowCells.join('')}</div>`);
+        rowCells = [];
+      }
+    }
+    if (rowCells.length > 0) {
+      while (rowCells.length < 7) {
+        rowCells.push('<div class="heatmap-spacer" role="presentation" aria-hidden="true"></div>');
+      }
+      dayRows.push(`<div class="heatmap-row" role="row">${rowCells.join('')}</div>`);
+    }
+    const weekCount = dayRows.length;
 
     container.innerHTML = `
       <div class="heatmap-scroll">
-        <div class="heatmap-grid" role="grid" aria-label="Weekday by hour activity heatmap" aria-rowcount="8" aria-colcount="25">${body}</div>
+        <div class="heatmap-calendar" role="grid" aria-labelledby="heatmap-title" aria-describedby="heatmap-desc" aria-rowcount="${weekCount + 1}" aria-colcount="7" style="grid-template-rows:18px repeat(${weekCount},36px)">${headerRow}${dayRows.join('')}</div>
       </div>
       <div class="heatmap-legend">
         <span>Low</span>
@@ -585,6 +821,16 @@
         <span>High</span>
       </div>
     `;
+    const cellsByDate = new Map(list.map((cell) => [String(cell.date), cell]));
+    container.querySelectorAll('.heatmap-cell').forEach((cellElement) => {
+      heatmapCellData.set(cellElement, cellsByDate.get(cellElement.dataset.date));
+    });
+    attachHeatmapInteractions(container);
+    if (restoreDate) {
+      const replacement = Array.from(container.querySelectorAll('.heatmap-cell'))
+        .find((cellElement) => cellElement.dataset.date === restoreDate);
+      replacement?.focus();
+    }
   }
 
   function sparklinePoints(values, width, height, pad) {
@@ -657,7 +903,7 @@
     updateCacheTrendChart,
     updateCostPer1kChart,
     updateHourlyActivityChart,
-    updateWeekdayHeatmap,
+    updateDailyHeatmap,
     updateSparklines,
     resizeCharts,
     destroyCharts,

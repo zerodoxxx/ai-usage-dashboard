@@ -170,7 +170,7 @@
         cacheTrendCanvas: elements.chartCacheTrendCanvas,
         costPer1kCanvas: elements.chartCostPer1kCanvas,
         hourlyActivityCanvas: elements.chartHourlyActivityCanvas,
-        weekdayHeatmap: elements.weekdayHeatmap,
+        dailyHeatmap: elements.dailyHeatmap,
         sparklineSpend: elements.sparklineSpend,
         sparklineBurn: elements.sparklineBurn,
         sparklineSavings: elements.sparklineSavings,
@@ -489,7 +489,7 @@
     elements.chartCacheTrendCanvas = document.getElementById('chart-cache-trend');
     elements.chartCostPer1kCanvas = document.getElementById('chart-cost-per-1k');
     elements.chartHourlyActivityCanvas = document.getElementById('chart-hourly-activity');
-    elements.weekdayHeatmap = document.getElementById('weekday-hour-heatmap');
+    elements.dailyHeatmap = document.getElementById('daily-usage-heatmap');
     elements.unpricedBanner = document.getElementById('unpriced-banner');
     elements.unpricedSummaryBanner = document.getElementById('unpriced-summary-banner');
 
