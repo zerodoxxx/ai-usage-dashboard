@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -70,7 +71,10 @@ def _usage_event(
     cache_read = _as_int(usage.get("cache_read_input_tokens"))
     cache_write, cache_write_5m, cache_write_1h = _cache_creation_components(usage)
     output = _as_int(usage.get("output_tokens"))
-    reasoning = _as_int(usage.get("reasoning_output_tokens"))
+    reasoning = _as_int(
+        usage.get("reasoning_output_tokens")
+        or (usage.get("output_tokens_details") or {}).get("thinking_tokens")
+    )
     if not any((base_input, cache_read, cache_write, output, reasoning)):
         return None
 
@@ -168,7 +172,11 @@ def _parse_session_file(path: Path) -> UsageSession | None:
                     first_timestamp = first_timestamp if first_timestamp is not None else timestamp
                     last_timestamp = timestamp
 
-                if record.get("type") == "user" and not title and not record.get("isMeta"):
+                if record.get("type") == "ai-title" or record.get("aiTitle"):
+                    ai_title = _clean_title(str(record.get("aiTitle") or record.get("title") or ""))
+                    if ai_title:
+                        title = ai_title
+                elif record.get("type") == "user" and not title and not record.get("isMeta"):
                     title = _session_title(record)
 
                 message = record.get("message")
@@ -208,12 +216,17 @@ def _parse_session_file(path: Path) -> UsageSession | None:
         result = None
     else:
         model = models.most_common(1)[0][0] if models else None
+        fallback_title = (
+            f"Claude Code Subagent {path.stem[:8]}"
+            if is_subagent
+            else f"Claude Code Session {(session_id or path.stem)[:8]}"
+        )
         result = UsageSession(
             id=session_id or path.stem,
             tool="claude-code",
             provider="claude",
             model=model,
-            title=title or f"Claude Code Session {(session_id or path.stem)[:8]}",
+            title=title or fallback_title,
             created_at=first_timestamp,
             start_time=first_timestamp,
             end_time=last_timestamp,
@@ -238,13 +251,22 @@ def _parse_session_file(path: Path) -> UsageSession | None:
 
 
 def _session_files(base_dir: Path) -> list[Path]:
-    projects_dir = base_dir / "projects" if (base_dir / "projects").is_dir() else base_dir
-    if not projects_dir.exists():
+    if not base_dir.exists():
         return []
-    # Subagent transcripts contain billable Claude calls of their own and are
-    # intentionally included. Repeated wrapper records are deduplicated while
-    # parsing each file by message ID.
-    return sorted(projects_dir.rglob("*.jsonl"))
+    if base_dir.is_file() and base_dir.suffix == ".jsonl":
+        return [base_dir]
+    files: set[Path] = set()
+    projects_dir = base_dir / "projects"
+    if projects_dir.is_dir():
+        files.update(projects_dir.rglob("*.jsonl"))
+    # Also discover session jsonl files directly in base_dir or sessions/
+    for p in base_dir.glob("*.jsonl"):
+        if p.name != "history.jsonl":
+            files.add(p)
+    sessions_dir = base_dir / "sessions"
+    if sessions_dir.is_dir():
+        files.update(sessions_dir.rglob("*.jsonl"))
+    return sorted(files)
 
 
 class ClaudeCodeSource:
@@ -258,7 +280,14 @@ class ClaudeCodeSource:
     default_path = default_source_path
 
     def extract_sessions(self, root: str | Path | None = None) -> list[UsageSession]:
-        base_dir = Path(root).expanduser() if root is not None else self.default_source_path
+        if root is not None:
+            base_dir = Path(root).expanduser()
+        elif os.environ.get("CLAUDE_CONFIG_DIR"):
+            base_dir = Path(os.environ["CLAUDE_CONFIG_DIR"]).expanduser()
+        elif os.environ.get("CLAUDE_DIR"):
+            base_dir = Path(os.environ["CLAUDE_DIR"]).expanduser()
+        else:
+            base_dir = self.default_source_path
         sessions = [
             session
             for path in _session_files(base_dir)

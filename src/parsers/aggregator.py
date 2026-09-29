@@ -936,7 +936,7 @@ def _model_provider(model_name: str, fallback: str | None) -> str | None:
         return "deepseek"
     if normalized.startswith("gemini"):
         return "antigravity"
-    if normalized.startswith("claude"):
+    if normalized.startswith(("claude", "sonnet", "opus", "haiku")):
         return "claude"
     if normalized.startswith(("gpt-", "o1", "o3", "o4")):
         return "codex"

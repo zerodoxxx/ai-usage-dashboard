@@ -116,3 +116,56 @@ def test_gpt6_sol_and_luna_have_pricing() -> None:
     assert luna_alias.status == "known"
     assert luna_alias.canonical_model == "gpt-6-luna"
 
+
+def test_claude_5_5_sonnet_and_opus_have_pricing() -> None:
+    sonnet = get_pricing_strict("Claude Sonnet 5.5", provider="claude")
+    assert sonnet.status == "known"
+    assert sonnet.canonical_model == "Claude Sonnet 5.5"
+    assert sonnet.rates == PricingRates(
+        2.00,
+        0.20,
+        10.00,
+        cache_creation=2.50,
+        cache_write_5m=2.50,
+        cache_write_1h=4.00,
+    )
+
+    sonnet_alias = get_pricing_strict("claude-sonnet-5-5", provider="claude-code")
+    assert sonnet_alias.status == "known"
+    assert sonnet_alias.canonical_model == "Claude Sonnet 5.5"
+    assert sonnet_alias.rates == sonnet.rates
+
+    sonnet_dated = get_pricing_strict("claude-sonnet-5-5-20260922")
+    assert sonnet_dated.status == "known"
+    assert sonnet_dated.canonical_model == "Claude Sonnet 5.5"
+
+    sonnet_short = get_pricing_strict("sonnet 5.5")
+    assert sonnet_short.status == "known"
+    assert sonnet_short.canonical_model == "Claude Sonnet 5.5"
+
+    opus = get_pricing_strict("Claude Opus 5.5", provider="claude")
+    assert opus.status == "known"
+    assert opus.canonical_model == "Claude Opus 5.5"
+    assert opus.rates == PricingRates(
+        4.00,
+        0.20,
+        20.00,
+        cache_creation=5.00,
+        cache_write_5m=5.00,
+        cache_write_1h=8.00,
+    )
+
+    opus_alias = get_pricing_strict("claude-opus-5-5", provider="claude-code")
+    assert opus_alias.status == "known"
+    assert opus_alias.canonical_model == "Claude Opus 5.5"
+    assert opus_alias.rates == opus.rates
+
+    opus_dated = get_pricing_strict("claude-opus-5-5-20260922")
+    assert opus_dated.status == "known"
+    assert opus_dated.canonical_model == "Claude Opus 5.5"
+
+    opus_short = get_pricing_strict("opus 5.5")
+    assert opus_short.status == "known"
+    assert opus_short.canonical_model == "Claude Opus 5.5"
+
+

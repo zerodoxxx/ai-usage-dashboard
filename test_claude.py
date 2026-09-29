@@ -107,3 +107,90 @@ def test_claude_source_flows_through_registered_aggregator(tmp_path: Path) -> No
     assert result["summary"]["cache_write"] == 500
     assert result["summary"]["total_tokens"] == 6_800
     assert result["sessions"][0]["pricing_status"] == "estimated"
+
+
+def test_claude_5_5_session_extraction_and_reasoning_tokens(tmp_path: Path, monkeypatch) -> None:
+    session_dir = tmp_path / "custom-claude" / "projects" / "-test-project"
+    session_dir.mkdir(parents=True)
+    session_file = session_dir / "session-5-5.jsonl"
+    records = [
+        {
+            "type": "user",
+            "sessionId": "session-5-5",
+            "cwd": "/test/project",
+            "timestamp": "2026-09-29T10:00:00Z",
+            "message": {"role": "user", "content": "Help me build an app"},
+        },
+        {
+            "type": "ai-title",
+            "sessionId": "session-5-5",
+            "aiTitle": "Full Stack Application Development",
+        },
+        {
+            "type": "assistant",
+            "uuid": "msg-1",
+            "timestamp": "2026-09-29T10:00:05Z",
+            "message": {
+                "id": "msg-1",
+                "role": "assistant",
+                "model": "claude-sonnet-5-5",
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_read_input_tokens": 100_000,
+                    "cache_creation_input_tokens": 1_000,
+                    "output_tokens": 500,
+                    "output_tokens_details": {"thinking_tokens": 120},
+                    "cache_creation": {
+                        "ephemeral_1h_input_tokens": 1_000,
+                        "ephemeral_5m_input_tokens": 0,
+                    },
+                },
+            },
+        },
+        {
+            "type": "assistant",
+            "uuid": "msg-2",
+            "timestamp": "2026-09-29T10:01:00Z",
+            "message": {
+                "id": "msg-2",
+                "role": "assistant",
+                "model": "claude-opus-5-5",
+                "usage": {
+                    "input_tokens": 20,
+                    "cache_read_input_tokens": 50_000,
+                    "cache_creation_input_tokens": 2_000,
+                    "output_tokens": 800,
+                    "output_tokens_details": {"thinking_tokens": 250},
+                    "cache_creation": {
+                        "ephemeral_1h_input_tokens": 2_000,
+                        "ephemeral_5m_input_tokens": 0,
+                    },
+                },
+            },
+        },
+    ]
+    session_file.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+    # Test discovery via CLAUDE_CONFIG_DIR
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "custom-claude"))
+    sessions = ClaudeCodeSource().extract_sessions()
+    assert len(sessions) == 1
+    s = sessions[0]
+    assert s.title == "Full Stack Application Development"
+    assert s.call_count == 2
+    assert s.usage.reasoning_output_tokens == 370
+    assert s.events[0].usage.reasoning_output_tokens == 120
+    assert s.events[1].usage.reasoning_output_tokens == 250
+    assert s.events[0].cost is not None
+    assert s.events[1].cost is not None
+
+    # Verify flow through aggregator and model breakdown
+    result = get_tool_usage("claude-code", claude_dir=tmp_path / "custom-claude")
+    models = {m["canonical_model"]: m for m in result["models"]}
+    assert "Claude Sonnet 5.5" in models
+    assert "Claude Opus 5.5" in models
+    assert models["Claude Sonnet 5.5"]["pricing_status"] == "known"
+    assert models["Claude Opus 5.5"]["pricing_status"] == "known"
+    assert models["Claude Sonnet 5.5"]["reasoning_output"] == 120
+    assert models["Claude Opus 5.5"]["reasoning_output"] == 250
+

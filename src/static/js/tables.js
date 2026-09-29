@@ -90,7 +90,11 @@
     let hasEstimated = false;
     modelList.forEach((m) => {
       const modelName = String(m.model || 'unknown');
-      const badge = providerBadge(m.tool || (/gpt|o1|o3/i.test(modelName) ? 'codex' : 'antigravity'));
+      const badge = providerBadge(
+        (m.tool && m.tool !== 'all' ? m.tool : '')
+        || m.provider
+        || (/claude|sonnet|opus|haiku/i.test(modelName) ? 'claude' : (/gpt|o1|o3/i.test(modelName) ? 'codex' : 'antigravity'))
+      );
       const provenance = tokenProvenance(m);
       const est = provenance !== 'reported';
       if (est) hasEstimated = true;

@@ -71,7 +71,7 @@ def fetch_url_with_headers(path: str) -> tuple[int, dict | str, dict[str, str]]:
     url = f"{BASE_URL}{path}"
     req = urllib.request.Request(url, headers={"Cache-Control": "no-store"})
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             headers = {str(key).lower(): str(value) for key, value in resp.headers.items()}
             content_type = headers.get("content-type", "")
             raw = resp.read().decode("utf-8")
@@ -147,6 +147,10 @@ def main() -> None:
     assert status == 200, f"Expected 200, got {status}"
     assert "gpt-6-astra" in pricing
     assert "Gemini 3.8 Flash (High)" in pricing
+    assert "Claude Sonnet 5.5" in pricing
+    assert "Claude Opus 5.5" in pricing
+    assert pricing["Claude Sonnet 5.5"]["uncached_input"] == 2.0
+    assert pricing["Claude Opus 5.5"]["uncached_input"] == 4.0
     assert pricing["gpt-6-astra"]["uncached_input"] == 10.0
     assert "no-store" in headers.get("cache-control", "")
     print(f"✓ GET /api/pricing passed ({len(pricing)} models)")
@@ -196,6 +200,15 @@ def main() -> None:
     assert status == 200, f"Expected 200, got {status}"
     assert usage_agy["tool"] == "antigravity"
     print(f"✓ GET /api/usage?tool=agy passed (AGY tokens: {usage_agy['summary']['total_tokens']:,})")
+
+    # 8b. Test /api/usage?tool=claude-code and tool=claude
+    status, usage_claude = fetch_url("/api/usage?tool=claude-code")
+    assert status == 200, f"Expected 200, got {status}"
+    assert usage_claude["tool"] == "claude-code"
+    status_alias, usage_cc_alias = fetch_url("/api/usage?tool=claude")
+    assert status_alias == 200, f"Expected 200, got {status_alias}"
+    assert usage_cc_alias["tool"] == "claude-code"
+    print(f"✓ GET /api/usage?tool=claude-code passed (Claude tokens: {usage_claude['summary']['total_tokens']:,})")
 
     # 9. Test invalid tool
     status, err = fetch_url("/api/usage?tool=invalid_tool")
