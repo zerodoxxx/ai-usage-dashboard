@@ -23,6 +23,8 @@
     currentUsageData: null,
     allSessions: [],
     searchQuery: '',
+    usageRequestGeneration: 0,
+    renderedUsageGeneration: 0,
   };
 
   // Odometer Instances
@@ -109,6 +111,8 @@
       return;
     }
 
+    const generation = ++state.usageRequestGeneration;
+
     const refreshIcon = elements.refreshBtn ? elements.refreshBtn.querySelector('.refresh-icon') : null;
     if (refreshIcon) refreshIcon.classList.add('spin');
 
@@ -126,6 +130,11 @@
       }
 
       await fetchPricing();
+
+      if (generation < state.renderedUsageGeneration) {
+        return;
+      }
+      state.renderedUsageGeneration = generation;
 
       const data = result.data;
       state.currentUsageData = data;

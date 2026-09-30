@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 from datetime import datetime, timezone
@@ -923,45 +924,52 @@ def test_provider_prefixed_raw_names(tmp_path: Path) -> None:
 
 
 def test_cache_validation_rejects_null_and_corrupt_rates(tmp_path: Path) -> None:
+    valid_cache = tmp_path / "valid_cache.json"
+    idx = build_index(make_feed_fixture())
+    now_iso = datetime.now(timezone.utc).isoformat()
+    pricing_module._write_pricing_cache(valid_cache, idx, now_iso)
+
+    # First assert _read_pricing_cache accepts the valid cache
+    valid_loaded = pricing_module._read_pricing_cache(valid_cache)
+    assert valid_loaded is not None
+    loaded_index, _ = valid_loaded
+    assert len(loaded_index) >= 20
+
+    base_payload = json.loads(valid_cache.read_text(encoding="utf-8"))
+    target_model = "gpt-6.1-sol"
+    assert target_model in base_payload["index"]
+
     corrupted_cases = [
-        {"uncached_input": None, "cached_input": 1.0, "output": 2.0},
-        {"uncached_input": True, "cached_input": 1.0, "output": 2.0},
-        {"uncached_input": -1.0, "cached_input": 1.0, "output": 2.0},
-        {"uncached_input": float("inf"), "cached_input": 1.0, "output": 2.0},
-        {"uncached_input": 1.0, "cached_input": 1.0, "output": 2.0, "cache_write": "invalid"},
-        {"uncached_input": 1.0, "cached_input": 1.0, "output": 2.0, "cache_write": -5.0},
+        ("uncached_input", None),
+        ("uncached_input", True),
+        ("uncached_input", -1.0),
+        ("uncached_input", float("inf")),
+        ("cached_input", None),
+        ("cached_input", True),
+        ("cached_input", -0.5),
+        ("cached_input", float("inf")),
+        ("output", None),
+        ("output", True),
+        ("output", -2.0),
+        ("output", float("inf")),
+        ("cache_write", "invalid"),
+        ("cache_write", -5.0),
+        ("cache_write", True),
+        ("cache_write", float("inf")),
     ]
 
-    for i, rates in enumerate(corrupted_cases):
-        cache_file = tmp_path / f"corrupt_{i}.json"
-        cache_file.write_text(json.dumps({
-            "source": "litellm",
-            "schema_version": 1,
-            "source_url": LITELLM_PRICING_URL,
-            "index": {
-                "test-model": {
-                    "litellm_provider": "openai",
-                    **rates,
-                }
-            }
-        }), encoding="utf-8")
-        assert pricing_module._read_pricing_cache(cache_file) is None
+    for i, (field, bad_val) in enumerate(corrupted_cases):
+        corrupt_payload = copy.deepcopy(base_payload)
+        corrupt_payload["index"][target_model][field] = bad_val
+        cache_file = tmp_path / f"corrupt_{i}_{field}.json"
+        cache_file.write_text(json.dumps(corrupt_payload), encoding="utf-8")
+        assert pricing_module._read_pricing_cache(cache_file) is None, f"Expected reject for {field}={bad_val}"
 
     # Regression: a cache with "uncached_input": null is ignored, and refresh falls back without raising
+    null_payload = copy.deepcopy(base_payload)
+    null_payload["index"][target_model]["uncached_input"] = None
     null_cache = tmp_path / "null_cache.json"
-    null_cache.write_text(json.dumps({
-        "source": "litellm",
-        "schema_version": 1,
-        "source_url": LITELLM_PRICING_URL,
-        "index": {
-            "gpt-6.1-sol": {
-                "litellm_provider": "openai",
-                "uncached_input": None,
-                "cached_input": 1.0,
-                "output": 2.0,
-            }
-        }
-    }), encoding="utf-8")
+    null_cache.write_text(json.dumps(null_payload), encoding="utf-8")
     assert pricing_module._read_pricing_cache(null_cache) is None
 
     result = refresh_pricing(cache_path=null_cache, fetcher=lambda: {"sample_spec": {}})
