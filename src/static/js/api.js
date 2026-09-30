@@ -45,17 +45,19 @@
     const meta = metadata && typeof metadata === 'object' ? metadata : {};
     const source = String(meta.source || 'unavailable');
     const age = formatPricingAge(meta.fetched_at);
+    const modelCount = meta.models && typeof meta.models === 'object' ? Object.keys(meta.models).length : 0;
     const detail = [
       `source: ${source}`,
       meta.fetched_at ? `fetched: ${meta.fetched_at}` : null,
       meta.stale ? 'stale: true' : 'stale: false',
       meta.error ? `error: ${meta.error}` : null,
       meta.source_url ? `url: ${meta.source_url}` : null,
+      modelCount > 0 ? `models: ${modelCount} via LiteLLM` : null,
     ].filter(Boolean).join(' · ');
-    if (source === 'openai' && !meta.stale) {
+    if ((source === 'litellm' || source === 'litellm-cache') && !meta.stale) {
       const text = age && age !== 'just now' ? `Pricing: live ${age}` : 'Pricing: live just now';
       badge.innerHTML = `<span class="status-dot status-live"></span>${escapeHtml(text)}`;
-      badge.title = detail || 'Official OpenAI rates are fresh';
+      badge.title = detail || 'LiteLLM community rates are fresh';
     } else if (meta.stale) {
       badge.innerHTML = `<span class="status-dot status-stale"></span>Pricing: stale`;
       badge.title = detail || 'Using cached/stale rates';

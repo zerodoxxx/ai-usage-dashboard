@@ -27,9 +27,21 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from src.litellm_pricing import (
+    LITELLM_ALLOWED_HOST,
+    LITELLM_MAX_RESPONSE_BYTES,
+    LITELLM_PRICING_URL,
+    build_index,
+    litellm_key_candidates,
+    lookup,
+    parse_feed,
+    round_rate,
+    validate_index,
+)
 from src.timezones import as_utc
 
 
+# Offline fallback only; LiteLLM is the runtime source of truth.
 # This is the legacy, provider-less representation consumed by the existing
 # API and frontend. Keep its keys and the three standard rate fields stable.
 MODEL_PRICING: dict[str, dict[str, float]] = {
@@ -76,13 +88,6 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
 }
 
 DEFAULT_MODEL = "gpt-5.6-luna"
-_BUNDLED_OPENAI_MODELS = frozenset(
-    model for model in MODEL_PRICING
-    if not model.casefold().startswith(("gemini", "claude", "deepseek"))
-)
-_BUNDLED_OPENAI_RATE_VALUES = {
-    model: dict(MODEL_PRICING[model]) for model in _BUNDLED_OPENAI_MODELS
-}
 
 # The old names remain available for callers that imported these internals.
 _NORMALIZED_MAP: dict[str, str] = {k.casefold(): k for k in MODEL_PRICING}
@@ -194,6 +199,7 @@ class PricingEntry:
     rates: PricingRates | None
     aliases: tuple[str, ...] = ()
     off_peak_rates: PricingRates | None = None
+    exact_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -347,8 +353,17 @@ class PricingCatalog:
 
     def add_entry(self, entry: PricingEntry) -> PricingEntry:
         provider = normalize_provider(entry.provider) or entry.provider
-        normalized = PricingEntry(provider, entry.model, entry.rates, entry.aliases, entry.off_peak_rates)
-        self._entries[(provider, _normalize(entry.model))] = normalized
+        normalized = PricingEntry(
+            provider,
+            entry.model,
+            entry.rates,
+            entry.aliases,
+            entry.off_peak_rates,
+            exact_only=entry.exact_only,
+        )
+        new_entries = dict(self._entries)
+        new_entries[(provider, _normalize(entry.model))] = normalized
+        self._entries = new_entries
         return normalized
 
     def register(
@@ -366,6 +381,7 @@ class PricingCatalog:
         cache_write_5m: float | None = None,
         cache_write_1h: float | None = None,
         off_peak_rates: PricingRates | Mapping[str, Any] | None = None,
+        exact_only: bool = False,
     ) -> PricingEntry:
         """Register a model, including a known model with ``rates=None``.
 
@@ -391,23 +407,40 @@ class PricingCatalog:
             if isinstance(off_peak_rates, PricingRates) or off_peak_rates is None
             else PricingRates.from_mapping(off_peak_rates)
         )
-        return self.add_entry(PricingEntry(provider, model, parsed, tuple(aliases), off_peak_rates=parsed_off_peak))
+        return self.add_entry(
+            PricingEntry(
+                provider,
+                model,
+                parsed,
+                tuple(aliases),
+                off_peak_rates=parsed_off_peak,
+                exact_only=exact_only,
+            )
+        )
 
     def entries(self) -> tuple[PricingEntry, ...]:
-        return tuple(self._entries.values())
+        current = self._entries
+        return tuple(current.values())
 
     @property
     def models(self) -> dict[tuple[Provider, str], PricingEntry]:
         """Return a snapshot keyed by ``(provider, canonical_model)``."""
-        return dict(self._entries)
+        current = self._entries
+        return dict(current)
 
     def get_entry(self, provider: str, model: str) -> PricingEntry | None:
         """Return one exact provider/model entry, if registered."""
-        return self._entries.get((normalize_provider(provider) or provider, _normalize(model)))
+        current = self._entries
+        return current.get((normalize_provider(provider) or provider, _normalize(model)))
 
     def remove(self, provider: str, model: str) -> None:
         """Remove one exact provider/model entry, if present."""
-        self._entries.pop((normalize_provider(provider) or provider, _normalize(model)), None)
+        key = (normalize_provider(provider) or provider, _normalize(model))
+        current = self._entries
+        if key in current:
+            new_entries = dict(current)
+            new_entries.pop(key, None)
+            self._entries = new_entries
 
     def resolve(
         self, model_name: str | None, provider: str | None = None, *, timestamp: Any = None
@@ -416,8 +449,9 @@ class PricingCatalog:
         if not isinstance(model_name, str) or not model_name.strip():
             return PricingResolution(model_name, normalize_provider(provider), None, None, "unknown")
 
+        current_entries = self._entries
         raw, scoped_provider, model = model_name.strip(), normalize_provider(provider), model_name.strip()
-        known_providers = {entry.provider for entry in self._entries.values()}
+        known_providers = {entry.provider for entry in current_entries.values()}
         for separator in ("/", ":"):
             if separator in raw:
                 prefix, candidate = raw.split(separator, 1)
@@ -427,7 +461,7 @@ class PricingCatalog:
                     model = candidate.strip()
                     break
 
-        entries = [entry for entry in self._entries.values() if not scoped_provider or entry.provider == scoped_provider]
+        entries = [entry for entry in current_entries.values() if not scoped_provider or entry.provider == scoped_provider]
         normalized_model = _normalize(model)
         matches: list[tuple[PricingEntry, str]] = [
             (entry, "canonical") for entry in entries if _normalize(entry.model) == normalized_model
@@ -440,14 +474,16 @@ class PricingCatalog:
         if not matches:
             fuzzy: list[tuple[PricingEntry, str, int]] = []
             for entry in entries:
+                if entry.exact_only:
+                    continue
                 keys = [(entry.model, "canonical"), *[(alias, "alias") for alias in entry.aliases]]
-                for key, matched_by in keys:
+                for key, _ in keys:
                     key_normalized = _normalize(key)
                     if key_normalized and key_normalized in normalized_model:
-                        fuzzy.append((entry, matched_by, len(key_normalized)))
+                        fuzzy.append((entry, "fuzzy", len(key_normalized)))
             if fuzzy:
                 longest = max(item[2] for item in fuzzy)
-                matches = [(entry, matched_by) for entry, matched_by, size in fuzzy if size == longest]
+                matches = [(entry, "fuzzy") for entry, _, size in fuzzy if size == longest]
 
         unique: dict[tuple[str, str], tuple[PricingEntry, str]] = {
             (entry.provider, _normalize(entry.model)): (entry, matched_by) for entry, matched_by in matches
@@ -482,7 +518,7 @@ class PricingCatalog:
 
 def _build_catalog() -> PricingCatalog:
     catalog = PricingCatalog()
-    for model, rates in MODEL_PRICING.items():
+    for model, rates in dict(MODEL_PRICING).items():
         folded_model = model.casefold()
         if folded_model.startswith("gemini"):
             provider = "antigravity"
@@ -509,23 +545,26 @@ PRICING_CATALOG = _build_catalog()
 DEFAULT_PRICING_CATALOG = PRICING_CATALOG
 
 
-# OpenAI publishes pricing as a Markdown table rather than as a public pricing
-# API.  Keep the URL and cache policy in one place so the dashboard can refresh
-# without making network access part of cost calculation itself.
-OPENAI_PRICING_URL = "https://developers.openai.com/api/docs/pricing.md"
-OPENAI_PRICING_TTL_SECONDS = 24 * 60 * 60
-OPENAI_PRICING_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-OPENAI_PRICING_RETRY_SECONDS = 15 * 60
+# LiteLLM publishes a community-maintained, machine-readable JSON price list.
+# Rates are refreshed with conditional GET and cached on disk.
+PRICING_TTL_SECONDS = 24 * 60 * 60
+PRICING_RETRY_SECONDS = 15 * 60
 _PRICING_REFRESH_LOCK = RLock()
 _PRICING_STATES: dict[str, dict[str, Any]] = {}
-_PRICING_RATES_BY_KEY: dict[str, dict[str, PricingRates]] = {}
+_PRICING_INDEX_BY_KEY: dict[str, dict[str, dict[str, Any]]] = {}
 _ACTIVE_PRICING_CACHE_KEY: str | None = None
+_USED_MODELS: set[tuple[str | None, str]] = set()
+_APPLIED_PAIRS_VERSION: dict[tuple[str | None, str], int] = {}
+_PRICING_INDEX_VERSION: int = 0
+
+_INITIAL_CATALOG_ENTRIES: tuple[PricingEntry, ...] = tuple(PRICING_CATALOG.entries())
+_INITIAL_MODEL_PRICING: dict[str, dict[str, float]] = {k: dict(v) for k, v in MODEL_PRICING.items()}
 
 
 def _new_pricing_state() -> dict[str, Any]:
     return {
         "source": "bundled",
-        "source_url": OPENAI_PRICING_URL,
+        "source_url": LITELLM_PRICING_URL,
         "fetched_at": None,
         "last_checked_at": None,
         "next_retry_at": None,
@@ -534,16 +573,9 @@ def _new_pricing_state() -> dict[str, Any]:
         "persistence_warning": None,
         "etag": None,
         "last_modified": None,
-        "tier": "standard",
         "initialized": False,
         "failure_count": 0,
-    }
-
-
-def _bundled_openai_rates() -> dict[str, PricingRates]:
-    return {
-        model: PricingRates.from_mapping(rates)
-        for model, rates in _BUNDLED_OPENAI_RATE_VALUES.items()
+        "models": {},
     }
 
 
@@ -554,19 +586,8 @@ def pricing_cache_path() -> Path:
         return Path(configured).expanduser()
     cache_root = os.environ.get("XDG_CACHE_HOME")
     if cache_root:
-        return Path(cache_root).expanduser() / "ai-usage-dashboard" / "openai-pricing.json"
-    return Path.home() / ".cache" / "ai-usage-dashboard" / "openai-pricing.json"
-
-
-def _parse_price(value: str) -> float | None:
-    raw = str(value or "").strip().replace("$", "").replace(",", "")
-    if not raw or raw == "-":
-        return None
-    try:
-        parsed = float(raw)
-    except (TypeError, ValueError):
-        return None
-    return parsed if math.isfinite(parsed) and parsed >= 0 else None
+        return Path(cache_root).expanduser() / "ai-usage-dashboard" / "litellm-pricing.json"
+    return Path.home() / ".cache" / "ai-usage-dashboard" / "litellm-pricing.json"
 
 
 def _response_header(headers: Any, name: str) -> Any:
@@ -585,102 +606,6 @@ def _response_header(headers: Any, name: str) -> Any:
     return None
 
 
-def _model_family(model: str) -> str:
-    """Return a stable family key without depending on specific model IDs."""
-    normalized = _normalize(model)
-    match = re.match(r"^([a-z]+(?:[-.]\d+)?)(?:[-_.]|$)", normalized)
-    return match.group(1) if match else normalized.split("-", 1)[0]
-
-
-def _validate_standard_completeness(rates: Mapping[str, PricingRates]) -> None:
-    """Reject responses that look like an incomplete/incorrect pricing table."""
-    if len(rates) < 5:
-        raise ValueError("OpenAI Standard pricing table contains too few model rows")
-    families = {_model_family(model) for model in rates if _normalize(model)}
-    if len(families) < 2:
-        raise ValueError("OpenAI Standard pricing table contains too few model families")
-
-
-def parse_openai_standard_pricing(markdown: str) -> dict[str, PricingRates]:
-    """Parse the official Standard pricing table from OpenAI's Markdown page.
-
-    The table has deliberately explicit headings.  This avoids relying on the
-    generated HTML/React payload and ignores Batch, Flex, and Fast tables.
-    Long-context columns are retained by the source but not selected because
-    local transcripts do not identify the service tier or context band.
-    """
-    lines = str(markdown or "").splitlines()
-    try:
-        table_start = next(index for index, line in enumerate(lines) if line.strip().lower() == "### standard pricing data")
-    except StopIteration as exc:
-        raise ValueError("OpenAI Standard pricing table was not found") from exc
-
-    header_index = next(
-        (index for index in range(table_start + 1, len(lines)) if lines[index].lstrip().startswith("| Model |")),
-        None,
-    )
-    if header_index is None:
-        raise ValueError("OpenAI Standard pricing table header was not found")
-    headers = tuple(field.strip().lower() for field in lines[header_index].strip().strip("|").split("|"))
-    expected_headers = (
-        "model", "short context input", "short context cached input", "short context cache writes",
-        "short context output", "long context input", "long context cached input",
-        "long context cache writes", "long context output",
-    )
-    if headers != expected_headers:
-        raise ValueError("OpenAI Standard pricing table schema changed")
-    separator_index = header_index + 1
-    if separator_index >= len(lines):
-        raise ValueError("OpenAI Standard pricing table separator was not found")
-    separator_fields = [field.strip() for field in lines[separator_index].strip().strip("|").split("|")]
-    if len(separator_fields) != len(expected_headers) or any(
-        not field or not re.fullmatch(r":?-{3,}:?", field) for field in separator_fields
-    ):
-        raise ValueError("OpenAI Standard pricing table separator is malformed")
-
-    rates: dict[str, PricingRates] = {}
-    normalized_model_ids: set[str] = set()
-    for line in lines[header_index + 2:]:
-        stripped = line.strip()
-        if not stripped.startswith("|"):
-            if rates:
-                break
-            continue
-        fields = [field.strip() for field in stripped.strip("|").split("|")]
-        if len(fields) != len(expected_headers):
-            raise ValueError("OpenAI Standard pricing table contains a malformed row")
-        model = re.sub(r"\s*\(<\d+K context length\)\s*$", "", fields[0], flags=re.IGNORECASE).strip()
-        if not model:
-            raise ValueError("OpenAI Standard pricing table contains an empty model ID")
-        normalized_model = _normalize(model)
-        if model in rates or normalized_model in normalized_model_ids:
-            raise ValueError(f"OpenAI Standard pricing table contains duplicate model ID: {model}")
-        if any(field.strip() == "" for field in fields[1:]):
-            raise ValueError(f"OpenAI Standard pricing table contains partial rates for {model}")
-        uncached = _parse_price(fields[1])
-        cached = _parse_price(fields[2])
-        cache_write = _parse_price(fields[3])
-        output = _parse_price(fields[4])
-        # Some Pro models intentionally have no cached-input rate.  Treating a
-        # cache read as regular input is conservative and avoids zero pricing.
-        if uncached is None or output is None:
-            raise ValueError(f"OpenAI Standard pricing table contains malformed rates for {model}")
-        for field in fields[1:]:
-            if field.strip() not in ("", "-") and _parse_price(field) is None:
-                raise ValueError(f"OpenAI Standard pricing table contains malformed rates for {model}")
-        rates[model] = PricingRates(
-            uncached_input=uncached,
-            cached_input=cached if cached is not None else uncached,
-            output=output,
-            cache_write=cache_write,
-        )
-        normalized_model_ids.add(normalized_model)
-    if not rates:
-        raise ValueError("OpenAI Standard pricing table contained no usable rates")
-    _validate_standard_completeness(rates)
-    return rates
-
-
 def _metadata_fetched_at(metadata: Mapping[str, Any]) -> float | None:
     value = metadata.get("fetched_at")
     if not value:
@@ -691,39 +616,9 @@ def _metadata_fetched_at(metadata: Mapping[str, Any]) -> float | None:
         return None
 
 
-def _apply_openai_rates(rates: Mapping[str, PricingRates], *, replace: bool = False) -> None:
-    """Apply validated OpenAI rates, optionally removing absent stale models."""
-    if replace:
-        for model in list(MODEL_PRICING):
-            if model in _BUNDLED_OPENAI_MODELS or PRICING_CATALOG.get_entry("codex", model) is not None:
-                if model not in rates and PRICING_CATALOG.get_entry("codex", model) is not None:
-                    PRICING_CATALOG.remove("codex", model)
-                    MODEL_PRICING.pop(model, None)
-    for model, model_rates in rates.items():
-        aliases = tuple(alias for alias, target in _ALIASES if target == model)
-        PRICING_CATALOG.register("codex", model, model_rates, aliases=aliases)
-        MODEL_PRICING[model] = model_rates.as_dict(include_optional=False)
-
-
-def _activate_pricing(key: str, rates: Mapping[str, PricingRates]) -> None:
-    """Make one cache snapshot the process-global active catalog snapshot."""
-    global _ACTIVE_PRICING_CACHE_KEY
-    snapshot = dict(rates)
-    _PRICING_RATES_BY_KEY[key] = snapshot
-    _apply_openai_rates(snapshot, replace=True)
-    _ACTIVE_PRICING_CACHE_KEY = key
-
-
-def _ensure_active_pricing(key: str) -> None:
-    """Ensure active rates and metadata refer to the same cache key."""
-    if _ACTIVE_PRICING_CACHE_KEY == key:
-        return
-    _activate_pricing(key, _PRICING_RATES_BY_KEY.get(key) or _bundled_openai_rates())
-
-
 def _write_pricing_cache(
     path: Path,
-    rates: Mapping[str, PricingRates],
+    index: Mapping[str, dict[str, Any]],
     fetched_at: str,
     *,
     etag: str | None = None,
@@ -731,13 +626,13 @@ def _write_pricing_cache(
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "source": "openai",
-        "source_url": OPENAI_PRICING_URL,
+        "source": "litellm",
+        "schema_version": 1,
+        "source_url": LITELLM_PRICING_URL,
         "fetched_at": fetched_at,
         "etag": etag,
         "last_modified": last_modified,
-        "tier": "standard",
-        "rates": {model: value.as_dict() for model, value in rates.items()},
+        "index": dict(index),
     }
     temp_name: str | None = None
     try:
@@ -755,7 +650,7 @@ def _write_pricing_cache(
                 pass
 
 
-def _read_pricing_cache(path: Path) -> tuple[dict[str, PricingRates], dict[str, Any]] | None:
+def _read_pricing_cache(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str, Any]] | None:
     try:
         def reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             result: dict[str, Any] = {}
@@ -768,11 +663,15 @@ def _read_pricing_cache(path: Path) -> tuple[dict[str, PricingRates], dict[str, 
         payload = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_pairs)
         if not isinstance(payload, dict):
             return None
-        if payload.get("source") != "openai" or payload.get("tier") != "standard":
+        if payload.get("source") != "litellm" or payload.get("schema_version") != 1:
             return None
         source_url = str(payload.get("source_url") or "")
         parsed_url = urlparse(source_url)
-        if source_url != OPENAI_PRICING_URL or parsed_url.scheme != "https" or parsed_url.hostname != "developers.openai.com":
+        if (
+            source_url != LITELLM_PRICING_URL
+            or parsed_url.scheme != "https"
+            or parsed_url.hostname != LITELLM_ALLOWED_HOST
+        ):
             return None
         fetched_at = payload.get("fetched_at")
         if _metadata_fetched_at({"fetched_at": fetched_at}) is None:
@@ -780,61 +679,57 @@ def _read_pricing_cache(path: Path) -> tuple[dict[str, PricingRates], dict[str, 
         for validator in ("etag", "last_modified"):
             if payload.get(validator) is not None and not isinstance(payload.get(validator), str):
                 return None
-        raw_rates = payload.get("rates")
-        if not isinstance(raw_rates, dict) or len(raw_rates) < 1:
+        raw_index = payload.get("index")
+        if not isinstance(raw_index, dict) or len(raw_index) < 1:
             return None
-        rates: dict[str, PricingRates] = {}
-        normalized_model_ids: set[str] = set()
-        for model, value in raw_rates.items():
-            if not isinstance(model, str) or not model.strip() or _normalize(model) in normalized_model_ids or not isinstance(value, Mapping):
+
+        validated_index: dict[str, dict[str, Any]] = {}
+        for model_key, entry in raw_index.items():
+            if not isinstance(model_key, str) or not model_key.strip() or not isinstance(entry, Mapping):
                 return None
+            provider = entry.get("litellm_provider")
+            if not isinstance(provider, str) or not provider.strip():
+                return None
+            entry_copy: dict[str, Any] = {"litellm_provider": str(provider)}
             required = ("uncached_input", "cached_input", "output")
-            if any(key not in value for key in required):
-                return None
-            numeric_fields = (
-                *required,
-                "cache_write",
-                "cache_write_input",
-                "cache_creation",
-                "cache_creation_input",
-                "cache_write_5m",
-                "cache_write_1h",
-                "cache_creation_5m",
-                "cache_creation_1h",
-            )
-            if any(
-                key in value and value[key] is not None
-                and (isinstance(value[key], bool) or not isinstance(value[key], (int, float)))
-                for key in numeric_fields
-            ):
-                return None
-            parsed_rates = PricingRates.from_mapping(value)
-            if any(
-                not math.isfinite(rate) or rate < 0
-                for rate in (parsed_rates.uncached_input, parsed_rates.cached_input, parsed_rates.output)
-            ):
-                return None
-            if parsed_rates.cache_write is not None and (
-                not math.isfinite(parsed_rates.cache_write) or parsed_rates.cache_write < 0
-            ):
-                return None
-            if parsed_rates.cache_creation is not None and (
-                not math.isfinite(parsed_rates.cache_creation) or parsed_rates.cache_creation < 0
-            ):
-                return None
-            for ttl_rate in (parsed_rates.cache_write_5m, parsed_rates.cache_write_1h):
-                if ttl_rate is not None and (
-                    not math.isfinite(ttl_rate) or ttl_rate < 0
+            for field in required:
+                if field not in entry:
+                    return None
+                val = entry[field]
+                if (
+                    val is None
+                    or isinstance(val, bool)
+                    or not isinstance(val, (int, float))
+                    or not math.isfinite(val)
+                    or val < 0
                 ):
                     return None
-            rates[model] = parsed_rates
-            normalized_model_ids.add(_normalize(model))
-        try:
-            _validate_standard_completeness(rates)
-        except ValueError:
-            return None
+                entry_copy[field] = float(val)
+
+            optional_fields = (
+                "cache_write",
+                "cache_creation",
+                "cache_write_5m",
+                "cache_write_1h",
+            )
+            for field in optional_fields:
+                if field in entry:
+                    val = entry[field]
+                    if val is not None:
+                        if (
+                            isinstance(val, bool)
+                            or not isinstance(val, (int, float))
+                            or not math.isfinite(val)
+                            or val < 0
+                        ):
+                            return None
+                        entry_copy[field] = float(val)
+            validated_index[model_key] = entry_copy
+
+        validate_index(validated_index)
+
         metadata = {
-            "source": "openai-cache",
+            "source": "litellm-cache",
             "source_url": source_url,
             "fetched_at": fetched_at,
             "etag": payload.get("etag"),
@@ -844,26 +739,225 @@ def _read_pricing_cache(path: Path) -> tuple[dict[str, PricingRates], dict[str, 
             "stale": True,
             "error": None,
             "persistence_warning": None,
-            "tier": str(payload.get("tier") or "standard"),
+            "failure_count": 0,
         }
-        return rates, metadata
+        return validated_index, metadata
     except (OSError, TypeError, ValueError, KeyError, OverflowError):
         return None
 
 
-def refresh_openai_pricing(
+def _apply_single_model(
+    provider: str | None,
+    raw_model: str,
+    index: Mapping[str, dict[str, Any]],
+    state: dict[str, Any],
+    *,
+    catalog: PricingCatalog | None = None,
+    model_pricing: dict[str, Any] | None = None,
+) -> None:
+    cat = catalog if catalog is not None else PRICING_CATALOG
+    mp = model_pricing if model_pricing is not None else MODEL_PRICING
+
+    hit = lookup(index, raw_model)
+    res = cat.resolve(raw_model, provider)
+
+    matched_entry = None
+    if res.status == "known" and res.canonical_model:
+        entry = cat.get_entry(res.provider or provider or "", res.canonical_model)
+        if entry is not None:
+            norm_raw = _normalize(raw_model)
+            if _normalize(entry.model) == norm_raw:
+                matched_entry = entry
+            else:
+                # Matched by alias (or fuzzy)
+                if hit is not None:
+                    canonical_hit = lookup(index, entry.model)
+                    if canonical_hit is not None and canonical_hit[0] == hit[0]:
+                        matched_entry = entry
+                    else:
+                        matched_entry = None
+                else:
+                    if res.matched_by in ("canonical", "alias"):
+                        matched_entry = entry
+                    else:
+                        matched_entry = None
+
+    if hit is None:
+        if matched_entry is not None:
+            hit = lookup(index, matched_entry.model)
+
+    if hit is None:
+        return
+
+    key, entry_data = hit
+
+    prov_map = {
+        "openai": "codex",
+        "anthropic": "claude",
+        "gemini": "antigravity",
+        "vertex_ai-language-models": "antigravity",
+        "deepseek": "deepseek",
+    }
+
+    if matched_entry is not None:
+        canonical = matched_entry.model
+        target_provider = matched_entry.provider
+        aliases = matched_entry.aliases
+        exact_only = matched_entry.exact_only
+    else:
+        raw = raw_model.strip()
+        scoped_provider = normalize_provider(provider)
+        model_part = raw
+        current_entries = cat._entries
+        known_providers = {e.provider for e in current_entries.values()}
+        for separator in ("/", ":"):
+            if separator in raw:
+                prefix, candidate = raw.split(separator, 1)
+                normalized_prefix = normalize_provider(prefix)
+                if normalized_prefix in known_providers:
+                    scoped_provider = scoped_provider or normalized_prefix
+                    model_part = candidate.strip()
+                    break
+
+        canonical = model_part
+        target_provider = scoped_provider if scoped_provider else prov_map.get(entry_data.get("litellm_provider"), "codex")
+        aliases = (raw,) if raw != canonical else ()
+        exact_only = True
+
+    rate_kwargs: dict[str, Any] = {
+        "uncached_input": entry_data["uncached_input"],
+        "cached_input": entry_data["cached_input"],
+        "output": entry_data["output"],
+    }
+    for field in ("cache_write", "cache_creation", "cache_write_5m", "cache_write_1h"):
+        if field in entry_data:
+            rate_kwargs[field] = entry_data[field]
+
+    if target_provider == "claude":
+        uncached = float(rate_kwargs["uncached_input"])
+        if rate_kwargs.get("cache_write_5m") is None and rate_kwargs.get("cache_creation") is None:
+            rate_kwargs["cache_write"] = round_rate(uncached * 1.25)
+            rate_kwargs["cache_creation"] = round_rate(uncached * 1.25)
+            rate_kwargs["cache_write_5m"] = round_rate(uncached * 1.25)
+        elif rate_kwargs.get("cache_write_5m") is None:
+            cc = rate_kwargs.get("cache_creation")
+            rate_kwargs["cache_write_5m"] = round_rate(float(cc if cc is not None else (uncached * 1.25)))
+        if rate_kwargs.get("cache_write_1h") is None:
+            rate_kwargs["cache_write_1h"] = round_rate(uncached * 2.0)
+
+    rates = PricingRates(
+        uncached_input=float(rate_kwargs["uncached_input"]),
+        cached_input=float(rate_kwargs["cached_input"]),
+        output=float(rate_kwargs["output"]),
+        cache_write=_optional_float(rate_kwargs.get("cache_write")),
+        cache_creation=_optional_float(rate_kwargs.get("cache_creation")),
+        cache_write_5m=_optional_float(rate_kwargs.get("cache_write_5m")),
+        cache_write_1h=_optional_float(rate_kwargs.get("cache_write_1h")),
+    )
+
+    if target_provider == "deepseek":
+        off_peak = PricingRates(
+            uncached_input=round_rate(rates.uncached_input * 0.5),
+            cached_input=round_rate(rates.cached_input * 0.5),
+            output=round_rate(rates.output * 0.5),
+            cache_write=round_rate(rates.cache_write * 0.5) if rates.cache_write is not None else None,
+            cache_creation=round_rate(rates.cache_creation * 0.5) if rates.cache_creation is not None else None,
+            cache_write_5m=round_rate(rates.cache_write_5m * 0.5) if rates.cache_write_5m is not None else None,
+            cache_write_1h=round_rate(rates.cache_write_1h * 0.5) if rates.cache_write_1h is not None else None,
+        )
+    else:
+        off_peak = None
+
+    cat.register(
+        target_provider,
+        canonical,
+        rates,
+        aliases=aliases,
+        off_peak_rates=off_peak,
+        exact_only=exact_only,
+    )
+
+    mp[canonical] = rates.as_dict(include_optional=False)
+
+    if "models" not in state or not isinstance(state["models"], dict):
+        state["models"] = {}
+    state["models"][raw_model] = {"litellm_key": key, "canonical_model": canonical}
+
+
+def _activate_pricing(state_key: str, index: Mapping[str, dict[str, Any]]) -> None:
+    global _ACTIVE_PRICING_CACHE_KEY, _PRICING_INDEX_VERSION
+    _PRICING_INDEX_VERSION += 1
+    _ACTIVE_PRICING_CACHE_KEY = state_key
+    _PRICING_INDEX_BY_KEY[state_key] = dict(index)
+    _APPLIED_PAIRS_VERSION.clear()
+
+    staged_catalog = PricingCatalog(_INITIAL_CATALOG_ENTRIES)
+    staged_model_pricing = {k: dict(v) for k, v in _INITIAL_MODEL_PRICING.items()}
+    staged_models: dict[str, Any] = {}
+    temp_state: dict[str, Any] = {"models": staged_models}
+
+    for provider, raw_model in list(_USED_MODELS):
+        _apply_single_model(
+            provider,
+            raw_model,
+            index,
+            temp_state,
+            catalog=staged_catalog,
+            model_pricing=staged_model_pricing,
+        )
+        _APPLIED_PAIRS_VERSION[(provider, raw_model)] = _PRICING_INDEX_VERSION
+
+    PRICING_CATALOG._entries = staged_catalog._entries
+
+    for k, v in staged_model_pricing.items():
+        MODEL_PRICING[k] = v
+    for k in list(MODEL_PRICING):
+        if k not in staged_model_pricing:
+            del MODEL_PRICING[k]
+
+    state = _PRICING_STATES.setdefault(state_key, _new_pricing_state())
+    state["models"] = staged_models
+
+
+def _ensure_active_pricing(state_key: str) -> None:
+    global _ACTIVE_PRICING_CACHE_KEY
+    if _ACTIVE_PRICING_CACHE_KEY == state_key:
+        return
+    idx = _PRICING_INDEX_BY_KEY.get(state_key) or {}
+    _activate_pricing(state_key, idx)
+
+
+def apply_used_model_rates(models: Iterable[tuple[str | None, str]]) -> None:
+    """Apply LiteLLM rates to models seen in local usage."""
+    with _PRICING_REFRESH_LOCK:
+        path = pricing_cache_path()
+        state_key = _ACTIVE_PRICING_CACHE_KEY or str(path.resolve())
+        state = _PRICING_STATES.setdefault(state_key, _new_pricing_state())
+        index = _PRICING_INDEX_BY_KEY.get(state_key)
+
+        for provider, raw_model in models:
+            if not raw_model:
+                continue
+            model_str = str(raw_model).strip()
+            if not model_str or model_str.lower() in ("mixed", "unknown"):
+                continue
+            pair = (provider, model_str)
+            _USED_MODELS.add(pair)
+            if index is not None:
+                if _APPLIED_PAIRS_VERSION.get(pair) == _PRICING_INDEX_VERSION:
+                    continue
+                _apply_single_model(provider, model_str, index, state)
+                _APPLIED_PAIRS_VERSION[pair] = _PRICING_INDEX_VERSION
+
+
+def refresh_pricing(
     *,
     force: bool = False,
     cache_path: str | Path | None = None,
     fetcher: Any | None = None,
-    ttl_seconds: int = OPENAI_PRICING_TTL_SECONDS,
+    ttl_seconds: int = PRICING_TTL_SECONDS,
 ) -> dict[str, Any]:
-    """Refresh OpenAI Standard rates, coalescing concurrent requests.
-
-    Network and parsing failures never remove working rates.  A valid disk
-    snapshot is preferred over the bundled catalog when offline, and metadata
-    reports whether the active rates are stale.
-    """
+    """Refresh LiteLLM public pricing, coalescing concurrent requests."""
     path = Path(cache_path).expanduser() if cache_path is not None else pricing_cache_path()
     state_key = str(path.resolve())
     with _PRICING_REFRESH_LOCK:
@@ -873,8 +967,9 @@ def refresh_openai_pricing(
             cached = _read_pricing_cache(path)
             state["initialized"] = True
             if cached is not None:
-                cached_rates, cached_metadata = cached
-                _activate_pricing(state_key, cached_rates)
+                cached_index, cached_metadata = cached
+                _activate_pricing(state_key, cached_index)
+                cached_metadata.pop("models", None)
                 state.update(cached_metadata)
                 cached_at = _metadata_fetched_at(state)
                 if not force and cached_at is not None and now - cached_at < max(0, ttl_seconds):
@@ -894,42 +989,43 @@ def refresh_openai_pricing(
         state["last_checked_at"] = datetime.now(timezone.utc).isoformat()
         try:
             if fetcher is None:
-                parsed_url = urlparse(OPENAI_PRICING_URL)
-                if parsed_url.scheme != "https" or parsed_url.hostname != "developers.openai.com":
-                    raise ValueError("OpenAI pricing URL must use developers.openai.com over HTTPS")
-                headers = {"User-Agent": "ai-usage-dashboard/1.0", "Accept": "text/markdown"}
+                parsed_url = urlparse(LITELLM_PRICING_URL)
+                if parsed_url.scheme != "https" or parsed_url.hostname != LITELLM_ALLOWED_HOST:
+                    raise ValueError(f"LiteLLM pricing URL must use {LITELLM_ALLOWED_HOST} over HTTPS")
+                headers = {"User-Agent": "ai-usage-dashboard/1.0", "Accept": "application/json, text/plain"}
                 if state.get("etag"):
                     headers["If-None-Match"] = str(state["etag"])
                 if state.get("last_modified"):
                     headers["If-Modified-Since"] = str(state["last_modified"])
-                request = Request(OPENAI_PRICING_URL, headers=headers)
+                request = Request(LITELLM_PRICING_URL, headers=headers)
                 try:
-                    response = urlopen(request, timeout=10)  # noqa: S310 - fixed official HTTPS URL
+                    response = urlopen(request, timeout=15)  # noqa: S310 - fixed official HTTPS URL
                 except HTTPError as exc:
                     if exc.code != 304:
                         raise
                     refreshed = datetime.now(timezone.utc).isoformat()
                     state.update({
-                        "source": "openai", "source_url": OPENAI_PRICING_URL, "fetched_at": refreshed,
-                        "stale": False, "error": None, "next_retry_at": None, "failure_count": 0,
-                        "tier": "standard",
+                        "source": "litellm",
+                        "source_url": LITELLM_PRICING_URL,
+                        "fetched_at": refreshed,
+                        "stale": False,
+                        "error": None,
+                        "next_retry_at": None,
+                        "failure_count": 0,
                     })
-                    cached_active = {
-                        model: entry.rates
-                        for (provider, model), entry in PRICING_CATALOG.models.items()
-                        if provider == "codex" and entry.rates is not None
-                    }
-                    _activate_pricing(state_key, cached_active)
+                    current_index = _PRICING_INDEX_BY_KEY.get(state_key) or {}
+                    _activate_pricing(state_key, current_index)
                     state["persistence_warning"] = None
                     try:
-                        _write_pricing_cache(path, cached_active, refreshed, etag=state.get("etag"), last_modified=state.get("last_modified"))
+                        _write_pricing_cache(path, current_index, refreshed, etag=state.get("etag"), last_modified=state.get("last_modified"))
                     except Exception as persist_exc:
                         state["persistence_warning"] = str(persist_exc)
                     return dict(state)
-                response_url = response.geturl() if callable(getattr(response, "geturl", None)) else OPENAI_PRICING_URL
+
+                response_url = response.geturl() if callable(getattr(response, "geturl", None)) else LITELLM_PRICING_URL
                 final_url = urlparse(str(response_url))
-                if final_url.scheme != "https" or final_url.hostname != "developers.openai.com":
-                    raise ValueError("OpenAI pricing response redirected away from developers.openai.com")
+                if final_url.scheme != "https" or final_url.hostname != LITELLM_ALLOWED_HOST:
+                    raise ValueError(f"LiteLLM pricing response redirected away from {LITELLM_ALLOWED_HOST}")
                 response_code = getattr(response, "status", None)
                 if response_code is None:
                     try:
@@ -943,47 +1039,53 @@ def refresh_openai_pricing(
                         pass
                     refreshed = datetime.now(timezone.utc).isoformat()
                     state.update({
-                        "source": "openai", "source_url": OPENAI_PRICING_URL, "fetched_at": refreshed,
-                        "stale": False, "error": None, "next_retry_at": None, "failure_count": 0,
-                        "tier": "standard",
+                        "source": "litellm",
+                        "source_url": LITELLM_PRICING_URL,
+                        "fetched_at": refreshed,
+                        "stale": False,
+                        "error": None,
+                        "next_retry_at": None,
+                        "failure_count": 0,
                     })
-                    cached_active = {
-                        model: entry.rates
-                        for (provider, model), entry in PRICING_CATALOG.models.items()
-                        if provider == "codex" and entry.rates is not None
-                    }
-                    _activate_pricing(state_key, cached_active)
+                    current_index = _PRICING_INDEX_BY_KEY.get(state_key) or {}
+                    _activate_pricing(state_key, current_index)
                     state["persistence_warning"] = None
                     try:
-                        _write_pricing_cache(path, cached_active, refreshed, etag=state.get("etag"), last_modified=state.get("last_modified"))
+                        _write_pricing_cache(path, current_index, refreshed, etag=state.get("etag"), last_modified=state.get("last_modified"))
                     except Exception as persist_exc:
                         state["persistence_warning"] = str(persist_exc)
                     return dict(state)
+
                 with response:
                     content_type = str(_response_header(getattr(response, "headers", None), "Content-Type") or "").lower()
-                    if "text/markdown" not in content_type and "text/plain" not in content_type:
-                        raise ValueError("OpenAI pricing response was not Markdown/text")
-                    body = response.read(OPENAI_PRICING_MAX_RESPONSE_BYTES + 1)
-                    if len(body) > OPENAI_PRICING_MAX_RESPONSE_BYTES:
-                        raise ValueError("OpenAI pricing response exceeded size limit")
-                    markdown = body.decode("utf-8")
+                    if "application/json" not in content_type and "text/plain" not in content_type:
+                        raise ValueError("LiteLLM pricing response was not JSON or text")
+                    body = response.read(LITELLM_MAX_RESPONSE_BYTES + 1)
+                    if len(body) > LITELLM_MAX_RESPONSE_BYTES:
+                        raise ValueError("LiteLLM pricing response exceeded size limit")
                     response_etag = _response_header(getattr(response, "headers", None), "ETag")
                     response_last_modified = _response_header(getattr(response, "headers", None), "Last-Modified")
+                index = parse_feed(body)
             else:
-                markdown = fetcher()
+                data = fetcher()
+                if isinstance(data, Mapping):
+                    index = build_index(data)
+                    validate_index(index)
+                else:
+                    index = parse_feed(data)
                 response_etag = None
                 response_last_modified = None
-            rates = parse_openai_standard_pricing(markdown)
+
             fetched = datetime.now(timezone.utc).isoformat()
-            _activate_pricing(state_key, rates)
+            _activate_pricing(state_key, index)
             persistence_warning = None
             try:
-                _write_pricing_cache(path, rates, fetched, etag=response_etag, last_modified=response_last_modified)
+                _write_pricing_cache(path, index, fetched, etag=response_etag, last_modified=response_last_modified)
             except Exception as persist_exc:
                 persistence_warning = str(persist_exc)
             state.update({
-                "source": "openai",
-                "source_url": OPENAI_PRICING_URL,
+                "source": "litellm",
+                "source_url": LITELLM_PRICING_URL,
                 "fetched_at": fetched,
                 "etag": response_etag,
                 "last_modified": response_last_modified,
@@ -992,22 +1094,22 @@ def refresh_openai_pricing(
                 "persistence_warning": persistence_warning,
                 "next_retry_at": None,
                 "failure_count": 0,
-                "tier": "standard",
             })
             return dict(state)
-        except Exception as exc:  # Network/parsing errors must not break dashboard usage.
+        except Exception as exc:
             error = str(exc)
 
         state["failure_count"] = int(state.get("failure_count") or 0) + 1
-        backoff = min(60 * 60, OPENAI_PRICING_RETRY_SECONDS * (2 ** min(state["failure_count"] - 1, 2)))
+        backoff = min(60 * 60, PRICING_RETRY_SECONDS * (2 ** min(state["failure_count"] - 1, 2)))
         state["next_retry_at"] = datetime.fromtimestamp(now + backoff, timezone.utc).isoformat()
-        if state.get("source") in ("openai-cache", "bundled") or state.get("fetched_at") is None:
+        if state.get("source") in ("litellm-cache", "bundled") or state.get("fetched_at") is None:
             cached = _read_pricing_cache(path)
         else:
             cached = None
         if cached is not None:
-            cached_rates, cached_metadata = cached
-            _activate_pricing(state_key, cached_rates)
+            cached_index, cached_metadata = cached
+            _activate_pricing(state_key, cached_index)
+            cached_metadata.pop("models", None)
             cached_metadata["error"] = error
             cached_metadata["last_checked_at"] = state.get("last_checked_at")
             cached_metadata["next_retry_at"] = state.get("next_retry_at")
@@ -1023,7 +1125,10 @@ def pricing_metadata(cache_path: str | Path | None = None) -> dict[str, Any]:
     """Return a copy of the active pricing provenance metadata."""
     path = Path(cache_path).expanduser() if cache_path is not None else pricing_cache_path()
     with _PRICING_REFRESH_LOCK:
-        return dict(_PRICING_STATES.get(str(path.resolve()), _new_pricing_state()))
+        meta = dict(_PRICING_STATES.get(str(path.resolve()), _new_pricing_state()))
+        if "models" in meta:
+            meta["models"] = dict(meta["models"])
+        return meta
 
 
 def active_pricing_payload(*, refresh: bool = True, cache_path: str | Path | None = None) -> dict[str, Any]:
@@ -1031,18 +1136,21 @@ def active_pricing_payload(*, refresh: bool = True, cache_path: str | Path | Non
     path = Path(cache_path).expanduser() if cache_path is not None else pricing_cache_path()
     state_key = str(path.resolve())
     if refresh:
-        refresh_openai_pricing(cache_path=cache_path)
+        refresh_pricing(cache_path=cache_path)
     with _PRICING_REFRESH_LOCK:
         _ensure_active_pricing(state_key)
         payload: dict[str, Any] = {}
-        for model, rates in MODEL_PRICING.items():
+        for model, rates in dict(MODEL_PRICING).items():
             resolved = PRICING_CATALOG.resolve(model)
             payload[model] = resolved.rates.as_dict() if resolved.rates is not None else dict(rates)
         luna_rates = payload.get("gpt-5.6-luna")
         if isinstance(luna_rates, dict):
             payload.setdefault("codex-auto-review", dict(luna_rates))
             payload.setdefault("gpt-reserve", dict(luna_rates))
-        payload["__meta__"] = dict(_PRICING_STATES.get(state_key, _new_pricing_state()))
+        meta = dict(_PRICING_STATES.get(state_key, _new_pricing_state()))
+        if "models" in meta:
+            meta["models"] = dict(meta["models"])
+        payload["__meta__"] = meta
         return payload
 
 
@@ -1179,7 +1287,7 @@ __all__ = [
     "calculate_cost", "calculate_cost_strict", "get_pricing", "get_pricing_strict",
     "is_deepseek_peak_utc", "to_utc_datetime",
     "normalize_provider", "resolve_cost_strict", "resolve_pricing_strict",
-    "OPENAI_PRICING_URL", "OPENAI_PRICING_TTL_SECONDS", "pricing_cache_path",
-    "parse_openai_standard_pricing", "refresh_openai_pricing", "pricing_metadata",
+    "LITELLM_PRICING_URL", "PRICING_TTL_SECONDS", "pricing_cache_path",
+    "refresh_pricing", "apply_used_model_rates", "pricing_metadata",
     "active_pricing_payload",
 ]

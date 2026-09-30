@@ -9,7 +9,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping, Iterator
 
-from ..pricing import MODEL_PRICING, PRICING_CATALOG, calculate_cost_strict
+from ..pricing import (
+    MODEL_PRICING,
+    PRICING_CATALOG,
+    apply_used_model_rates,
+    calculate_cost_strict,
+)
 from ..timezones import local_timezone, timezone_name
 from .agy import AntigravitySource
 from .claude import ClaudeCodeSource
@@ -2340,9 +2345,27 @@ def get_tool_usage(
                 )
             extracted_sessions.append(session)
 
+    merged_sessions = _merge_usage_sessions(extracted_sessions)
+    used_models: set[tuple[str | None, str]] = set()
+    for session in [*extracted_sessions, *merged_sessions]:
+        tool_or_provider = str(session.provider or session.tool or "") or None
+        if session.model:
+            used_models.add((
+                _model_provider(str(session.model), tool_or_provider),
+                str(session.model),
+            ))
+        for event in session.events:
+            model = event.model or session.model
+            if model:
+                used_models.add((
+                    _model_provider(str(model), tool_or_provider),
+                    str(model),
+                ))
+    apply_used_model_rates(used_models)
+
     sessions = [
         _serialize_extracted_session(session)
-        for session in _merge_usage_sessions(extracted_sessions)
+        for session in merged_sessions
     ]
 
     return _filter_usage_data(
