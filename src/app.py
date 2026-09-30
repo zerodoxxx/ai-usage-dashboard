@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response
 
 from src.parsers.aggregator import get_tool_usage
-from src.pricing import active_pricing_payload, refresh_openai_pricing
+from src.pricing import active_pricing_payload, refresh_pricing
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -106,7 +106,7 @@ def api_usage(
     try:
         # Refresh before parsing so provider adapters and their snapshots use
         # the same active rates as the pricing endpoint.
-        refresh_openai_pricing()
+        refresh_pricing()
         return get_tool_usage(tool, time_range=time_range, start=start, end=end)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

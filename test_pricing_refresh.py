@@ -1,195 +1,466 @@
-"""Offline tests for the official OpenAI pricing refresh path."""
+"""Tests for LiteLLM pricing feed integration and catalog refresh."""
+
+from __future__ import annotations
 
 import json
+import math
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from urllib.error import HTTPError
 
-from src.parsers.aggregator import _refresh_estimated_session_cost
+import pytest
+
+import src.pricing as pricing_module
+from src.litellm_pricing import (
+    LITELLM_ALLOWED_HOST,
+    LITELLM_MAX_RESPONSE_BYTES,
+    LITELLM_PRICING_URL,
+    build_index,
+    litellm_key_candidates,
+    lookup,
+    parse_feed,
+    round_rate,
+    validate_index,
+)
 from src.parsers.contracts import CostEstimate, TokenUsage, UsageSession
 from src.pricing import (
     active_pricing_payload,
+    apply_used_model_rates,
+    calculate_cost_strict,
     get_pricing_strict,
-    parse_openai_standard_pricing,
-    refresh_openai_pricing,
+    pricing_metadata,
+    refresh_pricing,
 )
-import src.pricing as pricing_module
 
 
-STANDARD_FIXTURE = """
-# Pricing
+@pytest.fixture(autouse=True)
+def isolate_pricing_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Isolate global pricing state and forbid network access during unit tests."""
+    def forbidden_urlopen(*_args, **_kwargs):
+        raise AssertionError("Network access is forbidden in unit tests")
 
-### Standard pricing data
-| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| gpt-6-astra | $10.00 | $1.00 | $12.50 | $50.00 | $20.00 | $2.00 | $25.00 | $75.00 |
-| gpt-6-sol | $2.00 | $0.20 | $2.50 | $10.00 | $4.00 | $0.40 | $5.00 | $15.00 |
-| gpt-6-luna | $0.10 | $0.01 | $0.125 | $0.50 | $0.20 | $0.02 | $0.25 | $0.75 |
-| gpt-5.6-sol | $4.00 | $0.40 | $5.00 | $20.00 | $8.00 | $0.80 | $10.00 | $30.00 |
-| gpt-5.6-terra | $2.00 | $0.20 | $2.50 | $12.00 | $4.00 | $0.40 | $5.00 | $18.00 |
-| gpt-5.6-luna | $0.20 | $0.02 | $0.25 | $1.20 | $0.40 | $0.04 | $0.50 | $1.80 |
-| gpt-5.5 (<272K context length) | $5.00 | $0.50 | - | $30.00 | $10.00 | $1.00 | - | $45.00 |
+    monkeypatch.setattr(pricing_module, "urlopen", forbidden_urlopen)
 
-### Batch pricing data
-| Model | Short context input | Short context cached input | Short context cache writes | Short context output |
-| --- | --- | --- | --- | --- |
-| gpt-5.6-sol | $2.00 | $0.20 | $2.50 | $10.00 |
-"""
+    orig_entries = dict(pricing_module.PRICING_CATALOG._entries)
+    orig_model_pricing = dict(pricing_module.MODEL_PRICING)
+    orig_pricing_states = {k: dict(v) for k, v in pricing_module._PRICING_STATES.items()}
+    orig_index_by_key = {k: dict(v) for k, v in pricing_module._PRICING_INDEX_BY_KEY.items()}
+    orig_active_key = pricing_module._ACTIVE_PRICING_CACHE_KEY
+    orig_used_models = set(pricing_module._USED_MODELS)
+    orig_applied_pairs_version = dict(pricing_module._APPLIED_PAIRS_VERSION)
+    orig_version = pricing_module._PRICING_INDEX_VERSION
 
+    default_cache = tmp_path / "default-pricing-cache.json"
+    monkeypatch.setenv("AI_USAGE_PRICING_CACHE", str(default_cache))
 
-def test_standard_markdown_parser_selects_short_context_and_strips_annotations() -> None:
-    rates = parse_openai_standard_pricing(STANDARD_FIXTURE)
-    assert rates["gpt-5.6-sol"].as_dict() == {
-        "uncached_input": 4.0,
-        "cached_input": 0.4,
-        "output": 20.0,
-        "cache_write": 5.0,
-    }
-    assert rates["gpt-5.5"].as_dict() == {
-        "uncached_input": 5.0,
-        "cached_input": 0.5,
-        "output": 30.0,
-    }
+    yield
+
+    pricing_module.PRICING_CATALOG._entries = orig_entries
+    pricing_module.MODEL_PRICING.clear()
+    pricing_module.MODEL_PRICING.update(orig_model_pricing)
+    pricing_module._PRICING_STATES.clear()
+    pricing_module._PRICING_STATES.update(orig_pricing_states)
+    pricing_module._PRICING_INDEX_BY_KEY.clear()
+    pricing_module._PRICING_INDEX_BY_KEY.update(orig_index_by_key)
+    pricing_module._ACTIVE_PRICING_CACHE_KEY = orig_active_key
+    pricing_module._USED_MODELS.clear()
+    pricing_module._USED_MODELS.update(orig_used_models)
+    pricing_module._APPLIED_PAIRS_VERSION.clear()
+    pricing_module._APPLIED_PAIRS_VERSION.update(orig_applied_pairs_version)
+    pricing_module._PRICING_INDEX_VERSION = orig_version
 
 
-def test_pricing_cache_rejects_invalid_ttl_write_rates(tmp_path: Path) -> None:
-    cache_file = tmp_path / "pricing.json"
-    cache_file.write_text(json.dumps({
-        "source": "openai",
-        "source_url": pricing_module.OPENAI_PRICING_URL,
-        "fetched_at": "2026-09-25T00:00:00+00:00",
-        "tier": "standard",
-        "rates": {
-            "gpt-5.6-sol": {
-                "uncached_input": 4.0,
-                "cached_input": 0.4,
-                "output": 20.0,
-                "cache_write_5m": -1.0,
-            }
+def make_feed_fixture(**overrides: dict[str, Any]) -> dict[str, Any]:
+    """Return a valid test feed with standard models, providers, and test junk."""
+    feed: dict[str, Any] = {
+        "sample_spec": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 1e-6,
+            "output_cost_per_token": 2e-6,
         },
-    }), encoding="utf-8")
+        "openrouter/anthropic/claude-3": {
+            "litellm_provider": "anthropic",
+            "mode": "chat",
+            "input_cost_per_token": 1e-6,
+            "output_cost_per_token": 2e-6,
+        },
+        "bedrock/anthropic.claude-v2": {
+            "litellm_provider": "anthropic",
+            "mode": "chat",
+            "input_cost_per_token": 1e-6,
+            "output_cost_per_token": 2e-6,
+        },
+        "zero-cost": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 0.0,
+            "output_cost_per_token": 0.0,
+        },
+        "missing-output": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 1e-6,
+        },
+        "nan-cost": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": float("nan"),
+            "output_cost_per_token": 1e-6,
+        },
+        "negative-cost": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": -1e-6,
+            "output_cost_per_token": 1e-6,
+        },
+        "bool-cost": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": True,
+            "output_cost_per_token": 1e-6,
+        },
+        "gemini/gemini-3.8-flash": {
+            "litellm_provider": "gemini",
+            "mode": "chat",
+            "input_cost_per_token": 8e-7,
+            "output_cost_per_token": 4e-6,
+        },
+        "gemini-3.8-flash": {
+            "litellm_provider": "vertex_ai-language-models",
+            "mode": "chat",
+            "input_cost_per_token": 7.5e-7,
+            "output_cost_per_token": 3.75e-6,
+            "cache_read_input_token_cost": 7.5e-8,
+        },
+        "claude-opus-5-5": {
+            "litellm_provider": "anthropic",
+            "mode": "chat",
+            "input_cost_per_token": 4e-6,
+            "output_cost_per_token": 2e-5,
+            "cache_read_input_token_cost": 2e-7,
+            "cache_creation_input_token_cost": 5e-6,
+            "cache_creation_input_token_cost_above_1hr": 8e-6,
+        },
+        "claude-sonnet-5-5": {
+            "litellm_provider": "anthropic",
+            "mode": "chat",
+            "input_cost_per_token": 2e-6,
+            "output_cost_per_token": 1e-5,
+            "cache_read_input_token_cost": 2e-7,
+            "cache_creation_input_token_cost": 2.5e-6,
+        },
+        "deepseek-v4-pro": {
+            "litellm_provider": "deepseek",
+            "mode": "chat",
+            "input_cost_per_token": 1.32e-6,
+            "output_cost_per_token": 3.96e-6,
+            "cache_read_input_token_cost": 4.4e-8,
+            "cache_creation_input_token_cost": 0.0,
+        },
+        "gpt-6.1-sol": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 2e-6,
+            "output_cost_per_token": 1e-5,
+            "cache_read_input_token_cost": 1e-7,
+            "cache_creation_input_token_cost": 2.5e-6,
+        },
+        "gpt-5.6-luna": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 2e-7,
+            "output_cost_per_token": 1.2e-6,
+            "cache_read_input_token_cost": 2e-8,
+            "cache_creation_input_token_cost": 2.5e-7,
+        },
+        "gpt-5.6-sol": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 4e-6,
+            "output_cost_per_token": 2e-5,
+            "cache_read_input_token_cost": 4e-7,
+        },
+        "gpt-fallback-no-cache": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 1e-6,
+            "output_cost_per_token": 2e-6,
+        },
+    }
+    for i in range(1, 15):
+        feed[f"dummy-openai-{i}"] = {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 1e-6,
+            "output_cost_per_token": 2e-6,
+        }
+    feed.update(overrides)
+    return feed
 
-    assert pricing_module._read_pricing_cache(cache_file) is None
+
+def test_build_index_filtering_and_conversion() -> None:
+    raw = make_feed_fixture()
+    index = build_index(raw)
+
+    assert "sample_spec" not in index
+    assert "openrouter/anthropic/claude-3" not in index
+    assert "bedrock/anthropic.claude-v2" not in index
+    assert "zero-cost" not in index
+    assert "missing-output" not in index
+    assert "nan-cost" not in index
+    assert "negative-cost" not in index
+    assert "bool-cost" not in index
+
+    # Bare key wins over prefix-stripped duplicate
+    assert index["gemini-3.8-flash"]["litellm_provider"] == "vertex_ai-language-models"
+    assert math.isclose(index["gemini-3.8-flash"]["uncached_input"], 0.75)
+    assert math.isclose(index["gemini-3.8-flash"]["cached_input"], 0.075)
+    assert math.isclose(index["gemini-3.8-flash"]["output"], 3.75)
+
+    # Cached input falls back to uncached when missing
+    assert math.isclose(
+        index["gpt-fallback-no-cache"]["cached_input"],
+        index["gpt-fallback-no-cache"]["uncached_input"],
+    )
+
+    # Per-million rate conversion and cache write rates
+    opus = index["claude-opus-5-5"]
+    assert math.isclose(opus["uncached_input"], 4.0)
+    assert math.isclose(opus["cached_input"], 0.2)
+    assert math.isclose(opus["output"], 20.0)
+    assert math.isclose(opus["cache_write"], 5.0)
+    assert math.isclose(opus["cache_write_5m"], 5.0)
+    assert math.isclose(opus["cache_write_1h"], 8.0)
+
+    validate_index(index)
 
 
-def test_refresh_persists_last_good_snapshot_and_reports_stale_failure(tmp_path: Path) -> None:
+def test_litellm_key_candidates_examples() -> None:
+    cands_gemini = litellm_key_candidates("Gemini 3.8 Flash (High)")
+    assert cands_gemini[0] == "gemini-3.8-flash"
+
+    cands_opus = litellm_key_candidates("Claude Opus 4.6 (Thinking)")
+    assert "claude-opus-4-6" in cands_opus
+
+    cands_1m = litellm_key_candidates("claude-opus-5-5[1m]")
+    assert cands_1m == ["claude-opus-5-5"]
+
+    cands_sol = litellm_key_candidates("gpt-6.1-sol")
+    assert cands_sol[0] == "gpt-6.1-sol"
+
+
+def test_apply_used_model_rates_behavior(tmp_path: Path) -> None:
     cache_file = tmp_path / "pricing.json"
-    fresh = refresh_openai_pricing(
-        force=True,
-        cache_path=cache_file,
-        fetcher=lambda: STANDARD_FIXTURE,
-    )
-    assert fresh["source"] == "openai"
-    assert fresh["stale"] is False
+    feed = make_feed_fixture()
+    refresh_pricing(force=True, cache_path=cache_file, fetcher=lambda: feed)
+
+    apply_used_model_rates([
+        ("codex", "gpt-6.1-sol"),
+        ("antigravity", "Gemini 3.8 Flash (High)"),
+        ("codex", "codex-auto-review"),
+        ("claude", "claude-opus-5-5"),
+        ("deepseek", "deepseek-v4-pro"),
+        ("codex", "gpt-4o"),  # absent from feed, present in bundled
+        ("codex", "unknown-fantasy-model"),  # absent from both
+    ])
+
+    # gpt-6.1-sol gets registered as its own canonical with its LiteLLM rates
+    sol_cost = calculate_cost_strict("gpt-6.1-sol", 1_000_000, 0, 1_000_000, provider="codex")
+    assert sol_cost["canonical_model"] == "gpt-6.1-sol"
+    assert math.isclose(sol_cost["rates"]["uncached_input"], 2.0)
+    assert math.isclose(sol_cost["rates"]["cached_input"], 0.1)
+    assert math.isclose(sol_cost["rates"]["output"], 10.0)
+
+    # Gemini 3.8 Flash (High) updated from index
+    gemini_cost = calculate_cost_strict("Gemini 3.8 Flash (High)", 1_000_000, 0, 1_000_000, provider="antigravity")
+    assert gemini_cost["canonical_model"] == "Gemini 3.8 Flash (High)"
+    assert math.isclose(gemini_cost["rates"]["uncached_input"], 0.75)
+
+    # codex-auto-review gets gpt-5.6-luna rates via alias
+    car_cost = calculate_cost_strict("codex-auto-review", 1_000_000, 0, 1_000_000, provider="codex")
+    assert car_cost["canonical_model"] == "gpt-5.6-luna"
+    assert math.isclose(car_cost["rates"]["uncached_input"], 0.2)
+
+    # claude-opus-5-5 gets 4.0/0.2/20.0 with cache writes 5.0 and 8.0
+    claude_cost = calculate_cost_strict("claude-opus-5-5", 1_000_000, 0, 1_000_000, provider="claude")
+    assert math.isclose(claude_cost["rates"]["uncached_input"], 4.0)
+    assert math.isclose(claude_cost["rates"]["cached_input"], 0.2)
+    assert math.isclose(claude_cost["rates"]["output"], 20.0)
+    assert math.isclose(claude_cost["rates"]["cache_write_5m"], 5.0)
+    assert math.isclose(claude_cost["rates"]["cache_write_1h"], 8.0)
+
+    # DeepSeek gets 50% off-peak rates during off-peak window
+    off_peak_time = datetime(2026, 9, 14, 4, 30, tzinfo=timezone.utc)
+    ds_off = calculate_cost_strict("deepseek-v4-pro", 1_000_000, 0, 1_000_000, provider="deepseek", timestamp=off_peak_time)
+    assert math.isclose(ds_off["rates"]["uncached_input"], 1.32 * 0.5)
+    assert math.isclose(ds_off["rates"]["output"], 3.96 * 0.5)
+
+    # Model absent from LiteLLM keeps bundled rate
+    gpt4o = get_pricing_strict("gpt-4o", provider="codex")
+    assert gpt4o.status == "known"
+    assert math.isclose(gpt4o.rates.uncached_input, 2.50)
+
+    # Unknown model absent from both stays unknown
+    unknown = get_pricing_strict("unknown-fantasy-model", provider="codex")
+    assert unknown.status == "unknown"
+
+    # Calling twice is idempotent
+    apply_used_model_rates([("codex", "gpt-6.1-sol")])
+    sol_cost_repeat = calculate_cost_strict("gpt-6.1-sol", 1_000_000, 0, 1_000_000, provider="codex")
+    assert sol_cost_repeat["canonical_model"] == "gpt-6.1-sol"
+
+
+def test_refresh_pricing_success_writes_cache_and_sets_live(tmp_path: Path) -> None:
+    cache_file = tmp_path / "pricing.json"
+    feed = make_feed_fixture()
+    res = refresh_pricing(force=True, cache_path=cache_file, fetcher=lambda: feed)
+
+    assert res["source"] == "litellm"
+    assert res["stale"] is False
+    assert res["error"] is None
     assert cache_file.exists()
-    assert get_pricing_strict("gpt-5.6-sol").rates.uncached_input == 4.0
-    assert get_pricing_strict("codex-auto-review", provider="codex").status == "known"
-    assert get_pricing_strict("codex-auto-review", provider="codex").canonical_model == "gpt-5.6-luna"
-    assert get_pricing_strict("gpt-reserve", provider="codex").status == "known"
-    assert get_pricing_strict("gpt-reserve", provider="codex").canonical_model == "gpt-5.6-luna"
 
-    stale = refresh_openai_pricing(
-        force=True,
-        cache_path=cache_file,
-        fetcher=lambda: "not a pricing document",
-    )
-    assert stale["source"] == "openai"
+    disk_data = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert disk_data["source"] == "litellm"
+    assert disk_data["schema_version"] == 1
+    assert disk_data["source_url"] == LITELLM_PRICING_URL
+    assert "gpt-6.1-sol" in disk_data["index"]
+
+
+def test_second_call_within_ttl_loads_from_disk_cache(tmp_path: Path) -> None:
+    cache_file = tmp_path / "pricing.json"
+    feed = make_feed_fixture()
+    refresh_pricing(force=True, cache_path=cache_file, fetcher=lambda: feed)
+
+    # Clear memory state to simulate a second process/startup
+    pricing_module._PRICING_STATES.clear()
+    pricing_module._PRICING_INDEX_BY_KEY.clear()
+    pricing_module._ACTIVE_PRICING_CACHE_KEY = None
+
+    calls: list[int] = []
+
+    def mock_fetcher():
+        calls.append(1)
+        return feed
+
+    second = refresh_pricing(cache_path=cache_file, fetcher=mock_fetcher)
+    assert second["source"] == "litellm-cache"
+    assert second["stale"] is False
+    assert len(calls) == 0
+
+
+def test_refresh_pricing_fetch_failure_keeps_prior_rates_and_backs_off(tmp_path: Path) -> None:
+    cache_file = tmp_path / "pricing.json"
+    feed = make_feed_fixture()
+    first = refresh_pricing(force=True, cache_path=cache_file, fetcher=lambda: feed)
+    assert first["source"] == "litellm"
+
+    calls: list[int] = []
+
+    def failing_fetch():
+        calls.append(1)
+        raise OSError("Connection refused")
+
+    stale = refresh_pricing(force=True, cache_path=cache_file, fetcher=failing_fetch)
+    assert stale["source"] == "litellm"
     assert stale["stale"] is True
-    assert stale["error"]
-    assert get_pricing_strict("gpt-5.6-sol").rates.uncached_input == 4.0
+    assert "Connection refused" in stale["error"]
+    assert stale["next_retry_at"] is not None
+
+    # Next call without force respects retry window and suppresses fetch
+    suppressed = refresh_pricing(cache_path=cache_file, fetcher=failing_fetch)
+    assert len(calls) == 1
+    assert suppressed["next_retry_at"] == stale["next_retry_at"]
 
 
-def test_active_payload_keeps_legacy_model_keys_and_adds_reserved_metadata(tmp_path: Path) -> None:
-    refresh_openai_pricing(force=True, cache_path=tmp_path / "pricing.json", fetcher=lambda: STANDARD_FIXTURE)
-    payload = active_pricing_payload(refresh=False, cache_path=tmp_path / "pricing.json")
-    assert payload["gpt-5.6-sol"]["uncached_input"] == 4.0
-    assert payload["__meta__"]["tier"] == "standard"
-    assert payload["codex-auto-review"]["uncached_input"] == payload["gpt-5.6-luna"]["uncached_input"]
-    assert payload["gpt-reserve"]["uncached_input"] == payload["gpt-5.6-luna"]["uncached_input"]
+def test_invalid_feed_and_corrupt_cache_rejected(tmp_path: Path) -> None:
+    cache_file = tmp_path / "bad-feed.json"
+    too_small_feed = {
+        "gpt-1": {"litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6}
+    }
+    result = refresh_pricing(force=True, cache_path=cache_file, fetcher=lambda: too_small_feed)
+    assert result["stale"] is True
+    assert "too few entries" in result["error"].lower()
+
+    corrupt_cache = tmp_path / "corrupt.json"
+    corrupt_cache.write_text(json.dumps({
+        "source": "evil-source",
+        "schema_version": 1,
+        "source_url": "https://evil.example/pricing.json",
+        "index": {},
+    }), encoding="utf-8")
+    assert pricing_module._read_pricing_cache(corrupt_cache) is None
 
 
-def test_custom_cache_paths_reactivate_matching_rates_and_metadata(tmp_path: Path) -> None:
+def test_new_index_activation_reapplies_to_previously_used_models(tmp_path: Path) -> None:
     cache_a = tmp_path / "a.json"
     cache_b = tmp_path / "b.json"
-    fixture_b = STANDARD_FIXTURE.replace("| gpt-5.6-sol | $4.00 |", "| gpt-5.6-sol | $9.00 |")
 
-    refresh_openai_pricing(force=True, cache_path=cache_a, fetcher=lambda: STANDARD_FIXTURE)
-    refresh_openai_pricing(force=True, cache_path=cache_b, fetcher=lambda: fixture_b)
+    feed_a = make_feed_fixture()
+    feed_b = make_feed_fixture(
+        **{"gpt-6.1-sol": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 3e-6,
+            "output_cost_per_token": 1.5e-5,
+            "cache_read_input_token_cost": 2e-7,
+        }}
+    )
+
+    refresh_pricing(force=True, cache_path=cache_a, fetcher=lambda: feed_a)
+    apply_used_model_rates([("codex", "gpt-6.1-sol")])
+
+    cost_a = calculate_cost_strict("gpt-6.1-sol", 1_000_000, 0, 1_000_000, provider="codex")
+    assert math.isclose(cost_a["rates"]["uncached_input"], 2.0)
+
+    # Activating feed B re-applies to gpt-6.1-sol
+    refresh_pricing(force=True, cache_path=cache_b, fetcher=lambda: feed_b)
+    cost_b = calculate_cost_strict("gpt-6.1-sol", 1_000_000, 0, 1_000_000, provider="codex")
+    assert math.isclose(cost_b["rates"]["uncached_input"], 3.0)
+
+    # Switching back to cache_a reactivates feed_a rates
     payload_a = active_pricing_payload(refresh=False, cache_path=cache_a)
-    assert payload_a["gpt-5.6-sol"]["uncached_input"] == 4.0
-    assert payload_a["__meta__"]["source"] == "openai"
-
-    payload_b = active_pricing_payload(refresh=False, cache_path=cache_b)
-    assert payload_b["gpt-5.6-sol"]["uncached_input"] == 9.0
+    cost_a_restored = calculate_cost_strict("gpt-6.1-sol", 1_000_000, 0, 1_000_000, provider="codex")
+    assert math.isclose(cost_a_restored["rates"]["uncached_input"], 2.0)
+    assert payload_a["__meta__"]["source"] == "litellm"
 
 
-def test_estimated_costs_are_repriced_but_reported_cost_is_preserved(tmp_path: Path) -> None:
-    refresh_openai_pricing(force=True, cache_path=tmp_path / "pricing.json", fetcher=lambda: STANDARD_FIXTURE)
-    session = UsageSession(
-        id="estimated",
-        tool="codex",
-        provider="codex",
-        model="gpt-5.6-sol",
-        usage=TokenUsage(input_tokens=1_000_000, cached_input_tokens=0, output_tokens=0),
-        cost=CostEstimate(cached_usd=0.5, uncached_usd=0.5, source="estimated"),
-    )
-    _refresh_estimated_session_cost(session)
-    assert session.cost is not None
-    assert session.cost.cached_usd == 4.0
-
-    reported = UsageSession(
-        id="reported",
-        tool="codex",
-        provider="codex",
-        model="gpt-5.6-sol",
-        usage=TokenUsage(input_tokens=1_000_000),
-        cost=CostEstimate(cached_usd=0.5, uncached_usd=0.5, reported_usd=0.42),
-    )
-    _refresh_estimated_session_cost(reported)
-    assert reported.cost is not None
-    assert float(reported.cost.reported_usd) == 0.42
-
-
-def test_codex_luna_aliases_use_luna_pricing() -> None:
-    luna = get_pricing_strict("gpt-5.6-luna", provider="codex")
-    assert luna.rates is not None
-    for model in ("codex-auto-review", "gpt-reserve"):
-        resolved = get_pricing_strict(model, provider="codex")
-        assert resolved.status == "known"
-        assert resolved.canonical_model == "gpt-5.6-luna"
-        assert resolved.rates is not None
-        assert resolved.rates.as_dict() == luna.rates.as_dict()
-
-
-def test_gpt_reserve_estimated_cost_matches_luna() -> None:
-    reserve = UsageSession(
-        id="reserve",
-        tool="codex",
-        provider="codex",
-        model="gpt-reserve",
-        usage=TokenUsage(input_tokens=1_000_000, cached_input_tokens=0, output_tokens=0),
-        cost=CostEstimate(cached_usd=0.0, uncached_usd=0.0, source="estimated"),
-    )
-    luna = UsageSession(
-        id="luna",
-        tool="codex",
-        provider="codex",
-        model="gpt-5.6-luna",
-        usage=TokenUsage(input_tokens=1_000_000, cached_input_tokens=0, output_tokens=0),
-        cost=CostEstimate(cached_usd=0.0, uncached_usd=0.0, source="estimated"),
-    )
-    _refresh_estimated_session_cost(reserve)
-    _refresh_estimated_session_cost(luna)
-    assert reserve.cost is not None
-    assert luna.cost is not None
-    assert reserve.cost.cached_usd == luna.cost.cached_usd
-    assert float(reserve.cost.cached_usd) == 0.20
-
-
-def test_conditional_get_uses_persisted_validators_and_handles_304(tmp_path: Path, monkeypatch) -> None:
+def test_active_pricing_payload_exposes_models_provenance(tmp_path: Path) -> None:
     cache_file = tmp_path / "pricing.json"
+    feed = make_feed_fixture()
+    refresh_pricing(force=True, cache_path=cache_file, fetcher=lambda: feed)
+
+    apply_used_model_rates([
+        ("codex", "gpt-6.1-sol"),
+        ("codex", "codex-auto-review"),
+    ])
+
+    payload = active_pricing_payload(refresh=False, cache_path=cache_file)
+    meta = payload["__meta__"]
+
+    assert meta["source"] == "litellm"
+    assert meta["models"]["gpt-6.1-sol"] == {
+        "litellm_key": "gpt-6.1-sol",
+        "canonical_model": "gpt-6.1-sol",
+    }
+    assert meta["models"]["codex-auto-review"] == {
+        "litellm_key": "gpt-5.6-luna",
+        "canonical_model": "gpt-5.6-luna",
+    }
+    assert "codex-auto-review" in payload
+    assert "gpt-reserve" in payload
+    assert payload["codex-auto-review"]["uncached_input"] == payload["gpt-5.6-luna"]["uncached_input"]
+
+
+def test_conditional_get_and_304(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cache_file = tmp_path / "pricing.json"
+    feed_json = json.dumps(make_feed_fixture()).encode("utf-8")
 
     class Response:
-        headers = {"Content-Type": "text/markdown; charset=utf-8", "ETag": '"abc"', "Last-Modified": "today"}
+        headers = {"Content-Type": "application/json; charset=utf-8", "ETag": '"etag-123"', "Last-Modified": "Tue, 15 Sep 2026 12:00:00 GMT"}
+        status = 200
 
         def __enter__(self):
             return self
@@ -197,59 +468,57 @@ def test_conditional_get_uses_persisted_validators_and_handles_304(tmp_path: Pat
         def __exit__(self, *_args):
             return False
 
+        def geturl(self):
+            return LITELLM_PRICING_URL
+
         def read(self, _limit=None):
-            return STANDARD_FIXTURE.encode()
+            return feed_json
 
-    seen = []
+    calls: list[dict[str, str]] = []
 
-    def urlopen(request, timeout=0):
-        seen.append(dict(request.headers))
-        if len(seen) == 1:
+    def mock_urlopen(request, timeout=0):
+        calls.append(dict(request.headers))
+        if len(calls) == 1:
             return Response()
         raise HTTPError(request.full_url, 304, "Not Modified", {}, None)
 
-    monkeypatch.setattr(pricing_module, "urlopen", urlopen)
-    first = refresh_openai_pricing(force=True, cache_path=cache_file)
-    second = refresh_openai_pricing(force=True, cache_path=cache_file)
-    assert first["etag"] == '"abc"'
-    assert second["source"] == "openai"
+    monkeypatch.setattr(pricing_module, "urlopen", mock_urlopen)
+
+    first = refresh_pricing(force=True, cache_path=cache_file)
+    assert first["etag"] == '"etag-123"'
+    assert first["source"] == "litellm"
+
+    second = refresh_pricing(force=True, cache_path=cache_file)
+    assert second["source"] == "litellm"
     assert second["stale"] is False
-    assert seen[1]["If-none-match"] == '"abc"'
-    assert seen[1]["If-modified-since"] == "today"
-    assert json.loads(cache_file.read_text())["etag"] == '"abc"'
+    assert calls[1]["If-none-match"] == '"etag-123"'
+    assert calls[1]["If-modified-since"] == "Tue, 15 Sep 2026 12:00:00 GMT"
 
 
-def test_failed_refresh_backoff_prevents_repeated_requests(tmp_path: Path) -> None:
-    cache_file = tmp_path / "pricing.json"
-    calls = []
+def test_network_host_redirect_content_type_and_size_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class BadTypeResponse:
+        headers = {"Content-Type": "text/html"}
+        status = 200
 
-    def failing_fetch():
-        calls.append(1)
-        raise OSError("offline")
+        def __enter__(self):
+            return self
 
-    first = refresh_openai_pricing(force=True, cache_path=cache_file, fetcher=failing_fetch)
-    second = refresh_openai_pricing(cache_path=cache_file, fetcher=failing_fetch)
-    assert len(calls) == 1
-    assert first["next_retry_at"]
-    assert second["next_retry_at"] == first["next_retry_at"]
+        def __exit__(self, *_args):
+            return False
 
+        def geturl(self):
+            return LITELLM_PRICING_URL
 
-def test_live_rates_remain_active_when_cache_persistence_fails(tmp_path: Path, monkeypatch) -> None:
-    cache_file = tmp_path / "pricing.json"
+        def read(self, _limit=None):
+            return b"<html></html>"
 
-    def fail_persist(*_args, **_kwargs):
-        raise OSError("read-only cache")
+    monkeypatch.setattr(pricing_module, "urlopen", lambda *_args, **_kwargs: BadTypeResponse())
+    bad_type = refresh_pricing(force=True, cache_path=tmp_path / "bad-type.json")
+    assert "JSON or text" in bad_type["error"]
 
-    monkeypatch.setattr(pricing_module, "_write_pricing_cache", fail_persist)
-    result = refresh_openai_pricing(force=True, cache_path=cache_file, fetcher=lambda: STANDARD_FIXTURE)
-    assert result["source"] == "openai"
-    assert result["stale"] is False
-    assert "read-only cache" in result["persistence_warning"]
-    assert get_pricing_strict("gpt-5.6-sol").rates.uncached_input == 4.0
-
-
-def test_network_response_requires_official_host_markdown_and_size(tmp_path: Path, monkeypatch) -> None:
-    class Response:
+    class RedirectResponse:
         headers = {"Content-Type": "application/json"}
         status = 200
 
@@ -260,90 +529,267 @@ def test_network_response_requires_official_host_markdown_and_size(tmp_path: Pat
             return False
 
         def geturl(self):
-            return "https://developers.openai.com/api/docs/pricing.md"
+            return "https://evil.attacker.com/price.json"
 
         def read(self, _limit=None):
             return b"{}"
 
-    monkeypatch.setattr(pricing_module, "urlopen", lambda *_args, **_kwargs: Response())
-    result = refresh_openai_pricing(force=True, cache_path=tmp_path / "bad-content.json")
-    assert result["source"] == "bundled"
-    assert "Markdown/text" in result["error"]
+    monkeypatch.setattr(pricing_module, "urlopen", lambda *_args, **_kwargs: RedirectResponse())
+    redirected = refresh_pricing(force=True, cache_path=tmp_path / "redirect.json")
+    assert "redirected" in redirected["error"]
 
-    class Redirected(Response):
-        headers = {"Content-Type": "text/markdown"}
+    class OversizedResponse:
+        headers = {"Content-Type": "application/json"}
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
 
         def geturl(self):
-            return "https://evil.example/pricing.md"
-
-    monkeypatch.setattr(pricing_module, "urlopen", lambda *_args, **_kwargs: Redirected())
-    result = refresh_openai_pricing(force=True, cache_path=tmp_path / "bad-host.json")
-    assert "redirected" in result["error"]
-
-    class Oversized(Response):
-        headers = {"Content-Type": "text/markdown"}
+            return LITELLM_PRICING_URL
 
         def read(self, limit=None):
-            return b"x" * (pricing_module.OPENAI_PRICING_MAX_RESPONSE_BYTES + 1)
+            return b"x" * (LITELLM_MAX_RESPONSE_BYTES + 1)
 
-    monkeypatch.setattr(pricing_module, "urlopen", lambda *_args, **_kwargs: Oversized())
-    result = refresh_openai_pricing(force=True, cache_path=tmp_path / "too-large.json")
-    assert "size limit" in result["error"]
+    monkeypatch.setattr(pricing_module, "urlopen", lambda *_args, **_kwargs: OversizedResponse())
+    oversized = refresh_pricing(force=True, cache_path=tmp_path / "oversized.json")
+    assert "size limit" in oversized["error"]
 
 
-def test_invalid_cache_schema_is_rejected(tmp_path: Path) -> None:
+def test_parse_feed_duplicate_keys_and_non_object() -> None:
+    non_obj = "[]"
+    with pytest.raises(ValueError, match="JSON object"):
+        parse_feed(non_obj)
+
+    dup_json = '{"gpt-5.6-luna": {"litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6}, "gpt-5.6-luna": {"litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6}}'
+    with pytest.raises(ValueError, match="Duplicate key"):
+        parse_feed(dup_json)
+
+
+def test_live_rates_remain_active_when_cache_persistence_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     cache_file = tmp_path / "pricing.json"
-    cache_file.write_text(json.dumps({
-        "source": "evil",
-        "source_url": "https://evil.example/pricing.md",
-        "tier": "standard",
-        "rates": {"gpt-5.6-luna": {"uncached_input": 0.2, "cached_input": 0.02, "output": 1.2}},
-    }))
-    result = refresh_openai_pricing(force=True, cache_path=cache_file, fetcher=lambda: "bad")
-    assert result["source"] == "bundled"
-    assert result["stale"] is True
+    feed = make_feed_fixture()
+
+    def fail_persist(*_args, **_kwargs):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(pricing_module, "_write_pricing_cache", fail_persist)
+    res = refresh_pricing(force=True, cache_path=cache_file, fetcher=lambda: feed)
+    assert res["source"] == "litellm"
+    assert res["stale"] is False
+    assert "read-only filesystem" in res["persistence_warning"]
+
+    apply_used_model_rates([("codex", "gpt-6.1-sol")])
+    cost = calculate_cost_strict("gpt-6.1-sol", 1_000_000, 0, 1_000_000, provider="codex")
+    assert cost["canonical_model"] == "gpt-6.1-sol"
+    assert math.isclose(cost["rates"]["uncached_input"], 2.0)
 
 
-def test_parser_rejects_duplicate_rows_and_structurally_incomplete_tables() -> None:
-    duplicate = STANDARD_FIXTURE.replace(
-        "| gpt-5.6-sol | $4.00 | $0.40 | $5.00 | $20.00 | $8.00 | $0.80 | $10.00 | $30.00 |",
-        "| gpt-5.6-sol | $4.00 | $0.40 | $5.00 | $20.00 | $8.00 | $0.80 | $10.00 | $30.00 |\n| gpt-5.6-sol | $4.00 | $0.40 | $5.00 | $20.00 | $8.00 | $0.80 | $10.00 | $30.00 |",
+def test_estimated_costs_are_repriced_but_reported_cost_is_preserved(tmp_path: Path) -> None:
+    from src.parsers.aggregator import _refresh_estimated_session_cost
+
+    cache_file = tmp_path / "pricing.json"
+    feed = make_feed_fixture()
+    refresh_pricing(force=True, cache_path=cache_file, fetcher=lambda: feed)
+    apply_used_model_rates([("codex", "gpt-6.1-sol")])
+
+    session = UsageSession(
+        id="est",
+        tool="codex",
+        provider="codex",
+        model="gpt-6.1-sol",
+        usage=TokenUsage(input_tokens=1_000_000, cached_input_tokens=0, output_tokens=1_000_000),
+        cost=CostEstimate(cached_usd=24.0, uncached_usd=24.0, source="estimated"),
     )
-    try:
-        parse_openai_standard_pricing(duplicate)
-    except ValueError as exc:
-        assert "duplicate" in str(exc).lower()
-    else:
-        raise AssertionError("duplicate model row was accepted")
+    _refresh_estimated_session_cost(session)
+    assert session.cost is not None
+    assert math.isclose(float(session.cost.cached_usd), 12.0)
 
-    incomplete = (
-        STANDARD_FIXTURE
-        .replace("| gpt-6-sol | $2.00 | $0.20 | $2.50 | $10.00 | $4.00 | $0.40 | $5.00 | $15.00 |\n", "")
-        .replace("| gpt-6-luna | $0.10 | $0.01 | $0.125 | $0.50 | $0.20 | $0.02 | $0.25 | $0.75 |\n", "")
-        .replace("| gpt-5.6-terra | $2.00 | $0.20 | $2.50 | $12.00 | $4.00 | $0.40 | $5.00 | $18.00 |\n", "")
+    reported = UsageSession(
+        id="rep",
+        tool="codex",
+        provider="codex",
+        model="gpt-6.1-sol",
+        usage=TokenUsage(input_tokens=1_000_000),
+        cost=CostEstimate(cached_usd=5.0, uncached_usd=5.0, reported_usd=0.42, source="reported"),
     )
-    try:
-        parse_openai_standard_pricing(incomplete)
-    except ValueError as exc:
-        assert "too few" in str(exc).lower()
-    else:
-        raise AssertionError("structurally incomplete table was accepted")
+    _refresh_estimated_session_cost(reported)
+    assert reported.cost is not None
+    assert math.isclose(float(reported.cost.reported_usd), 0.42)
 
 
-def test_parser_does_not_require_specific_model_ids() -> None:
-    future_models = STANDARD_FIXTURE
-    for old, new in {
-        "gpt-6-astra": "gpt-7-alpha",
-        "gpt-6-sol": "gpt-7-beta",
-        "gpt-6-luna": "gpt-7-gamma",
-        "gpt-5.6-sol": "gpt-7-delta",
-        "gpt-5.6-terra": "o5-mini",
-        "gpt-5.6-luna": "o5-pro",
-        "gpt-5.5 (<272K context length)": "research-1",
-    }.items():
-        future_models = future_models.replace(old, new)
-    rates = parse_openai_standard_pricing(future_models)
-    assert set(rates) == {
-        "gpt-7-alpha", "gpt-7-beta", "gpt-7-gamma", "gpt-7-delta",
-        "o5-mini", "o5-pro", "research-1",
+def test_apply_used_model_rates_before_first_refresh_preserves_provenance(tmp_path: Path) -> None:
+    cache_file = tmp_path / "litellm-cache.json"
+    feed = make_feed_fixture(**{
+        "gpt-6.1-sol": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 3.0e-6,
+            "output_cost_per_token": 15.0e-6,
+            "cache_read_input_token_cost": 0.5e-6,
+        }
+    })
+    idx = build_index(feed)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    pricing_module._write_pricing_cache(cache_file, idx, now_iso)
+
+    # 1. apply_used_model_rates runs BEFORE the first refresh_pricing
+    apply_used_model_rates([("codex", "gpt-6.1-sol")])
+
+    # 2. First refresh_pricing loads the valid disk cache
+    state = refresh_pricing(cache_path=cache_file)
+    assert state["source"] == "litellm-cache"
+
+    # 3. After the refresh, pricing_metadata(...)["models"] contains gpt-6.1-sol
+    meta = pricing_metadata(cache_path=cache_file)
+    assert "gpt-6.1-sol" in meta["models"]
+    assert meta["models"]["gpt-6.1-sol"]["litellm_key"] == "gpt-6.1-sol"
+    assert meta["models"]["gpt-6.1-sol"]["canonical_model"] == "gpt-6.1-sol"
+
+    # 4. Catalog resolves it at the cache's rates
+    res = pricing_module.PRICING_CATALOG.resolve("gpt-6.1-sol", "codex")
+    assert res.status == "known"
+    assert res.rates is not None
+    assert math.isclose(res.rates.uncached_input, 3.0)
+    assert math.isclose(res.rates.output, 15.0)
+    assert math.isclose(res.rates.cached_input, 0.5)
+
+
+def test_refresh_pricing_failure_with_cache_preserves_provenance(tmp_path: Path) -> None:
+    cache_file = tmp_path / "litellm-cache.json"
+    feed = make_feed_fixture(**{
+        "gpt-6.1-sol": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 3.0e-6,
+            "output_cost_per_token": 15.0e-6,
+            "cache_read_input_token_cost": 0.5e-6,
+        }
+    })
+    idx = build_index(feed)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    pricing_module._write_pricing_cache(cache_file, idx, now_iso)
+
+    apply_used_model_rates([("codex", "gpt-6.1-sol")])
+
+    def failing_fetcher():
+        raise RuntimeError("Network failure")
+
+    state = refresh_pricing(force=True, cache_path=cache_file, fetcher=failing_fetcher)
+    assert state["error"] == "Network failure"
+
+    meta = pricing_metadata(cache_path=cache_file)
+    assert "gpt-6.1-sol" in meta["models"]
+    assert meta["models"]["gpt-6.1-sol"]["litellm_key"] == "gpt-6.1-sol"
+
+
+def test_activate_pricing_never_leaves_catalog_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    feed = make_feed_fixture(**{
+        "gpt-6.1-sol": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 2e-6,
+            "output_cost_per_token": 10e-6,
+        }
+    })
+    idx = build_index(feed)
+    pricing_module._USED_MODELS.add(("codex", "gpt-6.1-sol"))
+
+    calls = 0
+    orig_add_entry = pricing_module.PricingCatalog.add_entry
+
+    def tracked_add_entry(self, entry):
+        nonlocal calls
+        calls += 1
+        # Whenever an entry is added/staged during activation,
+        # the live catalog must remain non-empty and resolvable.
+        assert len(pricing_module.PRICING_CATALOG._entries) > 0, "Live PRICING_CATALOG was empty during activation!"
+        assert len(pricing_module.MODEL_PRICING) > 0, "Live MODEL_PRICING was empty during activation!"
+        res = pricing_module.PRICING_CATALOG.resolve("gpt-5.6-luna", "codex")
+        assert res.status == "known", "Live catalog resolve failed during activation!"
+        return orig_add_entry(self, entry)
+
+    monkeypatch.setattr(pricing_module.PricingCatalog, "add_entry", tracked_add_entry)
+
+    orig_register = pricing_module.PricingCatalog.register
+
+    def tracked_register(self, *args, **kwargs):
+        assert len(pricing_module.PRICING_CATALOG._entries) > 0, "Live PRICING_CATALOG was empty during register!"
+        assert len(pricing_module.MODEL_PRICING) > 0, "Live MODEL_PRICING was empty during register!"
+        return orig_register(self, *args, **kwargs)
+
+    monkeypatch.setattr(pricing_module.PricingCatalog, "register", tracked_register)
+
+    old_entries = pricing_module.PRICING_CATALOG._entries
+    old_mp_id = id(pricing_module.MODEL_PRICING)
+
+    pricing_module._activate_pricing("test-key", idx)
+
+    assert calls > 0
+    # Live catalog was swapped atomically to the staged dict
+    assert pricing_module.PRICING_CATALOG._entries is not old_entries
+    assert len(pricing_module.PRICING_CATALOG._entries) > 0
+    # Live MODEL_PRICING dict was mutated in-place (identity preserved)
+    assert id(pricing_module.MODEL_PRICING) == old_mp_id
+    assert len(pricing_module.MODEL_PRICING) > 0
+    # Newly activated model is resolvable
+    res = pricing_module.PRICING_CATALOG.resolve("gpt-6.1-sol", "codex")
+    assert res.status == "known"
+
+
+def test_rate_conversion_eliminates_float_artefacts() -> None:
+    feed = {
+        "deepseek/deepseek-v4-pro": {
+            "litellm_provider": "deepseek",
+            "mode": "chat",
+            "input_cost_per_token": 1.32e-06,
+            "output_cost_per_token": 3.96e-06,
+            "cache_read_input_token_cost": 1e-07,
+            "cache_creation_input_token_cost": 0.0,
+        },
+        "anthropic/claude-sonnet-5-5": {
+            "litellm_provider": "anthropic",
+            "mode": "chat",
+            "input_cost_per_token": 2e-06,
+            "output_cost_per_token": 1e-05,
+            "cache_read_input_token_cost": 1e-07,
+        },
     }
+    index = build_index(feed)
+
+    # A feed entry with cache_read 1e-07 yields cached_input == 0.1 exactly
+    assert index["deepseek-v4-pro"]["cached_input"] == 0.1
+    # output 3.96e-06 yields 3.96 exactly
+    assert index["deepseek-v4-pro"]["output"] == 3.96
+    assert index["deepseek-v4-pro"]["uncached_input"] == 1.32
+
+    # Derived Claude defaults and DeepSeek off-peak rates also eliminate float artefacts
+    pricing_module._USED_MODELS.add(("deepseek", "deepseek-v4-pro"))
+    pricing_module._USED_MODELS.add(("claude", "claude-sonnet-5-5"))
+    pricing_module._activate_pricing("float-test", index)
+
+    res_deepseek = pricing_module.PRICING_CATALOG.resolve("deepseek-v4-pro", "deepseek")
+    assert res_deepseek.status == "known"
+    assert res_deepseek.rates is not None
+    assert res_deepseek.rates.cached_input == 0.1
+    assert res_deepseek.rates.output == 3.96
+    deepseek_entry = pricing_module.PRICING_CATALOG.get_entry(res_deepseek.provider, res_deepseek.canonical_model)
+    assert deepseek_entry is not None
+    assert deepseek_entry.off_peak_rates is not None
+    assert deepseek_entry.off_peak_rates.output == 1.98
+    assert deepseek_entry.off_peak_rates.cached_input == 0.05
+
+    res_claude = pricing_module.PRICING_CATALOG.resolve("claude-sonnet-5-5", "claude")
+    assert res_claude.status == "known"
+    assert res_claude.rates is not None
+    assert res_claude.rates.cached_input == 0.1
+    assert res_claude.rates.cache_write == 2.5
+    assert res_claude.rates.cache_write_1h == 4.0
+
+
+

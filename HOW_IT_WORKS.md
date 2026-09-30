@@ -130,19 +130,21 @@ For each model, rates are expressed in USD per 1,000,000 tokens:
 - `output` — generated completion tokens (including reasoning/thinking)
 - `cache_write` — optional prompt-cache creation tokens, when the provider bills them
 
-OpenAI Standard rates are refreshed from the official Markdown pricing table at
-`https://developers.openai.com/api/docs/pricing.md`. The refresh is TTL-based
-(24 hours by default), thread-safe, and persists a last-known-good snapshot at
-`$AI_USAGE_PRICING_CACHE`, `$XDG_CACHE_HOME/ai-usage-dashboard/openai-pricing.json`,
-or `~/.cache/ai-usage-dashboard/openai-pricing.json`. Offline startup uses the
-bundled catalog or that snapshot and reports `stale`/`error` metadata rather
-than failing usage collection. Local transcripts do not identify Batch, Flex,
-Fast, long-context, or regional-processing tiers, so Standard short-context
-rates are used for estimates. The server has one process-global active catalog;
-the default cache path should be used for normal operation. Custom cache paths
-are supported for tests or explicitly switching the active storage snapshot,
-and the payload always reactivates the matching rates before returning its
-metadata.
+Model rates are pulled from LiteLLM's public JSON price list at
+`https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json`.
+The refresh is TTL-based (24 hours by default), thread-safe, and persists a
+last-known-good snapshot at `$AI_USAGE_PRICING_CACHE`,
+`$XDG_CACHE_HOME/ai-usage-dashboard/litellm-pricing.json`, or
+`~/.cache/ai-usage-dashboard/litellm-pricing.json`. Only models seen in local
+usage have rates applied from LiteLLM; the bundled `MODEL_PRICING` table remains
+as an offline fallback. Offline startup uses the bundled catalog or that snapshot
+and reports `stale`/`error` metadata rather than failing usage collection. Local
+transcripts do not identify Batch, Flex, Fast, long-context, or regional-processing
+tiers, so Standard short-context rates are used for estimates. The server has one
+process-global active catalog; the default cache path should be used for normal
+operation. Custom cache paths are supported for tests or explicitly switching the
+active storage snapshot, and the payload always reactivates the matching rates
+before returning its metadata.
 
 **Cost formula (with caching):**
 ```
@@ -182,7 +184,8 @@ Claude 5-minute and 1-hour writes are retained separately and priced at 1.25× a
 |:-----|:-----------|
 | `run.py` | CLI entry point — starts uvicorn, optionally opens browser |
 | `src/app.py` | FastAPI app — 4 endpoints: `/`, `/api/usage`, `/api/pricing`, `/api/health` |
-| `src/pricing.py` | Provider catalog, official OpenAI refresh/cache, and cost calculator |
+| `src/litellm_pricing.py` | LiteLLM pricing feed parser, exact key candidates, and model index |
+| `src/pricing.py` | Provider catalog, LiteLLM refresh/cache, and cost calculator |
 | `src/parsers/contracts.py` | Provider-neutral token, event, session, and cost contracts |
 | `src/parsers/source_registry.py` | Provider adapter registry with canonical-key and alias lookup |
 | `src/parsers/codex.py` | Reads Codex rollout JSONL + SQLite, returns structured metrics dict |
@@ -214,7 +217,7 @@ Claude 5-minute and 1-hour writes are retained separately and priced at 1.25× a
 New adapters should own only provider-specific discovery and decoding. Token normalization, cost enrichment, time slicing, model/timeline aggregation, and API serialization are shared. The built-in adapters retain their mature legacy parser wrappers during migration, while exposing normalized sessions to the shared pipeline. The contracts include cache-read and cache-write counts plus reported-versus-estimated cost provenance for providers with different billing formats.
 
 ### Add a new model's pricing
-Register a provider/model entry in `PricingCatalog` with `uncached_input`, `cached_input`, and `output` rates ($/1M tokens). Optional `cache_write` or `cache_creation` rates are supported. `MODEL_PRICING`, `get_pricing()`, and `calculate_cost()` remain available for backward compatibility.
+New models present in LiteLLM require no manual configuration. If LiteLLM lacks a model or uses an alternate model ID, add an alias in `_ALIASES` in `src/pricing.py` or register a provider/model fallback entry in `PricingCatalog` with `uncached_input`, `cached_input`, and `output` rates ($/1M tokens). Optional `cache_write` or `cache_creation` rates are supported. `MODEL_PRICING`, `get_pricing()`, and `calculate_cost()` remain available for backward compatibility.
 
 ### Change the polling interval default
 Edit `state.autoRefreshInterval` in `dashboard.js` (line ~12). Value is in milliseconds.
