@@ -199,6 +199,7 @@ class PricingEntry:
     rates: PricingRates | None
     aliases: tuple[str, ...] = ()
     off_peak_rates: PricingRates | None = None
+    exact_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -352,8 +353,17 @@ class PricingCatalog:
 
     def add_entry(self, entry: PricingEntry) -> PricingEntry:
         provider = normalize_provider(entry.provider) or entry.provider
-        normalized = PricingEntry(provider, entry.model, entry.rates, entry.aliases, entry.off_peak_rates)
-        self._entries[(provider, _normalize(entry.model))] = normalized
+        normalized = PricingEntry(
+            provider,
+            entry.model,
+            entry.rates,
+            entry.aliases,
+            entry.off_peak_rates,
+            exact_only=entry.exact_only,
+        )
+        new_entries = dict(self._entries)
+        new_entries[(provider, _normalize(entry.model))] = normalized
+        self._entries = new_entries
         return normalized
 
     def register(
@@ -371,6 +381,7 @@ class PricingCatalog:
         cache_write_5m: float | None = None,
         cache_write_1h: float | None = None,
         off_peak_rates: PricingRates | Mapping[str, Any] | None = None,
+        exact_only: bool = False,
     ) -> PricingEntry:
         """Register a model, including a known model with ``rates=None``.
 
@@ -396,23 +407,40 @@ class PricingCatalog:
             if isinstance(off_peak_rates, PricingRates) or off_peak_rates is None
             else PricingRates.from_mapping(off_peak_rates)
         )
-        return self.add_entry(PricingEntry(provider, model, parsed, tuple(aliases), off_peak_rates=parsed_off_peak))
+        return self.add_entry(
+            PricingEntry(
+                provider,
+                model,
+                parsed,
+                tuple(aliases),
+                off_peak_rates=parsed_off_peak,
+                exact_only=exact_only,
+            )
+        )
 
     def entries(self) -> tuple[PricingEntry, ...]:
-        return tuple(self._entries.values())
+        current = self._entries
+        return tuple(current.values())
 
     @property
     def models(self) -> dict[tuple[Provider, str], PricingEntry]:
         """Return a snapshot keyed by ``(provider, canonical_model)``."""
-        return dict(self._entries)
+        current = self._entries
+        return dict(current)
 
     def get_entry(self, provider: str, model: str) -> PricingEntry | None:
         """Return one exact provider/model entry, if registered."""
-        return self._entries.get((normalize_provider(provider) or provider, _normalize(model)))
+        current = self._entries
+        return current.get((normalize_provider(provider) or provider, _normalize(model)))
 
     def remove(self, provider: str, model: str) -> None:
         """Remove one exact provider/model entry, if present."""
-        self._entries.pop((normalize_provider(provider) or provider, _normalize(model)), None)
+        key = (normalize_provider(provider) or provider, _normalize(model))
+        current = self._entries
+        if key in current:
+            new_entries = dict(current)
+            new_entries.pop(key, None)
+            self._entries = new_entries
 
     def resolve(
         self, model_name: str | None, provider: str | None = None, *, timestamp: Any = None
@@ -421,8 +449,9 @@ class PricingCatalog:
         if not isinstance(model_name, str) or not model_name.strip():
             return PricingResolution(model_name, normalize_provider(provider), None, None, "unknown")
 
+        current_entries = self._entries
         raw, scoped_provider, model = model_name.strip(), normalize_provider(provider), model_name.strip()
-        known_providers = {entry.provider for entry in self._entries.values()}
+        known_providers = {entry.provider for entry in current_entries.values()}
         for separator in ("/", ":"):
             if separator in raw:
                 prefix, candidate = raw.split(separator, 1)
@@ -432,7 +461,7 @@ class PricingCatalog:
                     model = candidate.strip()
                     break
 
-        entries = [entry for entry in self._entries.values() if not scoped_provider or entry.provider == scoped_provider]
+        entries = [entry for entry in current_entries.values() if not scoped_provider or entry.provider == scoped_provider]
         normalized_model = _normalize(model)
         matches: list[tuple[PricingEntry, str]] = [
             (entry, "canonical") for entry in entries if _normalize(entry.model) == normalized_model
@@ -445,14 +474,16 @@ class PricingCatalog:
         if not matches:
             fuzzy: list[tuple[PricingEntry, str, int]] = []
             for entry in entries:
+                if entry.exact_only:
+                    continue
                 keys = [(entry.model, "canonical"), *[(alias, "alias") for alias in entry.aliases]]
-                for key, matched_by in keys:
+                for key, _ in keys:
                     key_normalized = _normalize(key)
                     if key_normalized and key_normalized in normalized_model:
-                        fuzzy.append((entry, matched_by, len(key_normalized)))
+                        fuzzy.append((entry, "fuzzy", len(key_normalized)))
             if fuzzy:
                 longest = max(item[2] for item in fuzzy)
-                matches = [(entry, matched_by) for entry, matched_by, size in fuzzy if size == longest]
+                matches = [(entry, "fuzzy") for entry, _, size in fuzzy if size == longest]
 
         unique: dict[tuple[str, str], tuple[PricingEntry, str]] = {
             (entry.provider, _normalize(entry.model)): (entry, matched_by) for entry, matched_by in matches
@@ -487,7 +518,7 @@ class PricingCatalog:
 
 def _build_catalog() -> PricingCatalog:
     catalog = PricingCatalog()
-    for model, rates in MODEL_PRICING.items():
+    for model, rates in dict(MODEL_PRICING).items():
         folded_model = model.casefold()
         if folded_model.startswith("gemini"):
             provider = "antigravity"
@@ -659,28 +690,39 @@ def _read_pricing_cache(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str
             provider = entry.get("litellm_provider")
             if not isinstance(provider, str) or not provider.strip():
                 return None
+            entry_copy: dict[str, Any] = {"litellm_provider": str(provider)}
             required = ("uncached_input", "cached_input", "output")
-            if any(field not in entry for field in required):
-                return None
-            numeric_fields = (
-                *required,
+            for field in required:
+                if field not in entry:
+                    return None
+                val = entry[field]
+                if (
+                    val is None
+                    or isinstance(val, bool)
+                    or not isinstance(val, (int, float))
+                    or not math.isfinite(val)
+                    or val < 0
+                ):
+                    return None
+                entry_copy[field] = float(val)
+
+            optional_fields = (
                 "cache_write",
                 "cache_creation",
                 "cache_write_5m",
                 "cache_write_1h",
             )
-            entry_copy: dict[str, Any] = {"litellm_provider": str(provider)}
-            for field in numeric_fields:
+            for field in optional_fields:
                 if field in entry:
                     val = entry[field]
-                    if val is not None and (
-                        isinstance(val, bool)
-                        or not isinstance(val, (int, float))
-                        or not math.isfinite(val)
-                        or val < 0
-                    ):
-                        return None
                     if val is not None:
+                        if (
+                            isinstance(val, bool)
+                            or not isinstance(val, (int, float))
+                            or not math.isfinite(val)
+                            or val < 0
+                        ):
+                            return None
                         entry_copy[field] = float(val)
             validated_index[model_key] = entry_copy
 
@@ -724,8 +766,21 @@ def _apply_single_model(
         entry = cat.get_entry(res.provider or provider or "", res.canonical_model)
         if entry is not None:
             norm_raw = _normalize(raw_model)
-            if _normalize(entry.model) == norm_raw or any(_normalize(a) == norm_raw for a in entry.aliases):
+            if _normalize(entry.model) == norm_raw:
                 matched_entry = entry
+            else:
+                # Matched by alias (or fuzzy)
+                if hit is not None:
+                    canonical_hit = lookup(index, entry.model)
+                    if canonical_hit is not None and canonical_hit[0] == hit[0]:
+                        matched_entry = entry
+                    else:
+                        matched_entry = None
+                else:
+                    if res.matched_by in ("canonical", "alias"):
+                        matched_entry = entry
+                    else:
+                        matched_entry = None
 
     if hit is None:
         if matched_entry is not None:
@@ -748,11 +803,26 @@ def _apply_single_model(
         canonical = matched_entry.model
         target_provider = matched_entry.provider
         aliases = matched_entry.aliases
+        exact_only = matched_entry.exact_only
     else:
-        canonical = raw_model.strip()
-        norm_p = normalize_provider(provider)
-        target_provider = norm_p if norm_p else prov_map.get(entry_data.get("litellm_provider"), "codex")
-        aliases = ()
+        raw = raw_model.strip()
+        scoped_provider = normalize_provider(provider)
+        model_part = raw
+        current_entries = cat._entries
+        known_providers = {e.provider for e in current_entries.values()}
+        for separator in ("/", ":"):
+            if separator in raw:
+                prefix, candidate = raw.split(separator, 1)
+                normalized_prefix = normalize_provider(prefix)
+                if normalized_prefix in known_providers:
+                    scoped_provider = scoped_provider or normalized_prefix
+                    model_part = candidate.strip()
+                    break
+
+        canonical = model_part
+        target_provider = scoped_provider if scoped_provider else prov_map.get(entry_data.get("litellm_provider"), "codex")
+        aliases = (raw,) if raw != canonical else ()
+        exact_only = True
 
     rate_kwargs: dict[str, Any] = {
         "uncached_input": entry_data["uncached_input"],
@@ -804,6 +874,7 @@ def _apply_single_model(
         rates,
         aliases=aliases,
         off_peak_rates=off_peak,
+        exact_only=exact_only,
     )
 
     mp[canonical] = rates.as_dict(include_optional=False)
@@ -1069,7 +1140,7 @@ def active_pricing_payload(*, refresh: bool = True, cache_path: str | Path | Non
     with _PRICING_REFRESH_LOCK:
         _ensure_active_pricing(state_key)
         payload: dict[str, Any] = {}
-        for model, rates in MODEL_PRICING.items():
+        for model, rates in dict(MODEL_PRICING).items():
             resolved = PRICING_CATALOG.resolve(model)
             payload[model] = resolved.rates.as_dict() if resolved.rates is not None else dict(rates)
         luna_rates = payload.get("gpt-5.6-luna")

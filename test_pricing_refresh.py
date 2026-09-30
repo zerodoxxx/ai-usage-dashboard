@@ -25,6 +25,8 @@ from src.litellm_pricing import (
 )
 from src.parsers.contracts import CostEstimate, TokenUsage, UsageSession
 from src.pricing import (
+    PricingCatalog,
+    PricingRates,
     active_pricing_payload,
     apply_used_model_rates,
     calculate_cost_strict,
@@ -790,6 +792,238 @@ def test_rate_conversion_eliminates_float_artefacts() -> None:
     assert res_claude.rates.cached_input == 0.1
     assert res_claude.rates.cache_write == 2.5
     assert res_claude.rates.cache_write_1h == 4.0
+
+
+def test_direct_feed_hit_does_not_overwrite_alias_target(tmp_path: Path) -> None:
+    cache_file = tmp_path / "pricing.json"
+    feed = make_feed_fixture(**{
+        "o3": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 2e-6,
+            "output_cost_per_token": 8e-6,
+        },
+        "claude-opus-5-5": {
+            "litellm_provider": "anthropic",
+            "mode": "chat",
+            "input_cost_per_token": 15e-6,
+            "output_cost_per_token": 75e-6,
+        },
+    })
+    refresh_pricing(force=True, cache_path=cache_file, fetcher=lambda: feed)
+
+    # 1. Direct hit on 'o3' must NOT overwrite legacy alias target 'o3-mini'
+    apply_used_model_rates([("codex", "o3")])
+    o3_mini_entry = pricing_module.PRICING_CATALOG.get_entry("codex", "o3-mini")
+    assert o3_mini_entry is not None
+    assert o3_mini_entry.rates is not None
+    assert math.isclose(o3_mini_entry.rates.uncached_input, 1.10)
+    assert math.isclose(o3_mini_entry.rates.output, 4.40)
+
+    # 'o3' is registered as its own entry
+    o3_entry = pricing_module.PRICING_CATALOG.get_entry("codex", "o3")
+    assert o3_entry is not None
+    assert o3_entry.rates is not None
+    assert math.isclose(o3_entry.rates.uncached_input, 2.0)
+    assert math.isclose(o3_entry.rates.output, 8.0)
+
+    # 2. Underlying same model ('claude-opus-5-5' <-> 'Claude Opus 5.5') DOES update
+    apply_used_model_rates([("claude", "claude-opus-5-5")])
+    opus_entry = pricing_module.PRICING_CATALOG.get_entry("claude", "Claude Opus 5.5")
+    assert opus_entry is not None
+    assert opus_entry.rates is not None
+    assert math.isclose(opus_entry.rates.uncached_input, 15.0)
+    assert math.isclose(opus_entry.rates.output, 75.0)
+
+    # 3. Model with no direct hit ('codex-auto-review') follows legacy alias to 'gpt-5.6-luna'
+    apply_used_model_rates([("codex", "codex-auto-review")])
+    meta = pricing_metadata(cache_path=cache_file)
+    assert meta["models"]["codex-auto-review"] == {
+        "litellm_key": "gpt-5.6-luna",
+        "canonical_model": "gpt-5.6-luna",
+    }
+
+
+def test_pricing_catalog_copy_on_write() -> None:
+    cat = PricingCatalog()
+    cat.register("codex", "m1", PricingRates(1.0, 0.5, 2.0))
+    cat.register("codex", "m2", PricingRates(2.0, 1.0, 4.0))
+
+    initial_entries_dict = cat._entries
+    initial_id = id(initial_entries_dict)
+
+    # Mutating the catalog via add_entry replaces _entries without mutating the old dict
+    iterated_keys: list[tuple[str, str]] = []
+    for k in initial_entries_dict:
+        iterated_keys.append(k)
+        cat.register("codex", f"iter-added-{k[1]}", PricingRates(3.0, 1.5, 6.0))
+
+    assert len(iterated_keys) == 2
+    assert id(cat._entries) != initial_id
+    assert len(initial_entries_dict) == 2
+    assert len(cat._entries) == 4
+
+    # Remove also does copy-on-write
+    pre_remove_dict = cat._entries
+    pre_remove_id = id(pre_remove_dict)
+    cat.remove("codex", "m1")
+    assert id(cat._entries) != pre_remove_id
+    assert "m1" in [k[1] for k in pre_remove_dict]
+    assert "m1" not in [k[1] for k in cat._entries]
+
+
+def test_feed_registered_new_entries_are_exact_only(tmp_path: Path) -> None:
+    cache_file = tmp_path / "pricing.json"
+    feed = make_feed_fixture(**{
+        "claude-fable-5": {
+            "litellm_provider": "anthropic",
+            "mode": "chat",
+            "input_cost_per_token": 3e-6,
+            "output_cost_per_token": 15e-6,
+        }
+    })
+    refresh_pricing(force=True, cache_path=cache_file, fetcher=lambda: feed)
+    apply_used_model_rates([("claude", "claude-fable-5")])
+
+    # Exact match resolves
+    res_exact = pricing_module.PRICING_CATALOG.resolve("claude-fable-5", "claude")
+    assert res_exact.status == "known"
+    assert res_exact.canonical_model == "claude-fable-5"
+
+    # Fuzzy substring does not match exact-only entry
+    res_fuzzy = pricing_module.PRICING_CATALOG.resolve("claude-fable-5-2", "claude")
+    assert res_fuzzy.status == "unknown"
+
+
+def test_provider_prefixed_raw_names(tmp_path: Path) -> None:
+    cache_file = tmp_path / "pricing.json"
+    feed = make_feed_fixture(**{
+        "gpt-6.1-sol": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 2e-6,
+            "output_cost_per_token": 10e-6,
+        }
+    })
+    refresh_pricing(force=True, cache_path=cache_file, fetcher=lambda: feed)
+    apply_used_model_rates([("openai", "openai/gpt-6.1-sol")])
+
+    cost = calculate_cost_strict("openai/gpt-6.1-sol", 1_000_000, 0, 1_000_000, provider="openai")
+    assert cost["status"] == "known"
+    assert cost["canonical_model"] == "gpt-6.1-sol"
+    assert math.isclose(cost["rates"]["uncached_input"], 2.0)
+    assert math.isclose(cost["rates"]["output"], 10.0)
+
+    # Also resolves without explicit provider
+    cost_no_prov = calculate_cost_strict("openai/gpt-6.1-sol", 1_000_000, 0, 1_000_000)
+    assert cost_no_prov["status"] == "known"
+    assert cost_no_prov["canonical_model"] == "gpt-6.1-sol"
+    assert math.isclose(cost_no_prov["rates"]["uncached_input"], 2.0)
+    assert math.isclose(cost_no_prov["rates"]["output"], 10.0)
+
+
+def test_cache_validation_rejects_null_and_corrupt_rates(tmp_path: Path) -> None:
+    corrupted_cases = [
+        {"uncached_input": None, "cached_input": 1.0, "output": 2.0},
+        {"uncached_input": True, "cached_input": 1.0, "output": 2.0},
+        {"uncached_input": -1.0, "cached_input": 1.0, "output": 2.0},
+        {"uncached_input": float("inf"), "cached_input": 1.0, "output": 2.0},
+        {"uncached_input": 1.0, "cached_input": 1.0, "output": 2.0, "cache_write": "invalid"},
+        {"uncached_input": 1.0, "cached_input": 1.0, "output": 2.0, "cache_write": -5.0},
+    ]
+
+    for i, rates in enumerate(corrupted_cases):
+        cache_file = tmp_path / f"corrupt_{i}.json"
+        cache_file.write_text(json.dumps({
+            "source": "litellm",
+            "schema_version": 1,
+            "source_url": LITELLM_PRICING_URL,
+            "index": {
+                "test-model": {
+                    "litellm_provider": "openai",
+                    **rates,
+                }
+            }
+        }), encoding="utf-8")
+        assert pricing_module._read_pricing_cache(cache_file) is None
+
+    # Regression: a cache with "uncached_input": null is ignored, and refresh falls back without raising
+    null_cache = tmp_path / "null_cache.json"
+    null_cache.write_text(json.dumps({
+        "source": "litellm",
+        "schema_version": 1,
+        "source_url": LITELLM_PRICING_URL,
+        "index": {
+            "gpt-6.1-sol": {
+                "litellm_provider": "openai",
+                "uncached_input": None,
+                "cached_input": 1.0,
+                "output": 2.0,
+            }
+        }
+    }), encoding="utf-8")
+    assert pricing_module._read_pricing_cache(null_cache) is None
+
+    result = refresh_pricing(cache_path=null_cache, fetcher=lambda: {"sample_spec": {}})
+    assert result["source"] == "bundled"
+    assert result["stale"] is True
+
+
+def test_overflow_rates_not_indexed() -> None:
+    feed = {
+        "model-overflow": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 1e308,
+            "output_cost_per_token": 2e-6,
+        },
+        "model-opt-overflow": {
+            "litellm_provider": "anthropic",
+            "mode": "chat",
+            "input_cost_per_token": 1e-6,
+            "output_cost_per_token": 2e-6,
+            "cache_creation_input_token_cost": 1e308,
+            "cache_creation_input_token_cost_above_1hr": 1e308,
+        },
+    }
+    index = build_index(feed)
+    # Mandatory rate overflow -> entry is not indexed
+    assert "model-overflow" not in index
+    # Optional rate overflow -> optional rate is dropped while entry is indexed
+    assert "model-opt-overflow" in index
+    assert "cache_creation" not in index["model-opt-overflow"]
+    assert "cache_write" not in index["model-opt-overflow"]
+    assert "cache_write_1h" not in index["model-opt-overflow"]
+
+
+def test_fallback_rejects_fuzzy_matches_when_no_direct_hit(tmp_path: Path) -> None:
+    cache_file = tmp_path / "pricing.json"
+    feed = make_feed_fixture(**{
+        "gpt-5.6-sol": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 4e-6,
+            "output_cost_per_token": 20e-6,
+        }
+    })
+    refresh_pricing(force=True, cache_path=cache_file, fetcher=lambda: feed)
+
+    orig_entries_count = len(pricing_module.PRICING_CATALOG._entries)
+    orig_sol_entry = pricing_module.PRICING_CATALOG.get_entry("codex", "gpt-5.6-sol")
+
+    # gpt-7-sol has no direct index hit, but would fuzzy match gpt-5.6-sol (via alias 'sol')
+    apply_used_model_rates([("codex", "gpt-7-sol")])
+
+    meta = pricing_metadata(cache_path=cache_file)
+    # Must not appear in state["models"]
+    assert "gpt-7-sol" not in meta.get("models", {})
+
+    # Catalog must be untouched for it
+    assert pricing_module.PRICING_CATALOG.get_entry("codex", "gpt-7-sol") is None
+    assert len(pricing_module.PRICING_CATALOG._entries) == orig_entries_count
+    assert pricing_module.PRICING_CATALOG.get_entry("codex", "gpt-5.6-sol") == orig_sol_entry
+
+
 
 
 

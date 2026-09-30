@@ -125,6 +125,8 @@
         return;
       }
 
+      await fetchPricing();
+
       const data = result.data;
       state.currentUsageData = data;
       state.allSessions = Array.isArray(data.sessions) ? data.sessions : [];

@@ -98,8 +98,17 @@ def build_index(raw: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         if input_cost == 0 and output_cost == 0:
             continue
 
-        uncached_input = round_rate(float(input_cost) * 1e6)
-        output = round_rate(float(output_cost) * 1e6)
+        try:
+            uncached_raw = float(input_cost) * 1e6
+            output_raw = float(output_cost) * 1e6
+            if not math.isfinite(uncached_raw) or not math.isfinite(output_raw):
+                continue
+            uncached_input = round_rate(uncached_raw)
+            output = round_rate(output_raw)
+            if not math.isfinite(uncached_input) or not math.isfinite(output):
+                continue
+        except OverflowError:
+            continue
 
         cache_read = entry.get("cache_read_input_token_cost")
         if (
@@ -109,7 +118,15 @@ def build_index(raw: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
             and math.isfinite(cache_read)
             and cache_read >= 0
         ):
-            cached_input = round_rate(float(cache_read) * 1e6)
+            try:
+                cached_raw = float(cache_read) * 1e6
+                if not math.isfinite(cached_raw):
+                    continue
+                cached_input = round_rate(cached_raw)
+                if not math.isfinite(cached_input):
+                    continue
+            except OverflowError:
+                continue
         else:
             cached_input = uncached_input
 
@@ -128,10 +145,16 @@ def build_index(raw: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
             and math.isfinite(cache_creation)
             and cache_creation >= 0
         ):
-            creation_rate = round_rate(float(cache_creation) * 1e6)
-            entry_dict["cache_write"] = creation_rate
-            entry_dict["cache_creation"] = creation_rate
-            entry_dict["cache_write_5m"] = creation_rate
+            try:
+                creation_raw = float(cache_creation) * 1e6
+                if math.isfinite(creation_raw):
+                    creation_rate = round_rate(creation_raw)
+                    if math.isfinite(creation_rate):
+                        entry_dict["cache_write"] = creation_rate
+                        entry_dict["cache_creation"] = creation_rate
+                        entry_dict["cache_write_5m"] = creation_rate
+            except OverflowError:
+                pass
 
             above_1hr = entry.get("cache_creation_input_token_cost_above_1hr")
             if (
@@ -141,7 +164,14 @@ def build_index(raw: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
                 and math.isfinite(above_1hr)
                 and above_1hr >= 0
             ):
-                entry_dict["cache_write_1h"] = round_rate(float(above_1hr) * 1e6)
+                try:
+                    above_1hr_raw = float(above_1hr) * 1e6
+                    if math.isfinite(above_1hr_raw):
+                        above_1hr_rate = round_rate(above_1hr_raw)
+                        if math.isfinite(above_1hr_rate):
+                            entry_dict["cache_write_1h"] = above_1hr_rate
+                except OverflowError:
+                    pass
 
         index[key] = entry_dict
         is_bare_map[key] = is_bare
