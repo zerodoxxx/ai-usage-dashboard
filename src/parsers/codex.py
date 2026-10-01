@@ -95,6 +95,62 @@ def _event_totals(events: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+def _timestamp_seconds(value: Any) -> float | None:
+    """Parse a rollout timestamp for inferred call intervals."""
+    try:
+        if isinstance(value, (int, float)):
+            return value / 1000.0 if value > 1e11 else float(value)
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (ValueError, TypeError, OSError, OverflowError):
+        return None
+
+
+class _ResponseTiming:
+    """Pair a response with input received before its first generated item."""
+
+    def __init__(self) -> None:
+        self.input_timestamp: Any = None
+        self.start: Any = None
+        self.end: Any = None
+        self.model: str | None = None
+
+    def observe_output(self, timestamp: Any, model: str | None) -> None:
+        if self.end is None:
+            self.start = self.input_timestamp
+            self.model = model
+        self.end = timestamp
+
+    def finish(
+        self, event: dict[str, Any] | None, completion: Any = None, *, trustworthy: bool = True
+    ) -> None:
+        end = completion if completion is not None else self.end
+        start_seconds = _timestamp_seconds(self.start)
+        end_seconds = _timestamp_seconds(end)
+        if event is not None:
+            if end is not None:
+                event["timestamp"] = _to_iso_string(end)
+            if self.model:
+                event["model"] = self.model
+            event["metadata"] = {
+                "tps_duration_seconds": (
+                    end_seconds - start_seconds
+                    if end_seconds is not None and start_seconds is not None else None
+                ),
+                "tps_output_tokens": event["output_tokens"],
+                "tps_trustworthy": trustworthy and self.end is not None,
+            }
+        # A legacy token_count can arrive after a tool result. Keep that input
+        # for the next call, while consuming the input that started this one.
+        input_seconds = _timestamp_seconds(self.input_timestamp)
+        if input_seconds is None or end_seconds is None or input_seconds <= end_seconds:
+            self.input_timestamp = None
+        self.start = self.end = None
+        self.model = None
+
+
 def _reconcile_usage_events(
     events: list[dict[str, Any]],
     target: dict[str, int],
@@ -138,6 +194,7 @@ def _reconcile_usage_events(
     reconciled: list[dict[str, Any]] = []
     for index, event in enumerate(events):
         reconciled.append({
+            **event,
             "timestamp": str(event.get("timestamp") or ""),
             "input_tokens": input_allocations[index],
             "cached_input_tokens": min(input_allocations[index], cached_allocations[index]),
@@ -145,6 +202,7 @@ def _reconcile_usage_events(
             "reasoning_output_tokens": reasoning_allocations[index],
             "cache_write_input_tokens": cache_write_allocations[index],
             "total_tokens": total_allocations[index],
+            "metadata": {**event.get("metadata", {}), "tps_trustworthy": False},
         })
     return reconciled
 
@@ -190,6 +248,10 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
     token_record_count = 0
     previous_event_msg_cumulative: dict[str, int] | None = None
     last_cumulative: dict[str, int] | None = None
+    active_model: str | None = None
+    modern_timing = _ResponseTiming()
+    legacy_timing = _ResponseTiming()
+    seen_response_ids: set[str] = set()
 
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -197,7 +259,7 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
                 line_str = line.strip()
                 if not line_str:
                     continue
-                if "token" not in line_str and "session_meta" not in line_str:
+                if not any(key in line_str for key in ("token", "session_meta", "response_item", "turn_context")):
                     continue
                 try:
                     record = json.loads(line_str)
@@ -218,6 +280,22 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
                 if not isinstance(payload, dict):
                     payload = {}
 
+                if rec_type == "turn_context":
+                    model_value = payload.get("model")
+                    if model_value:
+                        active_model = str(model_value).strip()
+                elif rec_type == "response_item":
+                    item_type = payload.get("type")
+                    if item_type in ("function_call_output", "custom_tool_call_output") or (
+                        item_type == "message" and payload.get("role") == "user"
+                    ):
+                        modern_timing.input_timestamp = legacy_timing.input_timestamp = ts
+                    elif item_type in ("reasoning", "function_call", "custom_tool_call") or (
+                        item_type == "message" and payload.get("role") == "assistant"
+                    ):
+                        for timing in (modern_timing, legacy_timing):
+                            timing.observe_output(ts, active_model or extracted_model)
+
                 if rec_type == "session_meta" and isinstance(payload, dict):
                     prov = payload.get("provenance")
                     if isinstance(prov, dict):
@@ -229,12 +307,20 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
 
                 # Format 1: token_usage_record
                 elif rec_type == "token_usage_record":
+                    response_id = payload.get("response_id")
+                    if response_id and str(response_id) in seen_response_ids:
+                        continue
+                    if response_id:
+                        seen_response_ids.add(str(response_id))
                     token_record_count += 1
                     u = payload.get("usage")
                     if not isinstance(u, dict):
                         u = {}
                     usage_event = _build_usage_event(ts, u)
+                    modern_timing.finish(usage_event, ts)
                     if usage_event:
+                        if response_id:
+                            usage_event["event_id"] = str(response_id)
                         token_record_events.append(usage_event)
 
                     thread_cum = payload.get("thread_token_usage") or payload.get("turn_token_usage")
@@ -258,11 +344,16 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
                         previous_event_msg_cumulative = normalized_total
                         usage_event = _build_usage_event(ts, event_delta)
                         if usage_event:
+                            legacy_timing.finish(
+                                usage_event,
+                                trustworthy=event_delta == _normalize_usage(last_u),
+                            )
                             event_msg_events.append(usage_event)
                         last_cumulative = normalized_total
                     else:
                         usage_event = _build_usage_event(ts, last_u)
                         if usage_event:
+                            legacy_timing.finish(usage_event)
                             event_msg_fallback_events.append(usage_event)
     except Exception as e:
         logger.warning("Error reading rollout file %s: %s", file_path, e)

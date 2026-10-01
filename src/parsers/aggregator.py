@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import math
+import logging
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from statistics import median
 from typing import Any, Mapping, Iterator
 
 from ..pricing import (
@@ -26,6 +29,7 @@ _CANONICAL_MODELS: dict[str, str] = {k.lower(): k for k in MODEL_PRICING}
 _TIME_RANGES = {"all", "month", "30d", "7d", "24h", "custom"}
 _WEEKDAY_LABELS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _PARSER_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="usage-parser")
+_LOGGER = logging.getLogger(__name__)
 DEFAULT_SOURCE_REGISTRY = SOURCE_REGISTRY
 for _builtin_source in (CodexSource(), AntigravitySource(), ClaudeCodeSource()):
     if DEFAULT_SOURCE_REGISTRY.lookup(_builtin_source.key) is None:
@@ -948,6 +952,65 @@ def _model_provider(model_name: str, fallback: str | None) -> str | None:
     return fallback
 
 
+def _usage_model_key(
+    session: Mapping[str, Any], event: Mapping[str, Any], tool: str = "all"
+) -> str:
+    """Serialize the same provider/model grouping used by model rows."""
+    tool_value = str(session.get("tool") or (tool if tool != "all" else "")).strip()
+    raw_model = str(event.get("model") or session.get("model") or "unknown")
+    provider_hint = str(session.get("provider") or tool_value or "").strip() or None
+    provider = _model_provider(raw_model, provider_hint)
+    resolved = PRICING_CATALOG.resolve(raw_model, provider)
+    canonical_model = resolved.canonical_model or _canonical_model_name(raw_model)
+    return f"{provider or tool_value or 'unknown'}|{canonical_model}"
+
+
+def _blank_model_day() -> dict[str, Any]:
+    return {"total_tokens": 0, "call_count": 0, "cost_cached_usd": 0.0}
+
+
+def _add_model_day(
+    model_days: dict[str, dict[str, dict[str, Any]]],
+    model_key: str,
+    date_key: str,
+    total_tokens: int,
+    call_count: int,
+    cost: Mapping[str, float],
+) -> None:
+    """Attribute an accepted daily point without rounding each model's cost."""
+    days = model_days.setdefault(model_key, {})
+    row = days.get(date_key)
+    if row is None:
+        row = days[date_key] = _blank_model_day()
+    row["total_tokens"] += total_tokens
+    row["call_count"] += call_count
+    row["cost_cached_usd"] += float(cost.get("cost_cached_usd") or 0.0)
+
+
+def _aligned_model_days(
+    daily: list[dict[str, Any]],
+    model_days: dict[str, dict[str, dict[str, Any]]],
+    keys: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    # Daily totals are rounded once to six decimals. Keeping model costs at
+    # full precision avoids accumulating one rounding error per model.
+    return {
+        key: [model_days.get(key, {}).get(row["date"]) or _blank_model_day() for row in daily]
+        for key in keys
+    }
+
+
+def _add_model_metadata(
+    model_index: dict[str, dict[str, str]], model_key: str, tool: str,
+) -> None:
+    """Retain display metadata for keys outside the selected model window."""
+    model = model_index.setdefault(model_key, {
+        "tool": tool, "model": model_key.split("|", 1)[1],
+    })
+    if model["tool"] != tool:
+        model["tool"] = "all"
+
+
 def _session_model_contributions(
     session: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
@@ -991,6 +1054,7 @@ def _session_model_contributions(
             "total_tokens": total,
             "call_count": _event_call_count(event),
             "cost": _event_cost(session, event, uncached, cached, output, cache_write),
+            "timing": _event_timing(session, event),
         })
 
     event_calls = sum(contribution["call_count"] for contribution in contributions)
@@ -1026,6 +1090,34 @@ def _session_model_contributions(
     return contributions
 
 
+def _event_timing(
+    session: Mapping[str, Any], event: Mapping[str, Any]
+) -> tuple[int, float] | None:
+    """Read a trustworthy completed call, excluding unsupported sources."""
+    if normalize_source_key(str(session.get("tool") or "")) not in ("codex", "claude-code"):
+        return None
+    metadata = event.get("metadata")
+    if not isinstance(metadata, Mapping) or not metadata.get("tps_trustworthy") or metadata.get("synthetic"):
+        return None
+    if _event_call_count(event) != 1:
+        return None
+    duration = metadata.get("tps_duration_seconds")
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+        return None
+    output = _as_int(metadata.get("tps_output_tokens"))
+    if not math.isfinite(duration) or not 1.0 <= duration <= 300.0 or output < 32:
+        return None
+    return output, float(duration)
+
+
+def _tps_percentile(values: list[float], fraction: float) -> float:
+    """Interpolate a percentile from sorted per-call rates."""
+    position = (len(values) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(values) - 1)
+    return values[lower] + (values[upper] - values[lower]) * (position - lower)
+
+
 def _build_usage_data(
     sessions: list[dict[str, Any]],
     tool: str,
@@ -1046,6 +1138,7 @@ def _build_usage_data(
     model_statuses: dict[tuple[str, str], set[str]] = defaultdict(set)
     model_token_sources: dict[tuple[str, str], set[str]] = defaultdict(set)
     model_cost_sources: dict[tuple[str, str], set[str]] = defaultdict(set)
+    model_tps_samples: dict[tuple[str, str], list[float]] = defaultdict(list)
     for session_index, session in enumerate(sessions_combined):
         session_key = f"{session.get('tool', '')}:{session.get('id', session_index)}"
         session_token_source = str(
@@ -1072,6 +1165,7 @@ def _build_usage_data(
             else:
                 contribution_cost_source = "unavailable"
             model = models_map.setdefault(model_key, {
+                "key": "|".join(model_key),
                 "model": canonical_model,
                 "canonical_model": canonical_model,
                 "tool": tool_value,
@@ -1089,6 +1183,14 @@ def _build_usage_data(
                 "est_cost_cached_usd": 0.0,
                 "est_cost_uncached_usd": 0.0,
                 "est_savings_usd": 0.0,
+                "tps": None,
+                "tps_median": None,
+                "tps_p10": None,
+                "tps_p90": None,
+                "tps_calls": 0,
+                "tps_output_tokens": 0,
+                "tps_duration_seconds": 0.0,
+                "tps_status": "unavailable",
             })
             if model["tool"] != tool_value:
                 model["tool"] = "all"
@@ -1107,6 +1209,13 @@ def _build_usage_data(
             model_cost_sources[model_key].add(contribution_cost_source)
             model_statuses[model_key].add(resolved.status)
             model_token_sources[model_key].add(session_token_source)
+            timing = contribution.get("timing")
+            if timing is not None:
+                timed_output, duration = timing
+                model["tps_calls"] += 1
+                model["tps_output_tokens"] += timed_output
+                model["tps_duration_seconds"] += duration
+                model_tps_samples[model_key].append(timed_output / duration)
 
     models_list: list[dict[str, Any]] = []
     local_tz = (
@@ -1117,6 +1226,14 @@ def _build_usage_data(
         else local_timezone()
     )
     for model_key, model in models_map.items():
+        rates = sorted(model_tps_samples[model_key])
+        if rates:
+            model["tps"] = round(model["tps_output_tokens"] / model["tps_duration_seconds"], 1)
+            model["tps_median"] = round(median(rates), 1)
+            model["tps_p10"] = round(_tps_percentile(rates, 0.1), 1)
+            model["tps_p90"] = round(_tps_percentile(rates, 0.9), 1)
+            model["tps_status"] = "approximate"
+        model["tps_duration_seconds"] = round(model["tps_duration_seconds"], 6)
         model["session_count"] = len(model.pop("session_ids"))
         cacheable_input = int(model["uncached_input"]) + int(model["cached_input"])
         model["cache_hit_rate"] = round(
@@ -1172,6 +1289,7 @@ def _build_usage_data(
     models_list.sort(key=lambda model: int(model.get("total_tokens") or 0), reverse=True)
 
     timeline_map: dict[str, dict[str, Any]] = defaultdict(_blank_day_row)
+    model_days: dict[str, dict[str, dict[str, Any]]] = {}
     timeline_session_ids: dict[str, set[str]] = defaultdict(set)
     hourly_map = {hour: _blank_hour_row(hour) for hour in range(24)}
     hourly_session_ids: dict[int, set[str]] = defaultdict(set)
@@ -1196,6 +1314,7 @@ def _build_usage_data(
         total_tokens: int,
         call_count: int,
         cost: Mapping[str, float],
+        model_key: str,
     ) -> None:
         if not _is_plausible_usage_time(when, reference_now):
             return
@@ -1214,6 +1333,7 @@ def _build_usage_data(
             cost,
         )
         timeline_session_ids[date_key].add(session_key)
+        _add_model_day(model_days, model_key, date_key, total_tokens, call_count, cost)
 
         hour = when.hour
         weekday = when.weekday()
@@ -1282,6 +1402,7 @@ def _build_usage_data(
                     event_total,
                     _event_call_count(event),
                     event_cost,
+                    _usage_model_key(session, event, tool),
                 )
             continue
 
@@ -1303,6 +1424,7 @@ def _build_usage_data(
                 _as_int(session.get("total_tokens")),
                 _as_int(session.get("call_count")),
                 session_cost,
+                _usage_model_key(session, {}, tool),
             )
             continue
 
@@ -1330,6 +1452,10 @@ def _build_usage_data(
             session_cost,
         )
         timeline_session_ids[date_key].add(session_key)
+        _add_model_day(
+            model_days, _usage_model_key(session, {}, tool), date_key,
+            _as_int(session.get("total_tokens")), _as_int(session.get("call_count")), session_cost,
+        )
 
     for date_key, day in timeline_map.items():
         day["date"] = date_key
@@ -1402,12 +1528,18 @@ def _build_usage_data(
         if m.get("unpriced")
     ]
 
+    model_keys = [model["key"] for model in models_list]
+    unattributed = model_days.keys() - set(model_keys)
+    if unattributed:
+        _LOGGER.warning("Timeline usage has no corresponding model row: %s", sorted(unattributed))
+
     return {
         "tool": tool,
         "timezone": timezone_name(local_tz),
         "summary": summary,
         "models": models_list,
         "timeline": timeline_list,
+        "timeline_by_model": _aligned_model_days(timeline_list, model_days, model_keys),
         "hourly_timeline": hourly_timeline,
         "weekday_hour": weekday_hour,
         "sessions": [_strip_usage_events(session) for session in sessions_combined],
@@ -1696,6 +1828,10 @@ def _build_heatmap_daily(
     end_day: date,
     local_tz,
     reference_now: datetime,
+    *,
+    model_days: dict[str, dict[str, dict[str, Any]]] | None = None,
+    model_index: dict[str, dict[str, str]] | None = None,
+    tool: str = "all",
 ) -> list[dict[str, Any]]:
     """Aggregate only daily heatmap metrics for source sessions in the date window."""
     rows = {
@@ -1715,6 +1851,8 @@ def _build_heatmap_daily(
         total_tokens: int,
         call_count: int,
         cost: Mapping[str, float],
+        model_key: str,
+        model_tool: str,
     ) -> None:
         if not _is_plausible_usage_time(when, reference_now):
             return
@@ -1734,9 +1872,14 @@ def _build_heatmap_daily(
             cost,
         )
         session_ids[date_key].add(session_key)
+        if model_days is not None:
+            _add_model_day(model_days, model_key, date_key, total_tokens, call_count, cost)
+        if model_index is not None:
+            _add_model_metadata(model_index, model_key, model_tool)
 
     for session_index, session in enumerate(sessions):
         session_key = f"{session.get('tool', '')}:{session.get('id', f'session-{session_index}')}"
+        model_tool = str(session.get("tool") or (tool if tool != "all" else "")).strip()
         event_rows: list[tuple[dict[str, Any], datetime]] = []
         fallback_event_time = _session_timestamp(session, local_tz)
         raw_events = session.get("usage_events")
@@ -1780,6 +1923,8 @@ def _build_heatmap_daily(
                     event_total,
                     _event_call_count(event),
                     event_cost,
+                    _usage_model_key(session, event, tool),
+                    model_tool,
                 )
             continue
 
@@ -1801,6 +1946,8 @@ def _build_heatmap_daily(
                 _as_int(session.get("total_tokens")),
                 _as_int(session.get("call_count")),
                 session_cost,
+                _usage_model_key(session, {}, tool),
+                model_tool,
             )
             continue
 
@@ -1829,6 +1976,13 @@ def _build_heatmap_daily(
                 session_cost,
             )
             session_ids[date_key].add(session_key)
+            if model_days is not None:
+                _add_model_day(
+                    model_days, _usage_model_key(session, {}, tool), date_key,
+                    _as_int(session.get("total_tokens")), _as_int(session.get("call_count")), session_cost,
+                )
+            if model_index is not None:
+                _add_model_metadata(model_index, _usage_model_key(session, {}, tool), model_tool)
 
     for date_key, row in rows.items():
         row["session_count"] = len(session_ids.get(date_key, set()))
@@ -1885,20 +2039,41 @@ def _filter_usage_data(
             window_end=current,
         )
 
+    heatmap_model_index: dict[str, dict[str, str]] = {}
     if normalized == "all":
         result["heatmap_daily"] = _heatmap_rows_from_timeline(
             result["timeline"],
             heatmap_start_day,
             heatmap_end_day,
         )
+        timeline_dates = {row["date"]: index for index, row in enumerate(result["timeline"])}
+        result["heatmap_by_model"] = {
+            key: [
+                series[timeline_dates[row["date"]]] if row["date"] in timeline_dates else _blank_model_day()
+                for row in result["heatmap_daily"]
+            ]
+            for key, series in result["timeline_by_model"].items()
+        }
     else:
+        heatmap_model_days: dict[str, dict[str, dict[str, Any]]] = {}
         result["heatmap_daily"] = _build_heatmap_daily(
             source_sessions,
             heatmap_start_day,
             heatmap_end_day,
             heatmap_tz,
             heatmap_now,
+            model_days=heatmap_model_days,
+            model_index=heatmap_model_index,
+            tool=str(data.get("tool") or "all"),
         )
+        keys = list(dict.fromkeys([model["key"] for model in result["models"]] + list(heatmap_model_days)))
+        result["heatmap_by_model"] = _aligned_model_days(result["heatmap_daily"], heatmap_model_days, keys)
+    # Selected model rows take precedence over metadata from the wider
+    # heatmap window, which can contain additional tools for the same key.
+    result["model_index"] = {
+        **heatmap_model_index,
+        **{model["key"]: {"tool": model["tool"], "model": model["model"]} for model in result["models"]},
+    }
     result["time_range"] = normalized
     analytics_now = current if normalized == "custom" and not end else now
     result["analytics"] = _build_analytics(
