@@ -336,7 +336,10 @@
     } catch (err) {
       if (!isCurrentUsageRequest(generation)) return;
       console.warn('Failed to fetch usage metrics:', err);
-      window.DashboardUtils.showToast("Couldn't load usage data. Check that the server is running, then refresh.", 'error');
+      const errorMessage = err && typeof err.message === 'string' && err.message.trim()
+        ? err.message
+        : "Couldn't load usage data. Check that the server is running, then refresh.";
+      window.DashboardUtils.showToast(errorMessage, 'error');
       setSyncState('error');
     } finally {
       if (state.activeUsageRequest === generation) state.activeUsageRequest = null;
