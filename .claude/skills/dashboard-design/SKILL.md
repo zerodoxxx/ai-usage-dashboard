@@ -72,6 +72,19 @@ Motion is allowed only when it reports a real event or answers the user:
 
 No ambient loops, hover lifts on trays, entrance animations on panels or decorative pulsing. Everything above snaps or is skipped under reduced motion.
 
+## Feature modules
+
+Each feature owns its own JS and CSS. `dashboard.js` calls `update(data, ctx)` on each of them after every render, with `ctx = { boot, queryKey, tool, timeRange }`.
+
+- **Register** (`odometer.js`, `register.css`): drums in light theme, Nixie tubes in dark. `boot(value)` runs the load sequence.
+- **Milestones** (`milestones.js`): fires only when a live refresh of the same query crosses a 1-2.5-5 threshold.
+- **Receipt** (`receipt.js`, `receipt.css`): a physical paper strip in the meter showing the top 6 models by cost, an "other models" row and a total. Its amounts must match the ledger and the register to the cent.
+- **Skyline** (`skyline.js`, `skyline.css`): a Canvas 2D isometric city of `heatmap_daily`. Height is tokens; colour is the cost ramp, shaded in OKLCH and never toward grey.
+- **Linked hover** (`linked.js`, `linked.css`): focus on a model or a tool shows that series over ghosted totals.
+  - It uses `timeline_by_model`, `heatmap_by_model` and `model_index`.
+  - Map keys to tools through `model_index`. Never parse the key prefix.
+  - Axes never rescale on focus.
+
 ## Copy and chrome rules
 
 - Sentence case everywhere, including table headers ("Uncached input", not "UNCACHED INPUT").
@@ -83,5 +96,5 @@ No ambient loops, hover lifts on trays, entrance animations on panels or decorat
 ## Verify a visual change
 
 1. Screenshot full pages at 1440, 768 and 390 in dark and light, plus hover states for any chart you touched. Look at them.
-2. Check the console for errors, and check `tool=claude-code` (short ledger) and `time_range=all` (long timeline).
+2. Check the console for errors, and check `tool=claude-code` (short ledger) and `time_range=all` (long timeline). Trigger a milestone by hand with `DashboardMilestones.celebrate('cost', 500)`. For the boot sequence, capture frames during the first ~1.6s.
 3. Run `python -m pytest -q test_server.py`; the index test asserts key ids and copy.
