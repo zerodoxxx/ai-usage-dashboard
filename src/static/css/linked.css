@@ -1,0 +1,61 @@
+/* Linked hover across ledger, donut and charts. */
+#model-ledger .ledger__row,
+#tool-donut-legend .donut-legend__row {
+  transition: opacity 160ms, background-color 160ms;
+}
+
+#model-ledger .ledger__row.is-focused {
+  background: var(--surface-2);
+}
+
+#model-ledger .ledger__row.is-dimmed,
+#tool-donut-legend .donut-legend__row.is-dimmed {
+  opacity: .38;
+}
+
+#model-ledger .ledger__row:focus-visible,
+#tool-donut-legend .donut-legend__row:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.linked-focus-label {
+  color: var(--ink-2);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.daily-readout:has(.daily-readout__focus) {
+  position: relative;
+}
+
+.daily-readout__focus {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 4px);
+  max-width: 100%;
+  overflow: hidden;
+  line-height: 14px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  text-align: right;
+  pointer-events: none;
+}
+
+@media (max-width: 767px) {
+  .tray--daily:has(.daily-readout__focus) { position: relative; }
+  .daily-readout:has(.daily-readout__focus) { position: static; }
+  .daily-readout__focus {
+    top: 4px;
+    bottom: auto;
+    left: var(--tray-pad);
+    right: var(--tray-pad);
+    line-height: 11px;
+    text-align: left;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #model-ledger .ledger__row,
+  #tool-donut-legend .donut-legend__row { transition: none; }
+}
