@@ -56,7 +56,7 @@
     ].filter(Boolean).join('; ');
     if ((source === 'litellm' || source === 'litellm-cache') && !meta.stale) {
       const text = age && age !== 'just now' ? `Pricing: live ${age}` : 'Pricing: live just now';
-      badge.innerHTML = `<span class="status-dot status-live" aria-hidden="true"></span>${escapeHtml(text)}`;
+      badge.innerHTML = `<span class="status-dot" aria-hidden="true"></span>${escapeHtml(text)}`;
       badge.title = detail || 'LiteLLM community rates are fresh';
     } else if (meta.stale) {
       badge.innerHTML = `<span class="status-dot status-stale" aria-hidden="true"></span>Pricing: stale`;

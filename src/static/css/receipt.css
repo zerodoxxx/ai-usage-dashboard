@@ -295,7 +295,6 @@
   .meter {
     grid-template-columns: minmax(0, 1.1fr) 248px minmax(0, 1fr);
     column-gap: 28px;
-    align-items: start;
   }
 
   .readout {
@@ -320,11 +319,6 @@
 }
 
 @media (min-width: 768px) and (max-width: 1199px) {
-  .meter {
-    grid-template-columns: minmax(0, 1fr);
-    row-gap: 32px;
-  }
-
   .receipt {
     justify-self: start;
     width: min(320px, 100%);

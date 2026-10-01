@@ -74,7 +74,6 @@
     });
     document.querySelectorAll('#tool-donut-legend [data-tool]').forEach((row) => {
       const matches = resolved && row.dataset.tool === resolved.tool;
-      row.classList.toggle('is-focused', Boolean(matches));
       row.classList.toggle('is-dimmed', Boolean(resolved && !matches));
     });
   }

@@ -5,7 +5,7 @@
  * tool hues = identity only. Every color is read from the CSS custom properties defined in
  * dashboard.css (see readPalette) and re-read on `themechange` and OS scheme changes.
  *
- * Public API: window.DashboardCharts = { updateCharts(data, ctx), setFocus(focus), resizeCharts(), refreshTheme(), destroyCharts() }
+ * Public API: window.DashboardCharts = { updateCharts(data, ctx), setFocus(focus) }
  * updateCharts resolves its own mounts by id on every call; missing mounts are skipped silently.
  */
 (function () {
@@ -292,19 +292,9 @@
 
   /* ------------------------------------------------------------------ mounts and empty states */
 
-  /** Returns the canvas for a chart mount id; wraps a canvas inside a non-canvas mount. */
+  /** Returns the canvas for a chart mount id. */
   function canvasFor(id) {
-    const el = byId(id);
-    if (!el) return null;
-    if (el.tagName === 'CANVAS') return el;
-    let canvas = el.querySelector('canvas');
-    if (!canvas) {
-      el.classList.add('chart-mount');
-      canvas = document.createElement('canvas');
-      if (!el.hasAttribute('aria-hidden')) canvas.setAttribute('role', 'img');
-      el.appendChild(canvas);
-    }
-    return canvas;
+    return byId(id);
   }
 
   function frameFor(canvas) {
@@ -1696,9 +1686,9 @@
     if (!legend) return;
     legend.classList.add('hm');
     legend.dataset.metric = metric;
-    legend.innerHTML = `<span class="heatmap-legend__text">Less</span><span class="heatmap-legend__swatches" aria-hidden="true">${
+    legend.innerHTML = `<span>Less</span><span class="heatmap-legend__swatches" aria-hidden="true">${
       [1, 2, 3, 4, 5, 6].map((step) => `<span class="heatmap-swatch" data-step="${step}"></span>`).join('')
-    }</span><span class="heatmap-legend__text">More</span>`;
+    }</span><span>More</span>`;
   }
 
   function clearHeatmap(container, legend) {
@@ -1781,7 +1771,7 @@
     heatmapSuppressedCell = null;
 
     const firstOffset = weekdayColumn(list[0].date);
-    const header = `<div class="heatmap-row heatmap-header-row" role="row">${WEEKDAYS.map(([letter, name], index) => (
+    const header = `<div class="heatmap-row" role="row">${WEEKDAYS.map(([letter, name], index) => (
       `<div class="heatmap-weekday" role="columnheader" aria-colindex="${index + 1}" aria-label="${name}">${letter}</div>`
     )).join('')}</div>`;
     const spacer = '<div class="heatmap-spacer" role="presentation" aria-hidden="true"></div>';
@@ -2081,32 +2071,9 @@
     guard('updateSparklines', () => updateSparklines(payload));
   }
 
-  function resizeCharts() {
-    Object.keys(charts).forEach((key) => {
-      const inst = charts[key];
-      if (!inst || !inst.chart) return;
-      try { inst.chart.resize(); } catch { /* canvas may be hidden */ }
-    });
-  }
-
-  function destroyCharts() {
-    Object.keys(charts).forEach((key) => {
-      const inst = charts[key];
-      if (inst && inst.chart) {
-        if (inst.unbindFocus) inst.unbindFocus();
-        try { inst.chart.destroy(); } catch { /* already destroyed */ }
-      }
-      charts[key] = null;
-    });
-    hideTooltip();
-  }
-
   window.DashboardCharts = {
     updateCharts,
     setFocus,
-    resizeCharts,
-    refreshTheme,
-    destroyCharts,
   };
 
   if (document.readyState === 'loading') {

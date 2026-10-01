@@ -22,7 +22,6 @@
 
   const PROJECTION_PHRASES = {
     all_run_rate: "Projected from the all-time daily average",
-    last_30_days: "Projected from the all-time daily average",
     current_month_run_rate: "Projected from this month's daily average",
     custom_run_rate: "Projected from the selected range's daily average",
     '30d_run_rate': "Projected from the past 30 days' daily average",
@@ -79,7 +78,6 @@
         element: el,
         prefix: '$',
         decimals: 2,
-        register: true,
         minIntegerDigits: 4,
         duration: 850,
       });
@@ -779,7 +777,6 @@
     elements.customRangeEdit = document.getElementById('custom-range-edit');
     elements.customStartDate = document.getElementById('custom-start-date');
     elements.customEndDate = document.getElementById('custom-end-date');
-    elements.customEndControl = document.getElementById('custom-end-control');
     elements.customEndNowLabel = document.getElementById('custom-end-now-label');
     elements.customRangeApply = document.getElementById('custom-range-apply');
     elements.autoRefreshToggle = document.getElementById('auto-refresh-toggle');
@@ -823,8 +820,6 @@
     elements.sessionsCountBadge = document.getElementById('sessions-count-badge');
     elements.sessionsSearch = document.getElementById('sessions-search');
     elements.sessionsTableBody = document.getElementById('sessions-table-body');
-
-    elements.toastContainer = document.getElementById('toast-container');
   }
 
   /**

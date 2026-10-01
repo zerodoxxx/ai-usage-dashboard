@@ -391,7 +391,7 @@
         : `${savingsPrefix}${usd(savingsValue)}`;
 
       rowsHtml += `
-        <tr class="${isUnpricedRow ? 'unpriced-row' : ''}">
+        <tr>
           <td>
             <div class="model-cell__meta"><strong class="model-name">${escapeHtml(modelName)}</strong>${estBadge}${unpricedPill}${mixedCostPill}</div>
             <div class="cell-sub"><span class="${badge.className}">${badge.text}</span></div>
@@ -533,8 +533,5 @@
     renderModelLedger,
     renderModelTable,
     renderSessionsTable,
-    normalizeSessionTitle,
-    sessionCountLabel,
-    filterSessions,
   };
 })();

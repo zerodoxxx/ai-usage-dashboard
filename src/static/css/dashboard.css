@@ -75,7 +75,6 @@
 
   --font: "Archivo", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --register-size: clamp(44px, 7.2vw, 92px);
-  --ease-roll: cubic-bezier(.2, .7, .1, 1);
 
   --page-max: 1320px;
   --page-pad: 32px;
@@ -997,10 +996,6 @@ input[type="date"].control {
   display: block;
 }
 
-.chart-frame--donut {
-  position: relative;
-}
-
 .donut-center {
   position: absolute;
   inset: 0;
@@ -1464,10 +1459,6 @@ th[aria-sort="ascending"] .model-sort__chevron {
   font-size: 12px;
 }
 
-td > .provider {
-  font-size: 13px;
-}
-
 .cell-sub .provider {
   color: inherit;
   font-size: inherit;
@@ -1811,11 +1802,6 @@ td > .provider {
   .readout__row:nth-child(2) {
     padding-top: 16px;
     border-top: 1px solid var(--line);
-  }
-
-  .readout__row:first-child {
-    padding-top: 0;
-    border-top: 0;
   }
 
   .board {

@@ -359,26 +359,6 @@ def _allocate_reported_cost_to_events(session: UsageSession) -> None:
         )
 
 
-def _aggregate_event_costs(events: list[UsageEvent]) -> CostEstimate | None:
-    """Aggregate event costs without dropping mixed reported/estimated parts."""
-    costs = [event.cost for event in events if event.cost is not None]
-    if not costs or len(costs) != len(events):
-        return None
-    all_reported = all(cost.reported_usd is not None for cost in costs)
-    has_reported = any(cost.reported_usd is not None for cost in costs)
-    return CostEstimate(
-        cached_usd=sum((cost.total_usd for cost in costs), Decimal("0")),
-        uncached_usd=sum((cost.uncached_usd for cost in costs), Decimal("0")),
-        savings_usd=sum((cost.savings_usd for cost in costs), Decimal("0")),
-        reported_usd=(
-            sum((cost.reported_usd for cost in costs if cost.reported_usd is not None), Decimal("0"))
-            if all_reported else None
-        ),
-        currency=costs[0].currency,
-        source="reported" if all_reported else "mixed" if has_reported else "estimated",
-    )
-
-
 def _refresh_estimated_session_cost(session: UsageSession) -> None:
     """Reprice estimated data against the current catalog.
 

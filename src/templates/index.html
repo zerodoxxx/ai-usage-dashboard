@@ -76,7 +76,7 @@
             </div>
             <div class="field">
               <label class="field__label" for="custom-end-date">To</label>
-              <span id="custom-end-control" class="field__pair">
+              <span class="field__pair">
                 <input type="date" id="custom-end-date" class="control" title="Custom range end (dashboard local time); leave blank to include usage up to now" aria-describedby="custom-end-now-label">
                 <span id="custom-end-now-label" class="field__hint">Up to now</span>
               </span>
@@ -90,7 +90,7 @@
         <label class="switch" for="auto-refresh-toggle">
           <input type="checkbox" id="auto-refresh-toggle" class="switch__input" checked>
           <span class="switch__track" aria-hidden="true"></span>
-          <span class="switch__label">Auto-refresh</span>
+          <span>Auto-refresh</span>
         </label>
         <select id="refresh-interval" class="control control--select" aria-label="Auto-refresh interval">
           <option value="10000">Every 10s</option>
@@ -108,11 +108,11 @@
           </svg>
         </button>
         <button type="button" id="theme-toggle" class="icon-button" aria-label="Switch to light theme" title="Switch theme">
-          <svg class="theme-icon theme-icon--sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <svg class="theme-icon--sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
             <circle cx="12" cy="12" r="4"></circle>
             <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path>
           </svg>
-          <svg class="theme-icon theme-icon--moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <svg class="theme-icon--moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
             <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path>
           </svg>
         </button>
@@ -225,7 +225,7 @@
       </section>
 
       <div class="stack">
-        <section class="tray tray--donut" aria-labelledby="donut-title">
+        <section class="tray" aria-labelledby="donut-title">
           <header class="tray__head">
             <div class="tray__titles">
               <h3 id="donut-title" class="tray__title">Cost by tool</h3>
@@ -238,7 +238,7 @@
           <ul id="tool-donut-legend" class="donut-legend"></ul>
         </section>
 
-        <section class="tray tray--cache tray--fill" aria-labelledby="cache-title">
+        <section class="tray tray--fill" aria-labelledby="cache-title">
           <header class="tray__head">
             <div class="tray__titles">
               <h3 id="cache-title" class="tray__title">Cache hit rate per day</h3>
@@ -269,7 +269,7 @@
           <h2 id="details-title" class="tray__title">Details</h2>
         </div>
         <div class="tray__actions">
-          <div class="seg details-tabs" role="tablist" aria-label="Details views">
+          <div class="seg" role="tablist" aria-label="Details views">
             <button type="button" class="seg__item details-tab" role="tab" id="tab-models" aria-controls="panel-models" aria-selected="true" tabindex="0">Models</button>
             <button type="button" class="seg__item details-tab" role="tab" id="tab-sessions" aria-controls="panel-sessions" aria-selected="false" tabindex="-1">Sessions</button>
             <button type="button" class="seg__item details-tab" role="tab" id="tab-insights" aria-controls="panel-insights" aria-selected="false" tabindex="-1">Insights</button>

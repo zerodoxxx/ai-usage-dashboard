@@ -2,7 +2,7 @@
  * RollingOdometer - zero-dependency mechanical rolling odometer.
  * Smooth vertical rolling digits with staggered delays and a fixed easing.
  *
- * Register mode (`register: true`) renders the dashboard's meter: a fixed
+ * The dashboard's meter renders a fixed
  * number of integer digits (leading zeros flagged `--lead`), fraction digits
  * flagged `--fraction`, the first digit of each thousands group flagged
  * `--group-start`, and no separators other than the decimal point.
@@ -107,14 +107,11 @@
     /**
      * @param {Object} options
      * @param {HTMLElement|string} options.element - Target DOM element or CSS selector
-     * @param {string} [options.prefix=""] - Prefix string (e.g. "$"); in register mode it is only announced, not drawn
-     * @param {string} [options.suffix=""] - Suffix string (e.g. "%")
+     * @param {string} [options.prefix=""] - Prefix string (e.g. "$"); only announced, not drawn
      * @param {number} [options.decimals=0] - Decimal places (e.g. 2)
-     * @param {boolean} [options.formatCommas=true] - Thousands separators (ignored in register mode)
      * @param {number} [options.duration=800] - Roll animation duration in ms
-     * @param {boolean} [options.register=false] - Drum/Nixie register rendering
-     * @param {number} [options.minIntegerDigits=0] - Minimum integer digits, zero padded (register mode)
-     * @param {boolean} [options.nixie=true] - Register mode only: render Nixie tubes in the dark theme
+     * @param {number} [options.minIntegerDigits=0] - Minimum integer digits, zero padded
+     * @param {boolean} [options.nixie=true] - Render Nixie tubes in the dark theme
      */
     constructor(options = {}) {
       if (!options.element) {
@@ -130,11 +127,8 @@
       }
 
       this.prefix = options.prefix || '';
-      this.suffix = options.suffix || '';
       this.decimals = typeof options.decimals === 'number' ? options.decimals : 0;
-      this.formatCommas = options.formatCommas !== undefined ? !!options.formatCommas : true;
       this.duration = options.duration || 800;
-      this.register = !!options.register;
       this.allowNixie = options.nixie !== false;
       this.minIntegerDigits = Math.max(0, Number(options.minIntegerDigits) || 0);
 
@@ -142,14 +136,11 @@
       this.slots = []; // Mounted slot descriptors: { type: 'digit'|'sep', char, element, ribbon, ... }
       this._nixie = false;
       this._boot = null;
-      this._originalRole = this.el.getAttribute('role');
-      this._originalAriaLabel = this.el.getAttribute('aria-label');
 
       this._init();
     }
 
     _init() {
-      this.el.classList.add('odometer-container');
       // The drums are hidden from assistive technology: every ribbon holds all
       // ten digits, so exposing them would read as a long run of digits. The
       // container exposes one stable, current value instead.
@@ -157,13 +148,13 @@
 
       this._nixie = this._wantNixie();
       this.el.classList.toggle('register--nixie', this._nixie);
-      if (this.register && this.allowNixie) this._watchTheme();
+      if (this.allowNixie) this._watchTheme();
 
       this.update(0, true);
     }
 
     _wantNixie() {
-      return this.register && this.allowNixie && effectiveDark();
+      return this.allowNixie && effectiveDark();
     }
 
     _watchTheme() {
@@ -178,22 +169,6 @@
           this._mql.addListener(this._onThemeChange);
         }
       }
-    }
-
-    _unwatchTheme() {
-      if (this._onThemeChange) {
-        document.removeEventListener('themechange', this._onThemeChange);
-        global.removeEventListener('themechange', this._onThemeChange);
-        if (this._mql) {
-          if (typeof this._mql.removeEventListener === 'function') {
-            this._mql.removeEventListener('change', this._onThemeChange);
-          } else if (typeof this._mql.removeListener === 'function') {
-            this._mql.removeListener(this._onThemeChange);
-          }
-        }
-      }
-      this._onThemeChange = null;
-      this._mql = null;
     }
 
     /** Convert between drums and tubes instantly, keeping the value. */
@@ -229,7 +204,7 @@
       const parts = (negative ? formatted.slice(1) : formatted).split('.');
       let intPart = parts[0];
       const decPart = parts[1] || '';
-      if (this.register && this.minIntegerDigits > intPart.length) {
+      if (this.minIntegerDigits > intPart.length) {
         intPart = intPart.padStart(this.minIntegerDigits, '0');
       }
 
@@ -242,18 +217,13 @@
         if (char !== '0') leading = false;
         const fromEnd = intLen - i;
         const atGroupBoundary = i > 0 && fromEnd % 3 === 0;
-        if (this.register) {
-          descs.push({
-            char,
-            type: 'digit',
-            // Padding zeros before the first significant digit; the units digit always reads as live.
-            lead: leading && char === '0' && i < intLen - 1,
-            groupStart: atGroupBoundary,
-          });
-        } else {
-          if (this.formatCommas && atGroupBoundary) descs.push({ char: ',', type: 'sep' });
-          descs.push({ char, type: 'digit' });
-        }
+        descs.push({
+          char,
+          type: 'digit',
+          // Padding zeros before the first significant digit; the units digit always reads as live.
+          lead: leading && char === '0' && i < intLen - 1,
+          groupStart: atGroupBoundary,
+        });
       });
 
       if (decPart) {
@@ -266,7 +236,7 @@
     _ariaValue(formatted) {
       const [integer, fraction] = formatted.split('.');
       const grouped = integer.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-      return `${this.prefix}${grouped}${fraction === undefined ? '' : `.${fraction}`}${this.suffix}`;
+      return `${this.prefix}${grouped}${fraction === undefined ? '' : `.${fraction}`}`;
     }
 
     /**
@@ -349,7 +319,7 @@
       const digit = parseInt(desc.char, 10);
       const tube = document.createElement('span');
       tube.className = 'nixie-tube';
-      if (desc.lead) tube.classList.add('nixie-tube--blank', 'nixie-tube--lead');
+      if (desc.lead) tube.classList.add('nixie-tube--blank');
       if (desc.fraction) tube.classList.add('nixie-tube--fraction');
       if (desc.groupStart) tube.classList.add('nixie-tube--group-start');
       tube.setAttribute('aria-hidden', 'true');
@@ -423,7 +393,6 @@
         const desc = descs[idx];
         const digit = parseInt(desc.char, 10);
         const lead = !!desc.lead;
-        slot.element.classList.toggle('nixie-tube--lead', lead);
         if (slot.currentDigit !== digit || slot.lead !== lead) changed.push({ slot, digit, lead });
       });
       changed.reverse(); // right to left
@@ -440,14 +409,6 @@
     _rebuildSlots(descs, immediate) {
       this.el.innerHTML = '';
       this.slots = [];
-
-      if (this.prefix && !this.register) {
-        const prefixEl = document.createElement('span');
-        prefixEl.className = 'odometer-prefix';
-        prefixEl.setAttribute('aria-hidden', 'true');
-        prefixEl.textContent = this.prefix;
-        this.el.appendChild(prefixEl);
-      }
 
       const digitSlots = [];
       const newSlots = [];
@@ -498,7 +459,7 @@
           const sepEl = document.createElement('span');
           sepEl.className = 'odometer-separator';
           sepEl.setAttribute('aria-hidden', 'true');
-          if (desc.point && this.register) {
+          if (desc.point) {
             if (this._nixie) {
               sepEl.classList.add('nixie-point');
               sepEl.innerHTML = '<span class="nixie-point__dot"></span>';
@@ -512,14 +473,6 @@
           newSlots.push({ type: 'sep', char: desc.char, element: sepEl });
         }
       });
-
-      if (this.suffix) {
-        const suffixEl = document.createElement('span');
-        suffixEl.className = 'odometer-suffix';
-        suffixEl.setAttribute('aria-hidden', 'true');
-        suffixEl.textContent = this.suffix;
-        this.el.appendChild(suffixEl);
-      }
 
       this.slots = newSlots;
 
@@ -564,7 +517,7 @@
     boot(value) {
       this._cancelBoot();
       this.update(value, true);
-      if (!this.register || prefersReducedMotion()) return;
+      if (prefersReducedMotion()) return;
       if (!this.slots.some((s) => s.type === 'digit')) return;
 
       const target = this._formatValue(this.currentValue);
@@ -711,29 +664,6 @@
           if (remaining === 0) this._boot = null;
         };
       });
-    }
-
-    /**
-     * Return current numerical value
-     * @returns {number}
-     */
-    getValue() {
-      return this.currentValue;
-    }
-
-    /**
-     * Clean up DOM
-     */
-    destroy() {
-      this._cancelBoot();
-      this._unwatchTheme();
-      this.el.innerHTML = '';
-      this.el.classList.remove('odometer-container', 'register--nixie', 'is-snap');
-      if (this._originalRole === null) this.el.removeAttribute('role');
-      else this.el.setAttribute('role', this._originalRole);
-      if (this._originalAriaLabel === null) this.el.removeAttribute('aria-label');
-      else this.el.setAttribute('aria-label', this._originalAriaLabel);
-      this.slots = [];
     }
   }
 

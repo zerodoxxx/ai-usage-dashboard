@@ -7,7 +7,6 @@
 
   const PROJECTION_LABELS = {
     all_run_rate: 'All-time daily average × 30',
-    last_30_days: 'All-time daily average × 30',
     current_month_run_rate: 'Current-month daily average × 30',
     custom_run_rate: 'Selected-range daily average × 30',
     '30d_run_rate': '30-day daily average × 30',
@@ -216,7 +215,5 @@
 
   window.DashboardAnalytics = {
     updateAnalytics,
-    renderTopSessions,
-    projectionBasisLabel,
   };
 })();

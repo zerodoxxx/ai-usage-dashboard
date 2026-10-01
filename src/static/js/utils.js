@@ -17,77 +17,6 @@
   }
 
   /**
-   * Pick a short, single-line representation for the summary token cards.
-   * The exact value remains available through the card's accessible label/title.
-   */
-  function getCompactMetricParts(num) {
-    const numericValue = Number(num);
-    const value = Number.isFinite(numericValue) ? numericValue : 0;
-    const absoluteValue = Math.abs(value);
-    const units = [
-      { threshold: 1e3, suffix: 'K' },
-      { threshold: 1e6, suffix: 'M' },
-      { threshold: 1e9, suffix: 'B' },
-      { threshold: 1e12, suffix: 'T' },
-    ];
-
-    let unitIndex = -1;
-    units.forEach((unit, index) => {
-      if (absoluteValue >= unit.threshold) unitIndex = index;
-    });
-
-    if (unitIndex >= 0) {
-      let unit = units[unitIndex];
-      let scaledValue = value / unit.threshold;
-      let roundedValue = Number(scaledValue.toFixed(1));
-
-      // Avoid awkward values such as 1,000.0K at a unit boundary.
-      if (Math.abs(roundedValue) >= 1000 && unitIndex < units.length - 1) {
-        unit = units[unitIndex + 1];
-        scaledValue = value / unit.threshold;
-        roundedValue = Number(scaledValue.toFixed(1));
-      }
-
-      return {
-        value: roundedValue,
-        decimals: 1,
-        formatCommas: false,
-        suffix: unit.suffix,
-      };
-    }
-
-    return {
-      value,
-      decimals: 0,
-      formatCommas: true,
-      suffix: '',
-    };
-  }
-
-  /**
-   * Update a token metric with compact display text while preserving the full value.
-   */
-  function updateCompactMetric(odometer, unitElement, valueContainer, rawValue, label) {
-    if (!odometer) return;
-
-    const numericValue = Number(rawValue);
-    const value = Number.isFinite(numericValue) ? numericValue : 0;
-    const parts = getCompactMetricParts(value);
-    const fullValue = Math.round(value).toLocaleString();
-
-    odometer.decimals = parts.decimals;
-    odometer.formatCommas = parts.formatCommas;
-    odometer.update(parts.value);
-
-    if (unitElement) unitElement.textContent = parts.suffix;
-    if (valueContainer) {
-      const accessibleValue = `${fullValue} ${label}`;
-      valueContainer.title = accessibleValue;
-      valueContainer.setAttribute('aria-label', accessibleValue);
-    }
-  }
-
-  /**
    * Format date strings cleanly
    */
   function formatDateTime(isoString, timeZone) {
@@ -257,7 +186,7 @@
     if (!container) return;
 
     const toast = document.createElement('div');
-    toast.className = `toast ${type === 'error' ? 'toast--error' : ''}`.trim();
+    toast.className = 'toast';
     toast.innerHTML = `${type === 'error' ? '<span class="toast__dot" aria-hidden="true"></span>' : ''}<span>${escapeHtml(String(message))}</span>`;
 
     container.appendChild(toast);
@@ -269,8 +198,6 @@
 
   window.DashboardUtils = {
     formatCompactNumber,
-    getCompactMetricParts,
-    updateCompactMetric,
     formatDateTime,
     providerBadge,
     toolKey,

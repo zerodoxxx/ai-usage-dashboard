@@ -1267,7 +1267,7 @@
   function buildDom() {
     const legend = document.createElement('div');
     legend.className = 'skyline__legend';
-    legend.innerHTML = `<span class="skyline__note">Height shows tokens</span>
+    legend.innerHTML = `<span>Height shows tokens</span>
       <span class="skyline__ramp"><span>Cost</span><span>Less</span><span class="skyline__swatches" aria-hidden="true">${
   [1, 2, 3, 4, 5, 6].map((step) => `<span class="skyline__swatch" data-step="${step}"></span>`).join('')
 }</span><span>More</span></span>`;
