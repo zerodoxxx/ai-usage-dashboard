@@ -117,26 +117,48 @@
     }
   }
 
-  const PROVIDER_MARKS = {
-    codex: '<svg class="provider-mark" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="8 1.5 14 5 14 11 8 14.5 2 11 2 5"></polygon><circle cx="8" cy="8" r="1.6"></circle></svg>',
-    claude: '<svg class="provider-mark" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><line x1="8" y1="1.5" x2="8" y2="14.5"></line><line x1="2.4" y1="4.4" x2="13.6" y2="11.6"></line><line x1="13.6" y1="4.4" x2="2.4" y2="11.6"></line></svg>',
-    agy: '<svg class="provider-mark" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><polygon points="8 2 14.5 13.5 1.5 13.5"></polygon></svg>',
+  // Tool identity: one mapping used by every renderer. Display names are fixed.
+  const TOOL_LABELS = {
+    codex: 'Codex',
+    claude: 'Claude Code',
+    agy: 'Antigravity',
+    other: 'Other',
+  };
+  const TOOL_ALIASES = {
+    codex: 'codex',
+    claude: 'claude',
+    'claude-code': 'claude',
+    claude_code: 'claude',
+    anthropic: 'claude',
+    agy: 'agy',
+    antigravity: 'agy',
+    gemini: 'agy',
+    google: 'agy',
   };
 
-  const TOAST_ICONS = {
-    error: '<svg class="toast-icon toast-icon-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>',
-    info: '<svg class="toast-icon toast-icon-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>',
-  };
+  function toolKey(value) {
+    return TOOL_ALIASES[String(value || '').toLowerCase().trim()] || 'other';
+  }
 
+  function toolLabel(value) {
+    return TOOL_LABELS[toolKey(value)];
+  }
+
+  function toolDotHtml(value) {
+    return `<span class="dot dot--${toolKey(value)}" aria-hidden="true"></span>`;
+  }
+
+  /**
+   * Provider identity as [tool dot][tool name]; the name always accompanies the dot.
+   */
   function providerBadge(tool) {
-    const normalized = String(tool || '').toLowerCase();
-    if (normalized === 'codex') {
-      return { className: 'badge-codex', text: `${PROVIDER_MARKS.codex}<span>Codex</span>` };
-    }
-    if (normalized === 'claude' || normalized === 'claude-code') {
-      return { className: 'badge-claude', text: `${PROVIDER_MARKS.claude}<span>Claude Code</span>` };
-    }
-    return { className: 'badge-agy', text: `${PROVIDER_MARKS.agy}<span>Antigravity</span>` };
+    const key = toolKey(tool);
+    return {
+      key,
+      label: TOOL_LABELS[key],
+      className: 'provider',
+      text: `${toolDotHtml(key)}<span>${TOOL_LABELS[key]}</span>`,
+    };
   }
 
   // AGY transcript token counts are chars//4 estimates, unlike the exact
@@ -169,6 +191,50 @@
   }
 
   /**
+   * Compact number to three significant digits (2.62B, 26.2M, 262M, 842).
+   */
+  function formatCompactSig(num) {
+    const n = Number(num);
+    if (!Number.isFinite(n)) return '0';
+    const abs = Math.abs(n);
+    const units = [['', 1], ['K', 1e3], ['M', 1e6], ['B', 1e9], ['T', 1e12]];
+    let idx = 0;
+    while (idx < units.length - 1 && abs >= units[idx + 1][1]) idx += 1;
+    let scaled = n / units[idx][1];
+    if (Math.abs(Number(scaled.toPrecision(3))) >= 1000 && idx < units.length - 1) {
+      idx += 1;
+      scaled = n / units[idx][1];
+    }
+    if (idx === 0) return String(Math.round(n));
+    const magnitude = Math.abs(scaled);
+    const digits = magnitude >= 100 ? 0 : (magnitude >= 10 ? 1 : 2);
+    return `${scaled.toFixed(digits)}${units[idx][0]}`;
+  }
+
+  /** US-formatted dollar amount, e.g. $2,663.05. */
+  function formatUsd(value, decimals = 2) {
+    const n = Number(value);
+    const safe = Number.isFinite(n) ? n : 0;
+    return `${safe < 0 ? '-' : ''}$${Math.abs(safe).toLocaleString('en-US', {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals,
+    })}`;
+  }
+
+  /** Dollars per 1M tokens: three decimals under $1, two otherwise. */
+  function formatRate(value) {
+    const n = Number(value);
+    const safe = Number.isFinite(n) ? n : 0;
+    return formatUsd(safe, Math.abs(safe) < 1 ? 3 : 2);
+  }
+
+  /** Integer with thousands separators. */
+  function formatInt(value) {
+    const n = Number(value);
+    return (Number.isFinite(n) ? Math.round(n) : 0).toLocaleString('en-US');
+  }
+
+  /**
    * Helper to escape HTML and prevent XSS
    */
   function escapeHtml(str) {
@@ -191,18 +257,13 @@
     if (!container) return;
 
     const toast = document.createElement('div');
-    toast.className = `toast ${type === 'error' ? 'toast-error' : ''}`;
-    toast.innerHTML = `
-      ${type === 'error' ? TOAST_ICONS.error : TOAST_ICONS.info}
-      <span>${escapeHtml(String(message))}</span>
-    `;
+    toast.className = `toast ${type === 'error' ? 'toast--error' : ''}`.trim();
+    toast.innerHTML = `${type === 'error' ? '<span class="toast__dot" aria-hidden="true"></span>' : ''}<span>${escapeHtml(String(message))}</span>`;
 
     container.appendChild(toast);
     setTimeout(() => {
       toast.style.opacity = '0';
-      toast.style.transform = 'translateY(10px)';
-      toast.style.transition = 'all 0.3s ease';
-      setTimeout(() => toast.remove(), 300);
+      setTimeout(() => toast.remove(), 130);
     }, 4000);
   }
 
@@ -212,6 +273,13 @@
     updateCompactMetric,
     formatDateTime,
     providerBadge,
+    toolKey,
+    toolLabel,
+    toolDotHtml,
+    formatCompactSig,
+    formatUsd,
+    formatRate,
+    formatInt,
     escapeHtml,
     showToast,
     tokenProvenance,
