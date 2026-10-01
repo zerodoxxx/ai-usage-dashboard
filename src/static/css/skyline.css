@@ -1,0 +1,160 @@
+/* 3D city view of the last 30 days.
+   Consumes the dashboard tokens only; the canvas itself reads them at draw time (see skyline.js). */
+
+/* ---------------------------------------------------------------- tray header */
+
+/* The view toggle sits next to the metric control; wrap instead of overflowing in narrow trays. */
+.tray--heatmap .tray__head {
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+/* Same height with or without the metric control, so the header never jumps between views. */
+.tray--heatmap .tray__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-height: 34px;
+  margin-left: auto;
+}
+
+/* A little tighter than the default so the metric control and the toggle share the title's row. */
+.tray--heatmap .seg__item {
+  padding: 0 9px;
+}
+
+#skyline-toggle[aria-pressed="true"] {
+  background: var(--surface-3);
+  color: var(--ink);
+  box-shadow: var(--shadow-seg);
+}
+
+/* --------------------------------------------------------------- view switching */
+
+.tray--heatmap.is-city #daily-usage-heatmap,
+.tray--heatmap.is-city #heatmap-legend {
+  display: none;
+}
+
+/* Hidden but still in the layout: the header keeps its height and the toggle keeps its place. */
+.tray--heatmap.is-city #heatmap-metric {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* ---------------------------------------------------------------------- city */
+
+.skyline {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: 260px;
+  container-type: inline-size;
+}
+
+.skyline[hidden] {
+  display: none;
+}
+
+.skyline__stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  /* The city is drawn into the whitespace around the tray content, so the canvas bleeds into the
+     tray padding and the header and legend margins (the tray keeps its height). */
+  margin: -14px calc(var(--tray-pad, 24px) * -0.75) -6px;
+}
+
+.skyline__canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 8px;
+  cursor: grab;
+  touch-action: pan-y;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.skyline__canvas.is-grabbing {
+  cursor: grabbing;
+}
+
+.skyline__canvas:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -3px;
+}
+
+.skyline__empty {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 0 16px;
+  color: var(--ink-3);
+  font-size: 13px;
+  text-align: center;
+}
+
+.skyline__stage.is-empty .skyline__canvas {
+  visibility: hidden;
+}
+
+.skyline__stage.is-empty .skyline__empty {
+  display: flex;
+}
+
+/* One quiet row under the canvas, laid out like the heatmap legend. */
+.skyline__legend {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+  margin-top: 12px;
+  color: var(--ink-3);
+  font-size: 11px;
+  line-height: 1;
+}
+
+.skyline__legend[hidden] {
+  display: none;
+}
+
+.skyline__ramp {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.skyline__swatches {
+  display: inline-flex;
+  gap: 3px;
+}
+
+.skyline__swatch {
+  width: 16px;
+  height: 10px;
+  border-radius: 3px;
+  background: var(--surface-2);
+}
+
+.skyline__swatch[data-step="1"] { background: var(--money-1); }
+.skyline__swatch[data-step="2"] { background: var(--money-2); }
+.skyline__swatch[data-step="3"] { background: var(--money-3); }
+.skyline__swatch[data-step="4"] { background: var(--money-4); }
+.skyline__swatch[data-step="5"] { background: var(--money-5); }
+.skyline__swatch[data-step="6"] { background: var(--money-6); }
+
+/* Narrow trays: slimmer swatches keep the legend on one row. */
+@container (max-width: 322px) {
+  .skyline__swatch {
+    width: 12px;
+  }
+}
