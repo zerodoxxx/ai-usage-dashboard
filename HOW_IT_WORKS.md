@@ -100,15 +100,15 @@ disk files
 
 ---
 
-## Performance: The Parse Cache
+## Performance: Refresh and Parse Caching
 
-Codex rollout files can be large (2–4 MB each). Re-parsing 50–100 files on every 10-second poll would be slow and wasteful.
+Codex and Claude Code each keep a process-local cache of parsed transcript files, capped at 1,024 entries per parser. Entries are keyed by resolved file path and a filesystem stat signature. An unchanged file can reuse its parsed result during the current server process; cache entries do not persist across restarts. A changed file is parsed in full, rather than incrementally, and unsuccessful or unstable reads are not cached.
 
-**Solution:** `src/parsers/codex.py` maintains an in-memory dictionary `_ROLLOUT_PARSE_CACHE` keyed by `(file_path, mtime_ns, size)`. If a rollout file hasn't been modified since the last parse, the cached result is returned immediately. Only new or modified files trigger actual JSONL reads.
+AGY does not use this parsed-file cache. It scans transcript files on each usage refresh, and reads `token_usage.db` events with one ordered query grouped by session instead of one query per session.
 
-AGY has a snapshot cache keyed by a lightweight signature of its settings, SQLite, and transcript files. A changed file invalidates the AGY snapshot; unchanged polls reuse a deep-copied result. When the dashboard requests all tools, the Codex, Claude Code, and AGY parsers run concurrently, so the request is bounded by the slowest parser instead of the sum of all three.
+The launch script checks that parser modules import and built-in providers are registered; it does not read provider histories. The first usage request performs the initial calculation. Later requests avoid reparsing unchanged Codex and Claude Code files, but still discover and stat files, scan AGY transcripts, and rebuild aggregates. When the dashboard requests all tools, the Codex, Claude Code, and AGY parsers run concurrently.
 
-This means after the first load, polling responses are nearly instant.
+Refresh time still depends on the amount of source data and which files have changed.
 
 ## How Time Windows Stay Accurate
 
@@ -168,7 +168,7 @@ Claude 5-minute and 1-hour writes are retained separately and priced at 1.25× a
 
 ## The Frontend: How the Dashboard Updates
 
-1. **On load:** `dashboard.js` calls `GET /api/pricing` (once) then `GET /api/usage?tool=all&time_range=all`. The pricing response retains legacy model keys and adds reserved `__meta__` provenance/freshness data.
+1. **On load:** `dashboard.js` calls `GET /api/usage?tool=all&time_range=all`. The current API includes the matching pricing catalog and its `__meta__` provenance/freshness data in that response; older servers can use the separate `/api/pricing` endpoint as a fallback.
 2. **The API response** contains: `summary` (odometer values), `models` (per-model table rows), `timeline` (chart data), `sessions` (recent activity list), and `analytics` (derived insights for the selected window)
 3. **Odometers** (`odometer.js`): Each number is broken into digit characters. CSS 3D `translateY` shifts a vertical strip of 0–9 digits to land on the right number. Digits animate with staggered delays and `cubic-bezier(0.2, 0.9, 0.3, 1)` easing — right-to-left, like a real counter.
 4. **Charts** (Chart.js): Token breakdown, daily cost/token/call trend, cost by tool, blended cost per 1M tokens, cache-efficiency trend, hourly activity, and a weekday/hour heatmap

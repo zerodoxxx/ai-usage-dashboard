@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import UsageSession
+from .file_cache import ParsedFileCache
 from ..pricing import calculate_cost_strict
 
 logger = logging.getLogger(__name__)
@@ -233,7 +234,7 @@ def _to_iso_string(ts: int | float | str | None) -> str:
     return str(ts).strip()
 
 
-def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
+def _parse_rollout_file_uncached(file_path: Path) -> tuple[dict[str, Any], bool]:
     """Parse a single Codex rollout .jsonl file.
 
     Extracts incremental and cumulative token usage, timestamps, and call counts.
@@ -252,6 +253,7 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
     modern_timing = _ResponseTiming()
     legacy_timing = _ResponseTiming()
     seen_response_ids: set[str] = set()
+    read_succeeded = True
 
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -356,6 +358,7 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
                             legacy_timing.finish(usage_event)
                             event_msg_fallback_events.append(usage_event)
     except Exception as e:
+        read_succeeded = False
         logger.warning("Error reading rollout file %s: %s", file_path, e)
 
     if last_cumulative:
@@ -426,7 +429,15 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
         "model": extracted_model,
         "usage_events": usage_events,
     }
-    return dict(result)
+    return dict(result), read_succeeded
+
+
+_ROLLOUT_PARSE_CACHE: ParsedFileCache[dict[str, Any]] = ParsedFileCache(max_entries=1024)
+
+
+def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
+    """Parse a rollout file, reusing only stable successful reads."""
+    return _ROLLOUT_PARSE_CACHE.parse(file_path, _parse_rollout_file_uncached)
 
 
 def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
@@ -469,6 +480,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
     }
 
     if not base_dir.exists():
+        _ROLLOUT_PARSE_CACHE.retain_paths(())
         return empty_result
 
     # 1. Discover all rollout files on disk
@@ -521,6 +533,14 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
                     conn.close()
                 except Exception as e:
                     logger.debug("Failed to close connection: %s", e)
+
+    live_rollout_paths = set(rollout_files_by_path.values())
+    live_rollout_paths.update(
+        Path(str(thread.get("rollout_path"))).expanduser()
+        for thread in threads_data
+        if thread.get("rollout_path") and Path(str(thread["rollout_path"])).is_file()
+    )
+    _ROLLOUT_PARSE_CACHE.retain_paths(live_rollout_paths)
 
     sessions: list[dict[str, Any]] = []
     processed_rollout_paths: set[str] = set()

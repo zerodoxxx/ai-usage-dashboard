@@ -107,7 +107,12 @@ def api_usage(
         # Refresh before parsing so provider adapters and their snapshots use
         # the same active rates as the pricing endpoint.
         refresh_pricing()
-        return get_tool_usage(tool, time_range=time_range, start=start, end=end)
+        usage = get_tool_usage(tool, time_range=time_range, start=start, end=end)
+        # The aggregator applies rates to models it discovers while parsing.
+        # Include that exact active catalog with the usage response so clients
+        # need one request and cost details stay aligned with the calculation.
+        usage["pricing"] = active_pricing_payload(refresh=False)
+        return usage
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

@@ -195,6 +195,24 @@
     }
   }
 
+  /** Apply the catalog returned alongside usage when the backend supports it. */
+  function applyUsagePricing(data, generation) {
+    const pricingData = data && data.pricing;
+    const modelKeys = pricingData && typeof pricingData === 'object'
+      ? Object.keys(pricingData).filter((key) => !key.startsWith('__'))
+      : [];
+    if (!isCurrentUsageRequest(generation)
+      || !pricingData
+      || typeof pricingData !== 'object'
+      || Array.isArray(pricingData)
+      || modelKeys.length === 0) {
+      return false;
+    }
+    state.pricingData = pricingData;
+    window.DashboardApi.updatePricingStatus(elements.pricingStatus, pricingData.__meta__ || {});
+    return true;
+  }
+
   /**
    * Fetch usage data from /api/usage?tool=...&time_range=...[&start=...&end=...]
    * @param {boolean} [isUserInitiated=false]
@@ -242,11 +260,14 @@
         return;
       }
 
-      await fetchPricing(generation);
+      const data = result.data;
+      if (!applyUsagePricing(data, generation)) {
+        // Older servers still expose /api/pricing as a separate endpoint.
+        await fetchPricing(generation);
+      }
 
       if (!isCurrentUsageRequest(generation)) return;
 
-      const data = result.data;
       const ctx = {
         boot: !hasRenderedOnce,
         queryKey: JSON.stringify([request.tool, request.timeRange, request.start, request.end]),
@@ -336,6 +357,9 @@
     } catch (err) {
       if (!isCurrentUsageRequest(generation)) return;
       console.warn('Failed to fetch usage metrics:', err);
+      // Keep the pricing badge useful on first launch if usage itself failed.
+      if (!state.pricingData) await fetchPricing(generation);
+      if (!isCurrentUsageRequest(generation)) return;
       const errorMessage = err && typeof err.message === 'string' && err.message.trim()
         ? err.message
         : "Couldn't load usage data. Check that the server is running, then refresh.";
@@ -834,12 +858,7 @@
     setupTheme();
     setupEventListeners();
 
-    // Fetch initial pricing metadata and first usage batch
-    try {
-      await fetchPricing();
-    } catch (err) {
-      console.warn('Initial fetchPricing error:', err);
-    }
+    // Usage includes the matching pricing catalog on current servers.
     try {
       await fetchUsageData();
     } catch (err) {

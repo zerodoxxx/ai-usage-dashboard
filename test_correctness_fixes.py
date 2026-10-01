@@ -138,6 +138,110 @@ def test_agy_database_cache_writes_are_not_additive_input(tmp_path: Path) -> Non
     assert result["summary"]["cache_write"] == 0
 
 
+def test_agy_token_events_are_batch_read_and_keep_per_session_order(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    connection = sqlite3.connect(tmp_path / "token_usage.db")
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE sessions (
+                session_id TEXT, title TEXT, model TEXT, input_tokens INTEGER,
+                cached_input_tokens INTEGER, output_tokens INTEGER,
+                reasoning_output_tokens INTEGER, total_tokens INTEGER,
+                cache_write_tokens INTEGER, cost_usd REAL, call_count INTEGER,
+                timestamp TEXT, updated_at TEXT
+            );
+            CREATE TABLE token_events (
+                session_id TEXT, step_index INTEGER, timestamp TEXT, model TEXT,
+                input_tokens INTEGER, cached_input_tokens INTEGER,
+                output_tokens INTEGER, cache_write_tokens INTEGER,
+                reasoning_output_tokens INTEGER, total_tokens INTEGER, cost_usd REAL
+            );
+            """
+        )
+        connection.executemany(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    "alpha", "Alpha", "Gemini 3.8 Flash (High)", 100, 40, 20, 1, 120,
+                    0, 0.2, 3, "2026-09-18T10:00:00+00:00", "2026-09-18T10:03:00+00:00",
+                ),
+                (
+                    "beta", "Beta", "Gemini 3.8 Flash (High)", 25, 0, 5, 0, 30,
+                    0, 0.1, 2, "2026-09-18T11:00:00+00:00", "2026-09-18T11:00:00+00:00",
+                ),
+            ],
+        )
+        event_model = "Gemini 3.8 Flash (High)"
+        connection.executemany(
+            "INSERT INTO token_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                # Insert out of order. The repeated event and stale timestamp
+                # must remain present in step-index order.
+                ("alpha", 3, "2026-09-18T09:59:00+00:00", event_model, 15, 5, 3, 1, 0, 18, 0.01),
+                ("alpha", 2, "2026-09-18T10:01:00+00:00", event_model, 20, 10, 4, 3, 1, 24, 0.02),
+                ("alpha", 1, "2026-09-18T10:01:00+00:00", event_model, 20, 10, 4, 3, 1, 24, 0.02),
+                ("alpha", 0, "2026-09-18T10:00:00+00:00", event_model, 10, 5, 2, 2, 1, 12, 0.01),
+                # An orphan row was ignored by the old per-session reads.
+                ("orphan", 0, "2026-09-18T10:00:00+00:00", event_model, 999, 0, 0, 0, 0, 999, 0.0),
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    statements: list[str] = []
+    original_connect = sqlite3.connect
+
+    class TracedSQLite:
+        Row = sqlite3.Row
+
+        @staticmethod
+        def connect(*args, **kwargs):
+            traced_connection = original_connect(*args, **kwargs)
+            traced_connection.set_trace_callback(statements.append)
+            return traced_connection
+
+    import src.parsers.agy as agy_module
+    from src.parsers.agy import AntigravitySource
+
+    monkeypatch.setattr(agy_module, "sqlite3", TracedSQLite)
+    sessions = {
+        session.id: session
+        for session in AntigravitySource().extract_sessions(tmp_path)
+    }
+
+    select_queries = [
+        statement for statement in statements if statement.lstrip().upper().startswith("SELECT")
+    ]
+    event_queries = [statement for statement in select_queries if "FROM token_events" in statement]
+    assert len(select_queries) == 2
+    assert len(event_queries) == 1
+
+    alpha = sessions["alpha"]
+    assert alpha.provider == "antigravity"
+    assert alpha.metadata["token_source"] == "reported"
+    assert alpha.call_count == 4
+    assert alpha.usage.input_tokens == 100
+    assert alpha.usage.total_tokens == 120
+    assert [event.timestamp.isoformat() for event in alpha.events] == [
+        "2026-09-18T10:00:00+00:00",
+        "2026-09-18T10:01:00+00:00",
+        "2026-09-18T10:01:00+00:00",
+        "2026-09-18T09:59:00+00:00",
+    ]
+    assert [event.usage.input_tokens for event in alpha.events] == [10, 20, 20, 15]
+    assert alpha.events[1].usage.to_legacy_dict() == alpha.events[2].usage.to_legacy_dict()
+    assert all(event.usage.cache_write_tokens == 0 for event in alpha.events)
+
+    beta = sessions["beta"]
+    assert beta.events == []
+    assert beta.call_count == 2
+    assert beta.usage.total_tokens == 30
+
+
 def test_agy_metadata_only_session_does_not_fabricate_usage(tmp_path: Path) -> None:
     _create_agy_metadata_db(tmp_path)
 

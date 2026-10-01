@@ -233,11 +233,34 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM sessions")
-            for row in cursor.fetchall():
+            session_rows = cursor.fetchall()
+            session_rows_remaining: dict[Any, int] = defaultdict(int)
+            for session_row in session_rows:
+                session_rows_remaining[session_row["session_id"]] += 1
+            events_by_session: dict[Any, list[sqlite3.Row]] = defaultdict(list)
+            if session_rows:
+                event_cursor = conn.execute(
+                    """
+                    SELECT * FROM token_events
+                    WHERE session_id IN (SELECT session_id FROM sessions)
+                    ORDER BY session_id, step_index
+                    """
+                )
+                for event_row in event_cursor:
+                    events_by_session[event_row["session_id"]].append(event_row)
+
+            def release_consumed_event_rows(sid: Any) -> None:
+                remaining = session_rows_remaining[sid] - 1
+                if remaining:
+                    session_rows_remaining[sid] = remaining
+                else:
+                    session_rows_remaining.pop(sid, None)
+                    events_by_session.pop(sid, None)
+
+            for row in session_rows:
                 sid = row["session_id"]
-                ev_cursor = conn.execute("SELECT * FROM token_events WHERE session_id = ? ORDER BY step_index", (sid,))
                 events = []
-                for ev in ev_cursor.fetchall():
+                for ev in events_by_session.get(sid, ()):
                     events.append({
                         "timestamp": ev["timestamp"],
                         "model": ev["model"],
@@ -273,6 +296,7 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                     for event in events
                     for field in ("input_tokens", "cached_input_tokens", "output_tokens", "cache_write_tokens")
                 ):
+                    release_consumed_event_rows(sid)
                     continue
                 db_session_ids.add(sid)
                 observed_calls = int(row["call_count"] or 0)
@@ -303,6 +327,7 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                     "usage_events": events,
                     "from_token_usage_db": True,
                 }
+                release_consumed_event_rows(sid)
             cursor.close()
         except Exception as e:
             logger.warning("Error reading token_usage.db: %s", e)
