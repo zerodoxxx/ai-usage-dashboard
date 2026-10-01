@@ -6,378 +6,345 @@
   <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
-  <title>AI Tools Usage & Cost Visualizer</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='25' fill='%236366f1'/><path d='M30 70 L50 30 L70 70 Z' fill='none' stroke='white' stroke-width='10' stroke-linejoin='round'/></svg>">
-  <link rel="stylesheet" href="/static/css/dashboard.css?v=cost-per-1m">
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <title>AI Usage & Cost Visualizer</title>
+  <meta name="color-scheme" content="light dark">
+  <script>
+    /* Apply a stored theme before first paint so the page never flashes the wrong one. */
+    (function () {
+      try {
+        var stored = localStorage.getItem('aiud.theme');
+        if (stored === 'light' || stored === 'dark') {
+          document.documentElement.setAttribute('data-theme', stored);
+        }
+      } catch (e) { /* storage unavailable: follow the OS */ }
+    })();
+  </script>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><style>rect%7Bfill:%2317191C%7D@media (prefers-color-scheme:dark)%7Brect%7Bfill:%23EDEAE3%7D%7D</style><rect x='1' y='7' width='3.5' height='8' rx='1'/><rect x='6.25' y='1' width='3.5' height='14' rx='1'/><rect x='11.5' y='4.5' width='3.5' height='10.5' rx='1'/></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&display=swap">
+  <link rel="stylesheet" href="/static/css/dashboard.css">
+  <link rel="stylesheet" href="/static/css/charts.css">
+  <link rel="stylesheet" href="/static/css/register.css">
+  <link rel="stylesheet" href="/static/css/receipt.css">
+  <link rel="stylesheet" href="/static/css/skyline.css">
+  <link rel="stylesheet" href="/static/css/linked.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
 </head>
 <body>
-  <div class="dashboard-container">
-    <!-- Header Bar -->
-    <header class="dashboard-header">
-      <div class="brand-section">
-        <div class="brand-logo-icon">AI</div>
-        <div class="brand-titles">
-          <h1>
-            AI Usage & Cost Visualizer
-            <span class="live-badge">
-              <span class="pulse-dot"></span>
-              Live Telemetry
-            </span>
-          </h1>
-          <div class="subtitle">Real-time local auditing & cost breakdown for Codex, Claude Code & Antigravity (AGY)</div>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <!-- Topbar -->
+  <header class="topbar" id="topbar">
+    <div class="topbar__inner">
+      <h1 class="wordmark">
+        <svg class="wordmark__glyph" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false">
+          <rect x="1" y="7" width="3.5" height="8" rx="1"></rect>
+          <rect x="6.25" y="1" width="3.5" height="14" rx="1"></rect>
+          <rect x="11.5" y="4.5" width="3.5" height="10.5" rx="1"></rect>
+        </svg>
+        <span>AI usage &amp; cost</span>
+      </h1>
+
+      <div class="topbar__filters">
+        <div id="tool-filter" class="seg tool-filter" role="radiogroup" aria-label="Tool">
+          <button type="button" class="seg__item" role="radio" aria-checked="true" tabindex="0" data-tool="all">All tools</button>
+          <button type="button" class="seg__item" role="radio" aria-checked="false" tabindex="-1" data-tool="codex"><span class="dot dot--codex" aria-hidden="true"></span>Codex</button>
+          <button type="button" class="seg__item" role="radio" aria-checked="false" tabindex="-1" data-tool="claude-code"><span class="dot dot--claude" aria-hidden="true"></span>Claude Code</button>
+          <button type="button" class="seg__item" role="radio" aria-checked="false" tabindex="-1" data-tool="agy"><span class="dot dot--agy" aria-hidden="true"></span>Antigravity</button>
         </div>
-      </div>
 
-      <div class="header-controls">
-        <div class="control-group filter-controls" aria-label="Usage filters">
-          <label class="visually-hidden" for="tool-select">AI tool filter</label>
-          <select id="tool-select" class="select-control tool-select-control" title="Select AI Tool Filter">
-            <option value="all" selected>All AI Tools (Combined)</option>
-            <option value="codex">OpenAI Codex</option>
-            <option value="claude-code">Claude Code</option>
-            <option value="agy">AGY (Google Antigravity)</option>
-          </select>
-
-          <select id="time-range-select" class="select-control time-range-select" title="Select Usage Time Range" aria-label="Select Usage Time Range">
+        <div class="range-control" id="range-control">
+          <select id="time-range-select" class="control control--select" aria-label="Time range">
             <option value="all" selected>All time</option>
             <option value="month">This month</option>
             <option value="30d">Past 30 days</option>
             <option value="7d">Past 7 days</option>
-            <option value="24h">Past 24h</option>
-            <option value="custom">Custom…</option>
+            <option value="24h">Past 24 hours</option>
+            <option value="custom">Custom range…</option>
           </select>
-          <input type="date" id="custom-start-date" class="select-control date-input" title="Custom range start (dashboard local time)" aria-label="Custom range start date" hidden>
-          <span id="custom-end-control" class="custom-end-control" hidden>
-            <input type="date" id="custom-end-date" class="select-control date-input" title="Custom range end (dashboard local time); leave blank to include usage up to now" aria-label="Custom range end date; leave blank to include usage up to now">
-            <span id="custom-end-now-label" class="custom-end-now-label">Up to now</span>
-          </span>
-          <button id="custom-range-apply" class="btn-refresh" title="Apply custom date range" hidden>Apply</button>
-        </div>
-
-        <div class="control-group refresh-controls">
-          <label class="toggle-wrapper" title="Toggle Auto-Refresh">
-            <span class="switch">
-              <input type="checkbox" id="auto-refresh-toggle" checked>
-              <span class="slider"></span>
-            </span>
-            <span>Auto Refresh</span>
-          </label>
-
-          <label class="visually-hidden" for="refresh-interval">Auto-refresh interval</label>
-          <select id="refresh-interval" class="select-control" title="Auto Refresh Interval">
-            <option value="10000">10s</option>
-            <option value="30000" selected>30s</option>
-            <option value="60000">60s</option>
-          </select>
-        </div>
-
-        <div class="control-group action-controls">
-          <button id="refresh-btn" class="btn-refresh" title="Trigger Instant Refresh">
-            <svg class="refresh-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+          <button type="button" id="custom-range-edit" class="icon-button" aria-label="Edit custom range" title="Edit custom range" hidden>
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+              <rect x="2" y="3.5" width="12" height="10.5" rx="1.5"></rect>
+              <path d="M5 2v3M11 2v3M2 7h12"></path>
             </svg>
-            Refresh Now
           </button>
-        </div>
-
-        <span id="last-synced-badge" class="synced-badge" role="status" aria-live="polite" aria-atomic="true">Syncing...</span>
-      </div>
-    </header>
-
-    <!-- 4-card Executive Overview -->
-    <section class="executive-overview" aria-label="Executive Overview">
-      <h2 class="overview-heading">Executive Overview</h2>
-      <div class="metrics-grid">
-        <div class="metric-card card-cost">
-          <div class="metric-header">
-            <span class="metric-label">Spend</span>
-            <div class="metric-icon-wrap" title="Estimated API spend">
-              <svg class="metric-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <line x1="12" y1="1" x2="12" y2="23"></line>
-                <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>
-              </svg>
+          <div id="range-popover" class="popover range-popover" role="group" aria-label="Custom date range" hidden>
+            <div class="field">
+              <label class="field__label" for="custom-start-date">From</label>
+              <input type="date" id="custom-start-date" class="control" title="Custom range start (dashboard local time)">
             </div>
-          </div>
-          <div class="metric-value-container">
-            <div id="odo-total-cost" class="odometer-container">$0.00</div>
-          </div>
-          <div class="metric-subtext">
-            <span id="card-spend-subtext">Tokens in range</span>
-          </div>
-          <div id="sparkline-spend" class="metric-sparkline" aria-hidden="true"></div>
-        </div>
-
-        <div class="metric-card card-burn">
-          <div class="metric-header">
-            <span class="metric-label">Burn rate</span>
-            <div class="metric-icon-wrap" title="30-day run-rate">
-              <svg class="metric-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <polyline points="23 6 13.5 15.5 8.5 10.5 1 18"></polyline>
-                <polyline points="17 6 23 6 23 12"></polyline>
-              </svg>
+            <div class="field">
+              <label class="field__label" for="custom-end-date">To</label>
+              <span class="field__pair">
+                <input type="date" id="custom-end-date" class="control" title="Custom range end (dashboard local time); leave blank to include usage up to now" aria-describedby="custom-end-now-label">
+                <span id="custom-end-now-label" class="field__hint">Up to now</span>
+              </span>
             </div>
+            <button type="button" id="custom-range-apply" class="button">Apply range</button>
           </div>
-          <div class="metric-value-container">
-            <div id="odo-burn-rate" class="odometer-container">$0.00</div>
-          </div>
-          <div class="metric-subtext">
-            <span id="card-burn-subtext">Filter daily average × 30</span>
-          </div>
-          <div id="sparkline-burn" class="metric-sparkline" aria-hidden="true"></div>
-        </div>
-
-        <div class="metric-card card-savings">
-          <div class="metric-header">
-            <span class="metric-label">Cache savings</span>
-            <div class="metric-icon-wrap" title="Prompt cache savings">
-              <svg class="metric-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
-                <polyline points="9 12 11 14 15 10"></polyline>
-              </svg>
-            </div>
-          </div>
-          <div class="metric-value-container">
-            <div id="odo-savings" class="odometer-container">$0.00</div>
-          </div>
-          <div class="metric-subtext">
-            <span id="card-savings-subtext">0.0% cache hit rate</span>
-          </div>
-          <div id="sparkline-savings" class="metric-sparkline" aria-hidden="true"></div>
-        </div>
-
-        <div class="metric-card card-sessions">
-          <div class="metric-header">
-            <span class="metric-label">Tracked sessions</span>
-            <div class="metric-icon-wrap" title="Historical sessions in the selected period">
-              <svg class="metric-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="3" y="4" width="18" height="16" rx="2"></rect>
-                <line x1="8" y1="10" x2="16" y2="10"></line>
-                <line x1="8" y1="14" x2="13" y2="14"></line>
-              </svg>
-            </div>
-          </div>
-          <div class="metric-value-container">
-            <div id="odo-sessions" class="odometer-container">0</div>
-          </div>
-          <div class="metric-subtext">
-            <span id="card-calls-subtext">0 API calls recorded</span>
-          </div>
-          <div id="sparkline-sessions" class="metric-sparkline" aria-hidden="true"></div>
         </div>
       </div>
-      <div id="unpriced-summary-banner" class="unpriced-summary-banner" role="status" aria-live="polite" hidden></div>
+
+      <div class="topbar__auto">
+        <label class="switch" for="auto-refresh-toggle">
+          <input type="checkbox" id="auto-refresh-toggle" class="switch__input" checked>
+          <span class="switch__track" aria-hidden="true"></span>
+          <span>Auto-refresh</span>
+        </label>
+        <select id="refresh-interval" class="control control--select" aria-label="Auto-refresh interval">
+          <option value="10000">Every 10s</option>
+          <option value="30000" selected>Every 30s</option>
+          <option value="60000">Every 60s</option>
+        </select>
+      </div>
+
+      <div class="topbar__actions">
+        <span id="last-synced-badge" class="sync" role="status" aria-live="polite" aria-atomic="true" data-state="loading"><span class="live-dot" aria-hidden="true"></span><span class="sync__text">Updating…</span></span>
+        <button type="button" id="refresh-btn" class="icon-button" aria-label="Refresh now" title="Refresh now">
+          <svg class="refresh-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+            <path d="M20 11a8 8 0 1 0-2.3 5.7"></path>
+            <path d="M20 4v7h-7"></path>
+          </svg>
+        </button>
+        <button type="button" id="theme-toggle" class="icon-button" aria-label="Switch to light theme" title="Switch theme">
+          <svg class="theme-icon--sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+            <circle cx="12" cy="12" r="4"></circle>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path>
+          </svg>
+          <svg class="theme-icon--moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+            <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path>
+          </svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main id="main" class="page">
+    <!-- Meter: the drum register and the readout -->
+    <section class="meter" aria-labelledby="meter-heading">
+      <h2 id="meter-heading" class="visually-hidden">Usage meter</h2>
+      <div class="meter__reading">
+        <p id="meter-label" class="meter__label">API value, all time</p>
+        <div class="meter__value">
+          <span class="meter__currency" aria-hidden="true">$</span>
+          <div id="odo-total-cost" class="register" role="img" aria-label="$0.00"></div>
+        </div>
+        <div id="card-spend-subtext" class="meter__note">
+          <p>What this usage would cost at pay-as-you-go API rates.</p>
+        </div>
+      </div>
+      <div id="receipt" class="receipt" hidden></div>
+
+      <dl class="readout" aria-label="Usage readout">
+        <div class="readout__row is-empty">
+          <dt class="readout__label">Burn rate</dt>
+          <dd class="readout__sub" id="card-burn-subtext">No data yet</dd>
+          <dd class="readout__value"><span id="readout-burn" class="readout__num">–</span><span class="readout__unit">/ month</span></dd>
+          <dd class="readout__spark"><div id="sparkline-burn" class="spark" aria-hidden="true"></div></dd>
+        </div>
+        <div class="readout__row">
+          <dt class="readout__label">Tokens</dt>
+          <dd class="readout__sub" id="card-tokens-subtext">No data yet</dd>
+          <dd class="readout__value"><span id="readout-tokens" class="readout__num">–</span></dd>
+          <dd class="readout__spark"><div id="sparkline-tokens" class="spark" aria-hidden="true"></div></dd>
+        </div>
+        <div class="readout__row is-empty">
+          <dt class="readout__label">Blended rate</dt>
+          <dd class="readout__sub" id="card-rate-subtext">No data yet</dd>
+          <dd class="readout__value"><span id="readout-rate" class="readout__num">–</span><span class="readout__unit">per 1M</span></dd>
+          <dd class="readout__spark"></dd>
+        </div>
+        <div class="readout__row">
+          <dt class="readout__label">API calls</dt>
+          <dd class="readout__sub" id="card-calls-subtext">No data yet</dd>
+          <dd class="readout__value"><span id="readout-calls" class="readout__num">–</span></dd>
+          <dd class="readout__spark"><div id="sparkline-calls" class="spark" aria-hidden="true"></div></dd>
+        </div>
+      </dl>
     </section>
 
-    <!-- Charts Section -->
-    <section class="charts-section" aria-label="Visual Trends">
-      <details class="chart-group" open>
-        <summary class="chart-group-summary">
-          <svg class="chart-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <polyline points="9 6 15 12 9 18"></polyline>
-          </svg>
-          <span>Spend</span>
-        </summary>
-        <div class="charts-grid">
-          <div class="chart-card">
-            <div class="chart-header">
-              <div>
-                <div id="chart-cost-title" class="chart-title">Daily Cost &amp; Token Trend</div>
-                <div id="chart-cost-desc" class="chart-subtitle">Daily API spend, token volume, and call count</div>
-              </div>
-            </div>
-            <div class="chart-canvas-wrap">
-              <canvas id="chart-cost" role="img" aria-labelledby="chart-cost-title chart-cost-desc"></canvas>
-            </div>
-          </div>
+    <div id="unpriced-summary-banner" class="notice" role="status" aria-live="polite" hidden></div>
 
-          <div class="chart-card">
-            <div class="chart-header">
-              <div>
-                <div id="chart-cost-by-tool-title" class="chart-title">Cost by Tool</div>
-                <div id="chart-cost-by-tool-desc" class="chart-subtitle">Estimated spend split across Codex, Claude Code &amp; Antigravity</div>
-              </div>
-            </div>
-            <div class="chart-canvas-wrap">
-              <canvas id="chart-cost-by-tool" role="img" aria-labelledby="chart-cost-by-tool-title chart-cost-by-tool-desc"></canvas>
-            </div>
-          </div>
+    <h2 class="visually-hidden">Usage breakdown</h2>
 
-          <div class="chart-card">
-            <div class="chart-header">
-              <div>
-                <div id="chart-cost-per-1m-title" class="chart-title">Cost per 1M Tokens by Model</div>
-                <div id="chart-cost-per-1m-desc" class="chart-subtitle">Your estimated blended cost from this usage mix — not list price. Top 8 by token volume.</div>
-              </div>
-            </div>
-            <div class="chart-canvas-wrap">
-              <canvas id="chart-cost-per-1k" role="img" aria-labelledby="chart-cost-per-1m-title chart-cost-per-1m-desc"></canvas>
-            </div>
+    <!-- Board: one grid so trays pack without dead space -->
+    <div class="board">
+      <section class="tray tray--daily" aria-labelledby="daily-title">
+        <header class="tray__head">
+          <div class="tray__titles">
+            <h3 id="daily-title" class="tray__title">Spend and usage per day</h3>
           </div>
+          <div class="tray__actions">
+            <div id="daily-readout"></div>
+          </div>
+        </header>
+        <div class="chart-frame chart-frame--daily">
+          <canvas id="chart-daily" role="img" aria-label="Daily spend bars and API calls line sharing one date axis"></canvas>
         </div>
-      </details>
+      </section>
 
-      <details class="chart-group">
-        <summary class="chart-group-summary">
-          <svg class="chart-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <polyline points="9 6 15 12 9 18"></polyline>
-          </svg>
-          <span>Efficiency</span>
-        </summary>
-        <div class="charts-grid">
-          <div class="chart-card">
-            <div class="chart-header">
-              <div>
-                <div id="chart-tokens-title" class="chart-title">Token Distribution by Model</div>
-                <div id="chart-tokens-desc" class="chart-subtitle">Breakdown of cached vs uncached input, output &amp; reasoning</div>
-              </div>
-            </div>
-            <div class="chart-canvas-wrap">
-              <canvas id="chart-tokens" role="img" aria-labelledby="chart-tokens-title chart-tokens-desc"></canvas>
-            </div>
+      <section class="tray tray--heatmap" aria-labelledby="heatmap-title">
+        <header class="tray__head">
+          <div class="tray__titles">
+            <h3 id="heatmap-title" class="tray__title">Last 30 days</h3>
+            <p id="heatmap-streak" class="tray__sub" hidden></p>
           </div>
+          <div class="tray__actions">
+            <div id="heatmap-metric" class="seg" role="radiogroup" aria-label="Heatmap metric">
+              <button type="button" class="seg__item" role="radio" data-metric="cost" aria-checked="true">Cost</button>
+              <button type="button" class="seg__item" role="radio" data-metric="tokens" aria-checked="false">Tokens</button>
+              <button type="button" class="seg__item" role="radio" data-metric="calls" aria-checked="false">Calls</button>
+            </div>
+            <button type="button" id="skyline-toggle" class="icon-button" aria-pressed="false" aria-label="Show as 3D city" title="Show as 3D city" hidden>
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                <path d="M8 1.75 13.5 4.9v6.2L8 14.25 2.5 11.1V4.9L8 1.75Z"></path>
+                <path d="m2.5 4.9 5.5 3.2 5.5-3.2M8 8.1v6.15"></path>
+              </svg>
+            </button>
+          </div>
+        </header>
+        <div id="daily-usage-heatmap" class="heatmap-host"></div>
+        <div id="heatmap-legend" class="heatmap-legend"></div>
+        <div id="skyline" class="skyline" hidden></div>
+      </section>
 
-          <div class="chart-card">
-            <div class="chart-header">
-              <div>
-                <div id="chart-cache-trend-title" class="chart-title">Cache-Efficiency Trend</div>
-                <div id="chart-cache-trend-desc" class="chart-subtitle">Daily prompt-cache hit rate (cached input / cacheable input)</div>
-              </div>
-            </div>
-            <div class="chart-canvas-wrap">
-              <canvas id="chart-cache-trend" role="img" aria-labelledby="chart-cache-trend-title chart-cache-trend-desc"></canvas>
-            </div>
+      <section class="tray tray--ledger" aria-labelledby="ledger-title">
+        <header class="tray__head">
+          <div class="tray__titles">
+            <h3 id="ledger-title" class="tray__title">Models</h3>
+            <p class="tray__sub">Sorted by cost. Bars split token volume into cached input, fresh input and output.</p>
           </div>
+        </header>
+        <ul class="ledger-key" aria-label="Token bar key">
+          <li><span class="swatch swatch--cached" aria-hidden="true"></span>Cached input</li>
+          <li><span class="swatch swatch--fresh" aria-hidden="true"></span>Fresh input</li>
+          <li><span class="swatch swatch--output" aria-hidden="true"></span>Output</li>
+        </ul>
+        <div id="model-ledger" class="ledger"></div>
+      </section>
+
+      <div class="stack">
+        <section class="tray" aria-labelledby="donut-title">
+          <header class="tray__head">
+            <div class="tray__titles">
+              <h3 id="donut-title" class="tray__title">Cost by tool</h3>
+            </div>
+          </header>
+          <div class="chart-frame chart-frame--donut">
+            <canvas id="chart-cost-by-tool" role="img" aria-label="Estimated cost split by tool"></canvas>
+            <div id="tool-donut-center" class="donut-center"></div>
+          </div>
+          <ul id="tool-donut-legend" class="donut-legend"></ul>
+        </section>
+
+        <section class="tray tray--fill" aria-labelledby="cache-title">
+          <header class="tray__head">
+            <div class="tray__titles">
+              <h3 id="cache-title" class="tray__title">Cache hit rate per day</h3>
+            </div>
+          </header>
+          <div class="chart-frame">
+            <canvas id="chart-cache-trend" role="img" aria-label="Daily prompt-cache hit rate"></canvas>
+          </div>
+        </section>
+      </div>
+
+      <section class="tray tray--hourly" aria-labelledby="hourly-activity-title">
+        <header class="tray__head">
+          <div class="tray__titles">
+            <h3 id="hourly-activity-title" class="tray__title">Activity by hour (local time)</h3>
+          </div>
+        </header>
+        <div class="chart-frame">
+          <canvas id="chart-hourly-activity" role="img" aria-labelledby="hourly-activity-title"></canvas>
         </div>
-      </details>
-
-      <details class="chart-group">
-        <summary class="chart-group-summary">
-          <svg class="chart-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <polyline points="9 6 15 12 9 18"></polyline>
-          </svg>
-          <span>Activity</span>
-        </summary>
-        <div class="charts-grid">
-          <div class="chart-card">
-            <div class="chart-header">
-              <div>
-                <div class="chart-title" id="hourly-activity-title">Hourly Activity (local time)</div>
-                <div id="hourly-activity-desc" class="chart-subtitle">API call distribution and token volume by local hour of day</div>
-              </div>
-            </div>
-            <div class="chart-canvas-wrap">
-              <canvas id="chart-hourly-activity" role="img" aria-labelledby="hourly-activity-title hourly-activity-desc"></canvas>
-            </div>
-          </div>
-
-          <div class="chart-card chart-card-wide">
-            <div class="chart-header">
-              <div>
-                <div id="heatmap-title" class="chart-title">Past 30 Days</div>
-                <div id="heatmap-desc" class="chart-subtitle">Daily token usage for the selected tool. Hover a day for total cost and the token breakdown.</div>
-              </div>
-            </div>
-            <div id="daily-usage-heatmap" class="heatmap-host"></div>
-          </div>
-        </div>
-      </details>
-    </section>
+      </section>
+    </div>
 
     <!-- Details: Models / Sessions / Insights -->
-    <section class="section-card details-section" aria-label="Details">
-      <div class="section-header">
-        <h2 class="section-title">Details</h2>
-        <div class="details-tabs" role="tablist" aria-label="Details views">
-          <button type="button" class="details-tab" role="tab" id="tab-models" aria-controls="panel-models" aria-selected="true" tabindex="0">Models</button>
-          <button type="button" class="details-tab" role="tab" id="tab-sessions" aria-controls="panel-sessions" aria-selected="false" tabindex="-1">Sessions</button>
-          <button type="button" class="details-tab" role="tab" id="tab-insights" aria-controls="panel-insights" aria-selected="false" tabindex="-1">Insights</button>
+    <section class="tray tray--details" aria-labelledby="details-title">
+      <header class="tray__head">
+        <div class="tray__titles">
+          <h2 id="details-title" class="tray__title">Details</h2>
         </div>
-      </div>
+        <div class="tray__actions">
+          <div class="seg" role="tablist" aria-label="Details views">
+            <button type="button" class="seg__item details-tab" role="tab" id="tab-models" aria-controls="panel-models" aria-selected="true" tabindex="0">Models</button>
+            <button type="button" class="seg__item details-tab" role="tab" id="tab-sessions" aria-controls="panel-sessions" aria-selected="false" tabindex="-1">Sessions</button>
+            <button type="button" class="seg__item details-tab" role="tab" id="tab-insights" aria-controls="panel-insights" aria-selected="false" tabindex="-1">Insights</button>
+          </div>
+        </div>
+      </header>
 
       <div id="panel-models" class="details-panel" role="tabpanel" aria-labelledby="tab-models">
-        <div class="panel-toolbar">
-          <span id="models-count-badge" class="counter-badge">0 Models</span>
-          <span id="pricing-status" class="counter-badge">Pricing: loading...</span>
+        <div class="panel-meta">
+          <span id="models-count-badge">0 models</span>
+          <span id="pricing-status" class="pricing-status">Pricing: loading</span>
         </div>
 
-        <div id="unpriced-banner" class="unpriced-banner" hidden></div>
-        <div class="table-responsive" role="region" aria-label="Per-model usage table" tabindex="0">
+        <div id="unpriced-banner" class="notice notice--inline" hidden></div>
+        <div class="table-scroll" role="region" aria-label="Per-model usage table" tabindex="0">
           <table class="data-table">
             <caption class="visually-hidden">Per-model token usage, cache efficiency, rates, and estimated costs</caption>
             <thead>
               <tr>
-                <th scope="col">Model &amp; Provider</th>
-                <th scope="col" class="cell-right">Uncached Input</th>
-                <th scope="col" class="cell-right">Cached Input</th>
-                <th scope="col" class="cell-right">Total Input</th>
+                <th scope="col">Model and provider</th>
+                <th scope="col" class="cell-right">Uncached input</th>
+                <th scope="col" class="cell-right">Cached input</th>
+                <th scope="col" class="cell-right">Total input</th>
                 <th scope="col" class="cell-right">Output</th>
-                <th scope="col" class="cell-right">Reasoning / Thoughts</th>
-                <th scope="col" class="cell-right">Total Tokens</th>
-                <th scope="col" class="cell-right">Cache Hit %</th>
-                <th scope="col" class="cell-right">API Rates ($/1M In / Cache / Out)</th>
-                <th scope="col" class="cell-right">Est. Cost (Cached)</th>
-                <th scope="col" class="cell-right">Est. Cost (Uncached)</th>
-                <th scope="col" class="cell-right">Net Savings ($)</th>
+                <th scope="col" class="cell-right">Reasoning and thoughts</th>
+                <th scope="col" class="cell-right">Total tokens</th>
+                <th scope="col" class="cell-right">Cache hit rate</th>
+                <th scope="col" class="cell-right">API rates per 1M (in / cache / out)</th>
+                <th scope="col" class="cell-right">Est. cost (cached)</th>
+                <th scope="col" class="cell-right">Est. cost (uncached)</th>
+                <th scope="col" class="cell-right">Net savings</th>
               </tr>
             </thead>
             <tbody id="models-table-body">
               <tr>
-                <td colspan="12" class="empty-state">Loading model metrics...</td>
+                <td colspan="12" class="empty-state">Loading model metrics</td>
               </tr>
             </tbody>
           </table>
         </div>
 
-        <div class="table-footnote">
-          <svg class="footnote-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="12" cy="12" r="10"></circle>
-            <line x1="12" y1="16" x2="12" y2="12"></line>
-            <line x1="12" y1="8" x2="12.01" y2="8"></line>
-          </svg>
-          <span>Calculation Formula:</span>
-          <code>API Cost = (Uncached Input × Rate + Cached Input × Rate + Output × Rate + Cache Writes × Write Rate) / 1,000,000</code>
-        </div>
-        <div class="table-footnote" id="models-est-footnote" style="display: none;">
-          <svg class="footnote-icon footnote-icon-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
-            <line x1="12" y1="9" x2="12" y2="13"></line>
-            <line x1="12" y1="17" x2="12.01" y2="17"></line>
-          </svg>
-          <span>Rows marked <span class="est-badge">est.</span> / ~ are AGY estimates from transcript text (chars ÷ 4; single-turn 0% cache, multi-turn flat 45% cached input), not exact provider counts.</span>
-        </div>
+        <p class="footnote">API cost = (uncached input × rate + cached input × rate + output × rate + cache writes × write rate) / 1,000,000.</p>
+        <p class="footnote" id="models-est-footnote" hidden>Rows marked <span class="chip">est.</span> or ~ are Antigravity estimates from transcript text (characters ÷ 4; single-turn 0% cache, multi-turn flat 45% cached input), not exact provider counts.</p>
       </div>
 
       <div id="panel-sessions" class="details-panel" role="tabpanel" aria-labelledby="tab-sessions" hidden>
-        <div class="panel-toolbar sessions-toolbar">
-          <span id="sessions-count-badge" class="counter-badge">0 Sessions</span>
-          <div class="search-box">
-            <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="11" cy="11" r="8"></circle>
-              <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-            </svg>
+        <div class="panel-meta panel-meta--search">
+          <span id="sessions-count-badge">0 sessions</span>
+          <div class="search">
             <label class="visually-hidden" for="sessions-search">Search sessions</label>
-            <input type="text" id="sessions-search" class="search-input" placeholder="Search sessions by title, model, or ID...">
+            <svg class="search__icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+              <circle cx="11" cy="11" r="7.5"></circle>
+              <path d="M21 21l-4.6-4.6"></path>
+            </svg>
+            <input type="search" id="sessions-search" class="control search__input" placeholder="Search sessions by title, model or ID" autocomplete="off">
           </div>
         </div>
 
-        <div class="table-responsive" role="region" aria-label="Tracked sessions table" tabindex="0">
+        <div class="table-scroll" role="region" aria-label="Tracked sessions table" tabindex="0">
           <table class="data-table">
             <caption class="visually-hidden">Tracked sessions with tool, model, token, cache, cost, and timestamp details</caption>
             <thead>
               <tr>
-                <th scope="col">Session Title</th>
+                <th scope="col">Session title</th>
                 <th scope="col">Tool</th>
                 <th scope="col">Model</th>
-                <th scope="col" class="cell-right">Total Tokens</th>
-                <th scope="col" class="cell-right">Cache Hit %</th>
-                <th scope="col" class="cell-right">Est. Cost</th>
-                <th scope="col" class="cell-right">Date / Time</th>
+                <th scope="col" class="cell-right">Total tokens</th>
+                <th scope="col" class="cell-right">Cache hit rate</th>
+                <th scope="col" class="cell-right">Est. cost</th>
+                <th scope="col" class="cell-right">Date and time</th>
               </tr>
             </thead>
             <tbody id="sessions-table-body">
               <tr>
-                <td colspan="7" class="empty-state">Loading sessions...</td>
+                <td colspan="7" class="empty-state">Loading sessions</td>
               </tr>
             </tbody>
           </table>
@@ -385,54 +352,52 @@
       </div>
 
       <div id="panel-insights" class="details-panel" role="tabpanel" aria-labelledby="tab-insights" hidden>
-        <div class="panel-toolbar">
-          <span id="analytics-window-badge" class="counter-badge">All time</span>
-          <span class="analytics-note">Derived from the selected tool and time range</span>
+        <div class="panel-meta">
+          <span id="analytics-window-badge">All time</span>
+          <span class="panel-meta__note">Derived from the selected tool and time range</span>
         </div>
 
-        <div class="analytics-grid">
-          <div class="analytics-stat">
-            <span class="analytics-label">API Calls</span>
-            <strong id="analytics-call-count" class="analytics-value">0</strong>
-            <span class="analytics-subtext">Model requests recorded</span>
+        <dl class="stat-grid">
+          <div class="stat">
+            <dt class="stat__label">API calls</dt>
+            <dd id="analytics-call-count" class="stat__value">0</dd>
+            <dd class="stat__detail">Model requests recorded</dd>
           </div>
-          <div class="analytics-stat">
-            <span class="analytics-label">Avg. Cost / Session</span>
-            <strong id="analytics-avg-cost" class="analytics-value">$0.0000</strong>
-            <span class="analytics-subtext">Cached-rate estimate</span>
+          <div class="stat">
+            <dt class="stat__label">Average cost per session</dt>
+            <dd id="analytics-avg-cost" class="stat__value">$0.00</dd>
+            <dd class="stat__detail">Cached-rate estimate</dd>
           </div>
-          <div class="analytics-stat">
-            <span class="analytics-label">Avg. Tokens / Session</span>
-            <strong id="analytics-avg-tokens" class="analytics-value">0</strong>
-            <span class="analytics-subtext">Across filtered sessions</span>
+          <div class="stat">
+            <dt class="stat__label">Average tokens per session</dt>
+            <dd id="analytics-avg-tokens" class="stat__value">0</dd>
+            <dd class="stat__detail">Across filtered sessions</dd>
           </div>
-          <div class="analytics-stat">
-            <span class="analytics-label">Projected 30 Day Cost</span>
-            <strong id="analytics-monthly-projection" class="analytics-value">$0.0000</strong>
-            <span id="analytics-projection-basis" class="analytics-subtext">Filter daily average × 30</span>
+          <div class="stat">
+            <dt class="stat__label">Projected 30-day cost</dt>
+            <dd id="analytics-monthly-projection" class="stat__value">$0.00</dd>
+            <dd id="analytics-projection-basis" class="stat__detail">Filter daily average × 30</dd>
           </div>
-          <div class="analytics-stat">
-            <span class="analytics-label">Peak Cost Day</span>
-            <strong id="analytics-peak-day-cost" class="analytics-value">$0.0000</strong>
-            <span id="analytics-peak-day-detail" class="analytics-subtext">No daily usage yet</span>
+          <div class="stat">
+            <dt class="stat__label">Peak cost day</dt>
+            <dd id="analytics-peak-day-cost" class="stat__value">$0.00</dd>
+            <dd id="analytics-peak-day-detail" class="stat__detail">No daily usage yet</dd>
           </div>
-          <div class="analytics-stat">
-            <span class="analytics-label">Active Days</span>
-            <strong id="analytics-active-days" class="analytics-value">0</strong>
-            <span class="analytics-subtext">Days with recorded usage</span>
+          <div class="stat">
+            <dt class="stat__label">Active days</dt>
+            <dd id="analytics-active-days" class="stat__value">0</dd>
+            <dd class="stat__detail">Days with recorded usage</dd>
           </div>
-        </div>
+        </dl>
 
-        <div class="analytics-detail-grid">
-          <div class="insight-card">
-            <div class="insight-header">
-              <div>
-                <div class="insight-title">Top Sessions by Cost</div>
-                <div class="insight-subtitle">Highest estimated spend in the selected range</div>
-              </div>
+        <div class="insight-grid">
+          <div class="insight">
+            <div class="insight__head">
+              <h3 class="insight__title">Top sessions by cost</h3>
+              <p class="insight__sub">Highest estimated spend in the selected range</p>
             </div>
-            <div class="table-responsive insight-table-wrap" role="region" aria-label="Highest-cost sessions table" tabindex="0">
-              <table class="data-table insight-table">
+            <div class="table-scroll" role="region" aria-label="Highest-cost sessions table" tabindex="0">
+              <table class="data-table">
                 <caption class="visually-hidden">Highest-cost sessions in the selected range</caption>
                 <thead>
                   <tr>
@@ -440,41 +405,43 @@
                     <th scope="col">Tool</th>
                     <th scope="col">Model</th>
                     <th scope="col" class="cell-right">Tokens</th>
-                    <th scope="col" class="cell-right">Est. Cost</th>
+                    <th scope="col" class="cell-right">Est. cost</th>
                   </tr>
                 </thead>
                 <tbody id="top-sessions-table-body">
-                  <tr><td colspan="5" class="empty-state">Loading analytics...</td></tr>
+                  <tr><td colspan="5" class="empty-state">Loading analytics</td></tr>
                 </tbody>
               </table>
             </div>
           </div>
 
-          <div class="insight-card comparison-card">
-            <div class="insight-header">
-              <div>
-                <div class="insight-title">Period Comparison</div>
-                <div id="comparison-subtitle" class="insight-subtitle">Select a rolling range to compare usage</div>
-              </div>
+          <div class="insight">
+            <div class="insight__head">
+              <h3 class="insight__title">Period comparison</h3>
+              <p id="comparison-subtitle" class="insight__sub">Select a rolling range to compare usage</p>
             </div>
-            <div id="comparison-content" class="comparison-content">
-              <div class="comparison-empty">No comparison available for All time.</div>
+            <div id="comparison-content" class="comparison">
+              <p class="comparison__empty">No comparison available for all time.</p>
             </div>
           </div>
         </div>
       </div>
     </section>
-  </div>
+  </main>
 
   <div id="toast-container" class="toast-container" role="alert" aria-live="assertive" aria-atomic="true"></div>
 
   <!-- Scripts (order matters: odometer -> utils -> api/charts/tables/analytics -> orchestrator) -->
-  <script src="/static/js/odometer.js?v=cost-per-1m"></script>
-  <script src="/static/js/utils.js?v=cost-per-1m"></script>
-  <script src="/static/js/api.js?v=cost-per-1m"></script>
-  <script src="/static/js/charts.js?v=cost-per-1m"></script>
-  <script src="/static/js/tables.js?v=cost-per-1m"></script>
-  <script src="/static/js/analytics.js?v=cost-per-1m"></script>
-  <script src="/static/js/dashboard.js?v=cost-per-1m"></script>
+  <script src="/static/js/odometer.js"></script>
+  <script src="/static/js/utils.js"></script>
+  <script src="/static/js/api.js"></script>
+  <script src="/static/js/charts.js"></script>
+  <script src="/static/js/tables.js"></script>
+  <script src="/static/js/analytics.js"></script>
+  <script src="/static/js/milestones.js"></script>
+  <script src="/static/js/receipt.js"></script>
+  <script src="/static/js/skyline.js"></script>
+  <script src="/static/js/linked.js"></script>
+  <script src="/static/js/dashboard.js"></script>
 </body>
 </html>

@@ -1,7 +1,7 @@
 /**
  * AI Tools Usage & Cost Visualizer - Thin Orchestrator
- * Owns state, odometer-backed metric cards, event wiring, polling timer,
- * and UI dispatch. Data fetching lives in api.js, rendering in
+ * Owns state, the drum register and readout, event wiring, polling timer,
+ * theme toggle and UI dispatch. Data fetching lives in api.js, rendering in
  * charts.js / tables.js / analytics.js, shared helpers in utils.js.
  *
  * Load order (see index.html): odometer.js, utils.js, api.js, charts.js,
@@ -10,13 +10,40 @@
 (function () {
   'use strict';
 
+  const THEME_KEY = 'aiud.theme';
+
+  const RANGE_PHRASES = {
+    all: 'all time',
+    month: 'this month',
+    '30d': 'past 30 days',
+    '7d': 'past 7 days',
+    '24h': 'past 24 hours',
+  };
+
+  const PROJECTION_PHRASES = {
+    all_run_rate: "Projected from the all-time daily average",
+    current_month_run_rate: "Projected from this month's daily average",
+    custom_run_rate: "Projected from the selected range's daily average",
+    '30d_run_rate': "Projected from the past 30 days' daily average",
+    '7d_run_rate': "Projected from the past 7 days' daily average",
+    '24h_run_rate': "Projected from the past 24 hours' daily average",
+  };
+  const PROJECTION_DEFAULT = "Projected from this period's daily average";
+
+  const EMPTY_VALUE = '–';
+  const NO_USAGE = 'No usage in this period';
+  let hasRenderedOnce = false;
+
   // Global Dashboard State
   const state = {
     currentTool: 'all',
     currentTimeRange: 'all',
+    // The range the on-screen data reflects; a dismissed custom draft reverts to it.
+    appliedTimeRange: 'all',
     customStart: '',
     customEnd: '',
     customPending: false,
+    customDraftTool: null,
     autoRefreshInterval: 30000,
     refreshTimer: null,
     pricingData: null,
@@ -24,76 +51,145 @@
     allSessions: [],
     searchQuery: '',
     usageRequestGeneration: 0,
-    renderedUsageGeneration: 0,
+    activeUsageRequest: null,
   };
 
-  // Odometer Instances
+  // The drum register is the only odometer left.
   const odometers = {
     totalCost: null,
-    burnRate: null,
-    savings: null,
-    sessions: null,
   };
 
   // DOM Elements cache
   const elements = {};
 
-  /**
-   * Initialize rolling odometers defensively
-   */
-  function initOdometers() {
-    const createOdometer = (selector, opts) => {
-      try {
-        const el = document.querySelector(selector);
-        if (!el || typeof RollingOdometer === 'undefined') return null;
-        return new RollingOdometer({ element: selector, ...opts });
-      } catch (err) {
-        console.warn(`Failed to initialize odometer for ${selector}:`, err);
-        return null;
-      }
-    };
-
-    odometers.totalCost = createOdometer('#odo-total-cost', {
-      prefix: '$',
-      suffix: '',
-      decimals: 4,
-      formatCommas: true,
-      duration: 850,
-    });
-
-    odometers.burnRate = createOdometer('#odo-burn-rate', {
-      prefix: '$',
-      suffix: '',
-      decimals: 4,
-      formatCommas: true,
-      duration: 850,
-    });
-
-    odometers.savings = createOdometer('#odo-savings', {
-      prefix: '$',
-      suffix: '',
-      decimals: 4,
-      formatCommas: true,
-      duration: 850,
-    });
-
-    odometers.sessions = createOdometer('#odo-sessions', {
-      prefix: '',
-      suffix: '',
-      decimals: 0,
-      formatCommas: true,
-      duration: 850,
-    });
+  function prefersReducedMotion() {
+    return typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   }
 
   /**
-   * Fetch reference pricing table and update the status badge.
+   * Initialize the drum register defensively
    */
-  async function fetchPricing() {
+  function initOdometers() {
     try {
-      state.pricingData = await window.DashboardApi.fetchPricing();
+      const el = document.getElementById('odo-total-cost');
+      if (!el || typeof RollingOdometer === 'undefined') return;
+      odometers.totalCost = new RollingOdometer({
+        element: el,
+        prefix: '$',
+        decimals: 2,
+        minIntegerDigits: 4,
+        duration: 850,
+      });
+    } catch (err) {
+      console.warn('Failed to initialize the register:', err);
+    }
+  }
+
+  /* ------------------------------------------------------------- theme */
+
+  function effectiveTheme() {
+    const forced = document.documentElement.getAttribute('data-theme');
+    if (forced === 'light' || forced === 'dark') return forced;
+    return typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-color-scheme: dark)').matches
+      ? 'dark'
+      : 'light';
+  }
+
+  function syncThemeButton() {
+    const btn = elements.themeToggle;
+    if (!btn) return;
+    const label = `Switch to ${effectiveTheme() === 'dark' ? 'light' : 'dark'} theme`;
+    btn.setAttribute('aria-label', label);
+    btn.title = label;
+  }
+
+  function toggleTheme() {
+    const next = effectiveTheme() === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    try {
+      localStorage.setItem(THEME_KEY, next);
+    } catch (err) {
+      // Storage can be blocked; the choice still applies for this page view.
+    }
+    syncThemeButton();
+    document.dispatchEvent(new CustomEvent('themechange'));
+  }
+
+  function setupTheme() {
+    syncThemeButton();
+    if (elements.themeToggle) elements.themeToggle.addEventListener('click', toggleTheme);
+    if (typeof window.matchMedia === 'function') {
+      const query = window.matchMedia('(prefers-color-scheme: dark)');
+      const onChange = () => syncThemeButton();
+      if (query.addEventListener) query.addEventListener('change', onChange);
+      else if (query.addListener) query.addListener(onChange);
+    }
+  }
+
+  /* -------------------------------------------------------- range text */
+
+  function formatRangeDay(iso) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''));
+    if (!match) return String(iso || '');
+    const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+    const sameYear = date.getFullYear() === new Date().getFullYear();
+    return date.toLocaleDateString('en-US', sameYear
+      ? { month: 'short', day: 'numeric' }
+      : { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
+  /** Lower-case phrase for the register label ("past 30 days", "Sep 1 – Sep 12"). */
+  function describeRange(range, start, end) {
+    if (range === 'custom' && start) {
+      return `${formatRangeDay(start)} – ${end ? formatRangeDay(end) : 'now'}`;
+    }
+    return RANGE_PHRASES[range] || 'selected range';
+  }
+
+  /** Title-case label for the insights window ("Past 30 days", "Sep 1 – Sep 12"). */
+  function describeRangeLabel(range, start, end) {
+    if (range === 'custom' && start) return describeRange(range, start, end);
+    const option = elements.timeRangeSelect && Array.from(elements.timeRangeSelect.options)
+      .find((item) => item.value === range);
+    return option ? option.textContent : 'Selected range';
+  }
+
+  /* -------------------------------------------------------- sync badge */
+
+  function setSyncState(mode, timeText) {
+    const badge = elements.lastSyncedBadge;
+    if (!badge) return;
+    badge.dataset.state = mode;
+    const text = badge.querySelector('.sync__text') || badge;
+    const label = mode === 'loading' ? 'Updating…'
+      : mode === 'error' ? 'Update failed' : `Updated ${timeText}`;
+    if (text.textContent !== label) text.textContent = label;
+  }
+
+  function pulseLiveDot() {
+    const dot = elements.lastSyncedBadge && elements.lastSyncedBadge.querySelector('.live-dot');
+    if (!dot || prefersReducedMotion()) return;
+    dot.classList.remove('is-pulsing');
+    void dot.offsetWidth; // restart the one-shot animation
+    dot.classList.add('is-pulsing');
+  }
+
+  /** Only the latest issued usage request owns data and status updates. */
+  function isCurrentUsageRequest(generation) {
+    return generation === state.usageRequestGeneration;
+  }
+
+  /** Fetch reference pricing without letting a superseded request change its badge. */
+  async function fetchPricing(generation = state.usageRequestGeneration) {
+    try {
+      const pricingData = await window.DashboardApi.fetchPricing();
+      if (!isCurrentUsageRequest(generation)) return;
+      state.pricingData = pricingData;
       window.DashboardApi.updatePricingStatus(elements.pricingStatus, state.pricingData.__meta__ || {});
     } catch (e) {
+      if (!isCurrentUsageRequest(generation)) return;
       console.warn('Failed to load pricing table:', e);
       window.DashboardApi.updatePricingStatus(elements.pricingStatus, { source: 'unavailable', stale: true, error: e.message });
     }
@@ -111,42 +207,59 @@
       return;
     }
 
+    // A skipped poll must not supersede the request whose result is still pending.
+    // Keep the guard through pricing and rendering, while user requests may abort it.
+    if (!isUserInitiated && state.activeUsageRequest !== null) return;
+
     const generation = ++state.usageRequestGeneration;
+    state.activeUsageRequest = generation;
+    const request = {
+      tool: state.currentTool,
+      timeRange: state.appliedTimeRange,
+      start: state.customStart,
+      end: state.customEnd,
+    };
 
     const refreshIcon = elements.refreshBtn ? elements.refreshBtn.querySelector('.refresh-icon') : null;
-    if (refreshIcon) refreshIcon.classList.add('spin');
+    if (refreshIcon) {
+      refreshIcon.classList.remove('spin');
+      void refreshIcon.getBoundingClientRect(); // restart the rotation
+      refreshIcon.classList.add('spin');
+    }
+    setSyncState('loading');
 
     try {
       const result = await window.DashboardApi.requestUsage(
-        state.currentTool,
-        state.currentTimeRange,
+        request.tool,
+        request.timeRange,
         isUserInitiated,
-        { start: state.customStart, end: state.customEnd },
+        { start: request.start, end: request.end },
       );
+      if (!isCurrentUsageRequest(generation)) return;
       if (result.status !== 'ok') {
         // 'skipped' (background poll while fetching) or 'aborted'
         // (superseded by a newer user-initiated fetch): silently exit.
         return;
       }
 
-      await fetchPricing();
+      await fetchPricing(generation);
 
-      if (generation < state.renderedUsageGeneration) {
-        return;
-      }
-      state.renderedUsageGeneration = generation;
+      if (!isCurrentUsageRequest(generation)) return;
 
       const data = result.data;
+      const ctx = {
+        boot: !hasRenderedOnce,
+        queryKey: JSON.stringify([request.tool, request.timeRange, request.start, request.end]),
+        tool: request.tool,
+        timeRange: request.timeRange,
+      };
       state.currentUsageData = data;
       state.allSessions = Array.isArray(data.sessions) ? data.sessions : [];
 
       // Update UI components
-      updateMetricCards(data.summary || {}, data.analytics || {});
-      const isCustom = state.currentTimeRange === 'custom' && state.customStart;
-      const rangeLabel = isCustom
-        ? `${state.customStart} → ${state.customEnd || 'Up to now'}`
-        : elements.timeRangeSelect?.selectedOptions?.[0]?.textContent;
-      const timezoneSuffix = data.timezone ? ` · ${data.timezone}` : '';
+      updateMeter(data.summary || {}, data.analytics || {}, request, ctx);
+      const rangeLabel = describeRangeLabel(request.timeRange, request.start, request.end);
+      const timezoneSuffix = data.timezone ? ` (${data.timezone})` : '';
       window.DashboardAnalytics.updateAnalytics(data.analytics || {}, data.summary || {}, {
         analyticsWindowBadge: elements.analyticsWindowBadge,
         analyticsCallCount: elements.analyticsCallCount,
@@ -160,9 +273,10 @@
         topSessionsTableBody: elements.topSessionsTableBody,
         comparisonSubtitle: elements.comparisonSubtitle,
         comparisonContent: elements.comparisonContent,
-        selectedRangeLabel: `${rangeLabel || 'Selected range'}${timezoneSuffix}`,
+        selectedRangeLabel: `${rangeLabel}${timezoneSuffix}`,
         timezone: data.timezone || '',
       });
+      window.DashboardTables.renderModelLedger(data.models || [], elements.modelLedger);
       window.DashboardTables.renderModelTable(data.models || [], {
         tbody: elements.modelsTableBody,
         countBadge: elements.modelsCountBadge,
@@ -174,100 +288,184 @@
         countBadge: elements.sessionsCountBadge,
         timezone: data.timezone || '',
       });
-      window.DashboardCharts.updateCharts(data, {
-        tokensCanvas: elements.chartTokensCanvas,
-        costCanvas: elements.chartCostCanvas,
-        costByToolCanvas: elements.chartCostByToolCanvas,
-        cacheTrendCanvas: elements.chartCacheTrendCanvas,
-        costPer1kCanvas: elements.chartCostPer1kCanvas,
-        hourlyActivityCanvas: elements.chartHourlyActivityCanvas,
-        dailyHeatmap: elements.dailyHeatmap,
-        sparklineSpend: elements.sparklineSpend,
-        sparklineBurn: elements.sparklineBurn,
-        sparklineSavings: elements.sparklineSavings,
-        sparklineSessions: elements.sparklineSessions,
-      });
+      try {
+        window.DashboardCharts.updateCharts(data, ctx);
+      } catch (chartErr) {
+        // A chart failure must not take down the meter, ledger and tables.
+        console.error('Failed to render charts:', chartErr);
+      }
+
+      if (window.DashboardMilestones && typeof window.DashboardMilestones.update === 'function') {
+        try {
+          window.DashboardMilestones.update(data, ctx);
+        } catch (featureErr) {
+          console.error('Failed to update milestones:', featureErr);
+        }
+      }
+      if (window.DashboardReceipt && typeof window.DashboardReceipt.update === 'function') {
+        try {
+          window.DashboardReceipt.update(data, ctx);
+        } catch (featureErr) {
+          console.error('Failed to update receipt:', featureErr);
+        }
+      }
+      if (window.DashboardSkyline && typeof window.DashboardSkyline.update === 'function') {
+        try {
+          window.DashboardSkyline.update(data, ctx);
+        } catch (featureErr) {
+          console.error('Failed to update skyline:', featureErr);
+        }
+      }
+      if (window.DashboardLinked && typeof window.DashboardLinked.update === 'function') {
+        try {
+          window.DashboardLinked.update(data, ctx);
+        } catch (featureErr) {
+          console.error('Failed to update linked views:', featureErr);
+        }
+      }
 
       // Update last synced badge in the same timezone used by the API.
       const synced = window.DashboardUtils.formatDateTime(
         new Date().toISOString(),
         data.timezone || '',
       );
-      const timeStr = synced.includes(' ') ? synced.slice(11) : synced;
-      if (elements.lastSyncedBadge) {
-        elements.lastSyncedBadge.textContent = `Synced ${timeStr}`;
-      }
+      const timeStr = synced.includes(' ') ? synced.slice(11, 16) : synced;
+      setSyncState('ok', timeStr);
+      pulseLiveDot();
+      hasRenderedOnce = true;
     } catch (err) {
-      console.error('Failed to fetch usage metrics:', err);
-      window.DashboardUtils.showToast(`Sync failed: ${err.message}`, 'error');
-      if (elements.lastSyncedBadge) {
-        elements.lastSyncedBadge.textContent = 'Sync error';
-      }
+      if (!isCurrentUsageRequest(generation)) return;
+      console.warn('Failed to fetch usage metrics:', err);
+      const errorMessage = err && typeof err.message === 'string' && err.message.trim()
+        ? err.message
+        : "Couldn't load usage data. Check that the server is running, then refresh.";
+      window.DashboardUtils.showToast(errorMessage, 'error');
+      setSyncState('error');
     } finally {
-      if (refreshIcon) {
-        setTimeout(() => refreshIcon.classList.remove('spin'), 400);
-      }
+      if (state.activeUsageRequest === generation) state.activeUsageRequest = null;
     }
   }
 
+  /* -------------------------------------------------- meter and readout */
+
+  function projectionSubtext(basis) {
+    const text = typeof basis === 'string' ? basis.trim() : '';
+    if (text && /\s/.test(text)) return text;
+    return PROJECTION_PHRASES[text] || PROJECTION_DEFAULT;
+  }
+
+  function setReadoutRow(valueEl, subEl, value, sub, isEmpty) {
+    if (valueEl) valueEl.textContent = value;
+    if (subEl) subEl.textContent = sub;
+    const row = valueEl && valueEl.closest('.readout__row');
+    if (row) row.classList.toggle('is-empty', Boolean(isEmpty));
+  }
+
   /**
-   * Update the 4 executive overview cards and their subtexts
+   * Update the drum register and the four readout rows. Only the register rolls;
+   * the readout values are plain text.
    */
-  function updateMetricCards(summary, analytics) {
+  function updateMeter(summary, analytics, request, ctx) {
     const totals = summary && typeof summary === 'object' ? summary : {};
     const details = analytics && typeof analytics === 'object' ? analytics : {};
-    const { formatCompactNumber } = window.DashboardUtils;
-    const totalTokens = Number(totals.total_tokens || 0);
-    const cacheWriteTokens = Number(totals.cache_write || 0);
-    const totalCost = Number(totals.cost_cached_usd || 0);
-    const uncachedCost = Number(totals.cost_uncached_usd || 0);
-    const cacheHitRate = Number(totals.cache_hit_rate || 0);
-    const sessionCount = Number(totals.session_count || 0);
-    const savings = Number(totals.savings_usd || 0);
-    const callCount = Number(totals.call_count || 0);
-    const unpricedCount = Number(totals.unpriced_model_count || 0);
-    const burn = Number(details.projected_30d_usd ?? details.monthly_projection_usd ?? 0);
+    const { formatUsd, formatRate, formatInt, formatCompactSig } = window.DashboardUtils;
+    const num = (value) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : 0;
+    };
+
+    const totalTokens = num(totals.total_tokens);
+    const totalCost = num(totals.cost_cached_usd);
+    const uncachedCost = num(totals.cost_uncached_usd);
+    const savings = num(totals.savings_usd);
+    const cacheHitRate = num(totals.cache_hit_rate);
+    const sessionCount = num(totals.session_count);
+    const callCount = num(totals.call_count);
+    const unpricedCount = num(totals.unpriced_model_count);
+    const burn = num(details.projected_30d_usd ?? details.monthly_projection_usd);
+    const hasUsage = totalTokens > 0 || callCount > 0;
 
     if (elements.unpricedSummaryBanner) {
-      const hasUnpriced = Number.isFinite(unpricedCount) && unpricedCount > 0;
-      elements.unpricedSummaryBanner.hidden = !hasUnpriced;
-      elements.unpricedSummaryBanner.textContent = hasUnpriced
-        ? `${unpricedCount.toLocaleString()} model${unpricedCount === 1 ? '' : 's'} lack a usable catalog rate. Spend totals are partial; see the Models tab for details.`
-        : '';
+      const hasUnpriced = unpricedCount > 0;
+      const banner = elements.unpricedSummaryBanner;
+      banner.hidden = !hasUnpriced;
+      banner.textContent = '';
+      if (hasUnpriced) {
+        const chip = document.createElement('span');
+        chip.className = 'chip';
+        chip.textContent = 'Unpriced';
+        const text = document.createElement('span');
+        text.textContent = `${formatInt(unpricedCount)} model${unpricedCount === 1 ? '' : 's'} lack a usable catalog rate. Spend totals are partial; see the Models tab for details.`;
+        banner.append(chip, text);
+      }
     }
 
-    if (odometers.totalCost) odometers.totalCost.update(Number.isFinite(totalCost) ? totalCost : 0);
-    if (odometers.burnRate) odometers.burnRate.update(Number.isFinite(burn) ? burn : 0);
-    if (odometers.savings) odometers.savings.update(Number.isFinite(savings) ? savings : 0);
-    if (odometers.sessions) odometers.sessions.update(Number.isFinite(sessionCount) ? sessionCount : 0);
+    if (elements.meterLabel) {
+      elements.meterLabel.textContent = `API value, ${describeRange(request.timeRange, request.start, request.end)}`;
+    }
+    if (odometers.totalCost) {
+      if (ctx && ctx.boot) {
+        if (typeof odometers.totalCost.boot === 'function') odometers.totalCost.boot(totalCost);
+        else odometers.totalCost.update(totalCost);
+      } else {
+        odometers.totalCost.update(totalCost);
+      }
+    }
 
     if (elements.cardSpendSubtext) {
-      let text = `${formatCompactNumber(totalTokens)} tokens in range`;
-      if (Number.isFinite(uncachedCost) && uncachedCost > 0 && Math.abs(uncachedCost - totalCost) > 0.00005) {
-        text += ` · $${totalCost.toFixed(2)} cached vs $${uncachedCost.toFixed(2)} uncached`;
+      const lines = ['What this usage would cost at pay-as-you-go API rates.'];
+      if (!hasUsage) {
+        lines.push(`${NO_USAGE}.`);
+      } else if (savings > 0.005 && uncachedCost > 0) {
+        lines.push(`Without caching ${formatUsd(uncachedCost)}. Caching saved ${formatUsd(savings)}.`);
+      } else if (uncachedCost > 0) {
+        lines.push(`Without caching ${formatUsd(uncachedCost)}.`);
       }
-      if (Number.isFinite(cacheWriteTokens) && cacheWriteTokens > 0) {
-        text += ` · ${formatCompactNumber(cacheWriteTokens)} cache-write`;
-      }
-      if (unpricedCount > 0) text += ' · partial cost';
-      elements.cardSpendSubtext.textContent = text;
+      if (unpricedCount > 0) lines.push('Some models have no catalog rate, so this total is partial.');
+      elements.cardSpendSubtext.textContent = '';
+      lines.forEach((line) => {
+        const p = document.createElement('p');
+        p.textContent = line;
+        elements.cardSpendSubtext.appendChild(p);
+      });
     }
-    if (elements.cardBurnSubtext) {
-      const labelFn = window.DashboardAnalytics && window.DashboardAnalytics.projectionBasisLabel;
-      const projectionLabel = labelFn
-        ? labelFn(details.projection_basis)
-        : 'Filter daily average × 30';
-      elements.cardBurnSubtext.textContent = unpricedCount > 0
-        ? `${projectionLabel} · partial cost`
-        : projectionLabel;
+
+    const burnSub = projectionSubtext(details.projection_basis);
+    setReadoutRow(
+      elements.readoutBurn,
+      elements.cardBurnSubtext,
+      formatUsd(burn, 2),
+      unpricedCount > 0 ? `${burnSub}, partial cost` : burnSub,
+      false,
+    );
+
+    setReadoutRow(
+      elements.readoutTokens,
+      elements.cardTokensSubtext,
+      formatCompactSig(totalTokens),
+      totalTokens > 0 ? `${cacheHitRate.toFixed(1)}% read from cache` : NO_USAGE,
+      false,
+    );
+
+    if (totalTokens > 0) {
+      setReadoutRow(
+        elements.readoutRate,
+        elements.cardRateSubtext,
+        formatRate((totalCost / totalTokens) * 1e6),
+        `${formatRate((uncachedCost / totalTokens) * 1e6)} per 1M without caching`,
+        false,
+      );
+    } else {
+      setReadoutRow(elements.readoutRate, elements.cardRateSubtext, EMPTY_VALUE, NO_USAGE, true);
     }
-    if (elements.cardSavingsSubtext) {
-      const rate = Number.isFinite(cacheHitRate) ? cacheHitRate : 0;
-      elements.cardSavingsSubtext.textContent = `${rate.toFixed(1)}% cache hit rate`;
-    }
-    if (elements.cardCallsSubtext) {
-      elements.cardCallsSubtext.textContent = `${Number(callCount || 0).toLocaleString()} API calls recorded`;
-    }
+
+    setReadoutRow(
+      elements.readoutCalls,
+      elements.cardCallsSubtext,
+      formatInt(callCount),
+      `${formatInt(sessionCount)} session${sessionCount === 1 ? '' : 's'}`,
+      false,
+    );
   }
 
   /**
@@ -286,14 +484,47 @@
     }
   }
 
+  /* ------------------------------------------------ custom range popover */
+
+  function isRangePopoverOpen() {
+    return Boolean(elements.rangePopover && !elements.rangePopover.hidden);
+  }
+
+  function openRangePopover() {
+    if (!elements.rangePopover) return;
+    if (!isRangePopoverOpen()) state.customDraftTool = state.currentTool;
+    elements.rangePopover.hidden = false;
+    updateCustomEndHint();
+    if (elements.customStartDate) elements.customStartDate.focus();
+  }
+
+  function closeRangePopover(restoreFocus) {
+    if (!isRangePopoverOpen()) return;
+    elements.rangePopover.hidden = true;
+    state.customDraftTool = null;
+    if (restoreFocus && elements.timeRangeSelect) elements.timeRangeSelect.focus();
+  }
+
   /**
-   * Show or hide the custom date-range inputs next to the time-range select.
+   * Close an unapplied custom draft and put the selector back on the range the
+   * dashboard is actually showing.
    */
-  function setCustomControlsVisible(visible) {
-    const flag = !visible;
-    if (elements.customStartDate) elements.customStartDate.hidden = flag;
-    if (elements.customEndControl) elements.customEndControl.hidden = flag;
-    if (elements.customRangeApply) elements.customRangeApply.hidden = flag;
+  function dismissRangePopover(restoreFocus) {
+    if (!isRangePopoverOpen()) return;
+    const toolChanged = state.customPending && state.currentTool !== state.customDraftTool;
+    if (state.customPending) {
+      setCustomPending(false);
+      state.currentTimeRange = state.appliedTimeRange;
+      if (elements.timeRangeSelect) elements.timeRangeSelect.value = state.appliedTimeRange;
+    }
+    closeRangePopover(restoreFocus);
+    if (toolChanged) {
+      fetchUsageData(true).catch((err) => console.error('Error fetching usage data after dismissing a custom draft:', err));
+    }
+  }
+
+  function syncCustomRangeEdit() {
+    if (elements.customRangeEdit) elements.customRangeEdit.hidden = state.appliedTimeRange !== 'custom';
   }
 
   /** Mark the visible custom range as a draft, or clear the draft marker. */
@@ -308,17 +539,63 @@
     }
   }
 
+  /* ---------------------------------------------------------- tool filter */
+
+  /**
+   * Tool radiogroup: roving tabindex, arrow keys move and select.
+   */
+  function setupToolFilter() {
+    const group = elements.toolFilter;
+    if (!group) return;
+    const radios = Array.from(group.querySelectorAll('[role="radio"]'));
+    if (radios.length === 0) return;
+
+    const select = (radio, focus) => {
+      radios.forEach((item) => {
+        const on = item === radio;
+        item.setAttribute('aria-checked', on ? 'true' : 'false');
+        item.tabIndex = on ? 0 : -1;
+      });
+      if (focus) radio.focus();
+      const tool = radio.getAttribute('data-tool') || 'all';
+      if (tool === state.currentTool) return;
+      state.currentTool = tool;
+      fetchUsageData(true).catch((err) => console.error('Error fetching usage data on tool change:', err));
+    };
+
+    radios.forEach((radio, index) => {
+      radio.addEventListener('click', () => select(radio, false));
+      radio.addEventListener('keydown', (event) => {
+        let nextIndex = index;
+        switch (event.key) {
+          case 'ArrowRight':
+          case 'ArrowDown':
+            nextIndex = (index + 1) % radios.length;
+            break;
+          case 'ArrowLeft':
+          case 'ArrowUp':
+            nextIndex = (index - 1 + radios.length) % radios.length;
+            break;
+          case 'Home':
+            nextIndex = 0;
+            break;
+          case 'End':
+            nextIndex = radios.length - 1;
+            break;
+          default:
+            return;
+        }
+        event.preventDefault();
+        select(radios[nextIndex], true);
+      });
+    });
+  }
+
   /**
    * Attach all DOM event listeners
    */
   function setupEventListeners() {
-    // Tool dropdown switch
-    if (elements.toolSelect) {
-      elements.toolSelect.addEventListener('change', (e) => {
-        state.currentTool = e.target.value;
-        fetchUsageData(true).catch((err) => console.error('Error fetching usage data on tool select:', err));
-      });
-    }
+    setupToolFilter();
 
     // Time range dropdown switch
     if (elements.timeRangeSelect) {
@@ -326,13 +603,27 @@
         state.currentTimeRange = e.target.value;
         const isCustom = state.currentTimeRange === 'custom';
         setCustomPending(isCustom);
-        setCustomControlsVisible(isCustom);
         if (isCustom) {
           // Wait for explicit Apply; keep last custom dates in the inputs.
-          updateCustomEndHint();
+          openRangePopover();
           return;
         }
+        state.appliedTimeRange = state.currentTimeRange;
+        syncCustomRangeEdit();
+        closeRangePopover(false);
         fetchUsageData(true).catch((err) => console.error('Error fetching usage data on time range select:', err));
+      });
+    }
+
+    if (elements.customRangeEdit) {
+      elements.customRangeEdit.addEventListener('click', () => {
+        if (state.appliedTimeRange !== 'custom') return;
+        state.currentTimeRange = 'custom';
+        if (elements.timeRangeSelect) elements.timeRangeSelect.value = 'custom';
+        if (elements.customStartDate) elements.customStartDate.value = state.customStart;
+        if (elements.customEndDate) elements.customEndDate.value = state.customEnd;
+        setCustomPending(true);
+        openRangePopover();
       });
     }
 
@@ -369,10 +660,26 @@
         state.customEnd = end;
         setCustomPending(false);
         state.currentTimeRange = 'custom';
+        state.appliedTimeRange = 'custom';
+        syncCustomRangeEdit();
         if (elements.timeRangeSelect) elements.timeRangeSelect.value = 'custom';
+        closeRangePopover(true);
         fetchUsageData(true).catch((err) => console.error('Error fetching usage data on custom range apply:', err));
       });
     }
+
+    // Dismiss the popover with Escape or a press outside of the range control.
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && isRangePopoverOpen()) {
+        event.preventDefault();
+        dismissRangePopover(true);
+      }
+    });
+    document.addEventListener('pointerdown', (event) => {
+      if (!isRangePopoverOpen()) return;
+      if (elements.rangeControl && elements.rangeControl.contains(event.target)) return;
+      dismissRangePopover(false);
+    });
 
     // Auto-refresh toggle
     if (elements.autoRefreshToggle) {
@@ -409,13 +716,18 @@
     }
 
     setupDetailsTabs();
-    document.querySelectorAll('.chart-group').forEach((group) => {
-      group.addEventListener('toggle', () => {
-        if (group.open && window.DashboardCharts && window.DashboardCharts.resizeCharts) {
-          window.DashboardCharts.resizeCharts();
-        }
-      });
-    });
+    setupTopbarScroll();
+  }
+
+  /**
+   * Hairline under the sticky topbar once the page has scrolled.
+   */
+  function setupTopbarScroll() {
+    const topbar = elements.topbar;
+    if (!topbar) return;
+    const update = () => topbar.classList.toggle('is-scrolled', window.scrollY > 4);
+    window.addEventListener('scroll', update, { passive: true });
+    update();
   }
 
   /**
@@ -456,30 +768,36 @@
 
   /**
    * Cache DOM elements for fast access.
-   * IDs preserved from the original monolith; renderers receive
-   * the elements they need as explicit arguments.
+   * Renderers receive the elements they need as explicit arguments; charts
+   * look up their own mount points.
    */
   function cacheElements() {
-    elements.toolSelect = document.getElementById('tool-select');
+    elements.topbar = document.getElementById('topbar');
+    elements.toolFilter = document.getElementById('tool-filter');
+    elements.rangeControl = document.getElementById('range-control');
+    elements.rangePopover = document.getElementById('range-popover');
     elements.timeRangeSelect = document.getElementById('time-range-select');
+    elements.customRangeEdit = document.getElementById('custom-range-edit');
     elements.customStartDate = document.getElementById('custom-start-date');
     elements.customEndDate = document.getElementById('custom-end-date');
-    elements.customEndControl = document.getElementById('custom-end-control');
     elements.customEndNowLabel = document.getElementById('custom-end-now-label');
     elements.customRangeApply = document.getElementById('custom-range-apply');
     elements.autoRefreshToggle = document.getElementById('auto-refresh-toggle');
     elements.refreshInterval = document.getElementById('refresh-interval');
     elements.refreshBtn = document.getElementById('refresh-btn');
+    elements.themeToggle = document.getElementById('theme-toggle');
     elements.lastSyncedBadge = document.getElementById('last-synced-badge');
 
+    elements.meterLabel = document.getElementById('meter-label');
     elements.cardSpendSubtext = document.getElementById('card-spend-subtext');
+    elements.readoutBurn = document.getElementById('readout-burn');
+    elements.readoutTokens = document.getElementById('readout-tokens');
+    elements.readoutRate = document.getElementById('readout-rate');
+    elements.readoutCalls = document.getElementById('readout-calls');
     elements.cardBurnSubtext = document.getElementById('card-burn-subtext');
-    elements.cardSavingsSubtext = document.getElementById('card-savings-subtext');
+    elements.cardTokensSubtext = document.getElementById('card-tokens-subtext');
+    elements.cardRateSubtext = document.getElementById('card-rate-subtext');
     elements.cardCallsSubtext = document.getElementById('card-calls-subtext');
-    elements.sparklineSpend = document.getElementById('sparkline-spend');
-    elements.sparklineBurn = document.getElementById('sparkline-burn');
-    elements.sparklineSavings = document.getElementById('sparkline-savings');
-    elements.sparklineSessions = document.getElementById('sparkline-sessions');
 
     elements.analyticsWindowBadge = document.getElementById('analytics-window-badge');
     elements.analyticsCallCount = document.getElementById('analytics-call-count');
@@ -494,16 +812,10 @@
     elements.comparisonSubtitle = document.getElementById('comparison-subtitle');
     elements.comparisonContent = document.getElementById('comparison-content');
 
-    elements.chartTokensCanvas = document.getElementById('chart-tokens');
-    elements.chartCostCanvas = document.getElementById('chart-cost');
-    elements.chartCostByToolCanvas = document.getElementById('chart-cost-by-tool');
-    elements.chartCacheTrendCanvas = document.getElementById('chart-cache-trend');
-    elements.chartCostPer1kCanvas = document.getElementById('chart-cost-per-1k');
-    elements.chartHourlyActivityCanvas = document.getElementById('chart-hourly-activity');
-    elements.dailyHeatmap = document.getElementById('daily-usage-heatmap');
     elements.unpricedBanner = document.getElementById('unpriced-banner');
     elements.unpricedSummaryBanner = document.getElementById('unpriced-summary-banner');
 
+    elements.modelLedger = document.getElementById('model-ledger');
     elements.modelsCountBadge = document.getElementById('models-count-badge');
     elements.pricingStatus = document.getElementById('pricing-status');
     elements.modelsTableBody = document.getElementById('models-table-body');
@@ -511,8 +823,6 @@
     elements.sessionsCountBadge = document.getElementById('sessions-count-badge');
     elements.sessionsSearch = document.getElementById('sessions-search');
     elements.sessionsTableBody = document.getElementById('sessions-table-body');
-
-    elements.toastContainer = document.getElementById('toast-container');
   }
 
   /**
@@ -521,6 +831,7 @@
   async function init() {
     cacheElements();
     initOdometers();
+    setupTheme();
     setupEventListeners();
 
     // Fetch initial pricing metadata and first usage batch

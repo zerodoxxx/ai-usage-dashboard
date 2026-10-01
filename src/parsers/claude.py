@@ -13,11 +13,12 @@ import logging
 import os
 import re
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from ..pricing import calculate_cost_strict
-from .contracts import CostEstimate, TokenUsage, UsageEvent, UsageSession
+from .contracts import CostEstimate, TokenUsage, UsageEvent, UsageSession, _timestamp
 
 logger = logging.getLogger(__name__)
 def _pricing_provider(model: str) -> str:
@@ -136,9 +137,25 @@ def _session_title(record: dict[str, Any]) -> str:
     return _clean_title(content)
 
 
+def _sum_event_usage(events: list[UsageEvent]) -> TokenUsage:
+    """Rebuild usage after grouping or removing copied response observations."""
+    return TokenUsage(
+        input_tokens=sum(event.usage.input_tokens for event in events),
+        cached_input_tokens=sum(event.usage.cached_input_tokens for event in events),
+        output_tokens=sum(event.usage.output_tokens for event in events),
+        reasoning_output_tokens=sum(event.usage.reasoning_output_tokens for event in events),
+        total_tokens=sum(event.usage.total_tokens for event in events),
+        cache_read_tokens=sum(event.usage.cache_read_tokens or 0 for event in events),
+        cache_write_tokens=sum(event.usage.cache_write_tokens for event in events),
+        cache_write_5m_tokens=sum(event.usage.cache_write_5m_tokens for event in events),
+        cache_write_1h_tokens=sum(event.usage.cache_write_1h_tokens for event in events),
+    )
+
+
 def _parse_session_file(path: Path) -> UsageSession | None:
     events: list[UsageEvent] = []
-    seen_message_ids: set[str] = set()
+    responses: dict[str, tuple[Any, dict[str, Any], int]] = {}
+    ancestors: dict[str, tuple[Any, str, Any]] = {}
     models: Counter[str] = Counter()
     session_id: str | None = None
     title = ""
@@ -172,6 +189,12 @@ def _parse_session_file(path: Path) -> UsageSession | None:
                     first_timestamp = first_timestamp if first_timestamp is not None else timestamp
                     last_timestamp = timestamp
 
+                uuid = record.get("uuid")
+                if uuid:
+                    ancestors[str(uuid)] = (
+                        record.get("parentUuid"), str(record.get("type") or ""), timestamp
+                    )
+
                 if record.get("type") == "ai-title" or record.get("aiTitle"):
                     ai_title = _clean_title(str(record.get("aiTitle") or record.get("title") or ""))
                     if ai_title:
@@ -189,27 +212,49 @@ def _parse_session_file(path: Path) -> UsageSession | None:
                     continue
 
                 message_id = message.get("id") or record.get("uuid")
-                if message_id is not None and str(message_id) in seen_message_ids:
-                    continue
-                if message_id is not None:
-                    seen_message_ids.add(str(message_id))
-
-                model_value = message.get("model") or record.get("model")
-                model = str(model_value).strip() if model_value else None
-                event = _usage_event(record, usage, model, line_number)
-                if event is None:
-                    continue
-                if message_id is None and event.event_id:
-                    # Line-number fallbacks are only unique within one file.
-                    # Namespace them so two transcript files cannot suppress
-                    # one another's calls during cross-file deduplication.
-                    event.event_id = f"{path.resolve()}:{event.event_id}"
-                events.append(event)
-                if model:
-                    models[model] += 1
+                key = str(message_id) if message_id is not None else f"{path.resolve()}:event-{line_number}"
+                first_parent = responses[key][0] if key in responses else record.get("parentUuid")
+                # Usage is cumulative across blocks. Keep the final observation
+                # and completion timestamp, while preserving the first ancestor.
+                responses[key] = (first_parent, record, line_number)
     except (OSError, UnicodeError) as exc:
         logger.debug("Unable to read Claude Code session %s: %s", path, exc)
         return None
+
+    for key, (parent, record, ordinal) in responses.items():
+        message = record.get("message")
+        if not isinstance(message, dict):
+            message = {}
+        usage = message.get("usage") or record.get("usage")
+        model_value = message.get("model") or record.get("model")
+        model = str(model_value).strip() if model_value else None
+        event = _usage_event(record, usage, model, ordinal)
+        if event is None:
+            continue
+        event.event_id = key
+        start = None
+        visited: set[str] = set()
+        while parent is not None and str(parent) not in visited:
+            parent_key = str(parent)
+            visited.add(parent_key)
+            ancestor = ancestors.get(parent_key)
+            if ancestor is None:
+                break
+            parent, kind, timestamp = ancestor
+            if kind == "user":
+                start = _timestamp(timestamp)
+                break
+        event.metadata.update({
+            "tps_duration_seconds": (
+                (event.timestamp - start).total_seconds()
+                if event.timestamp is not None and start is not None else None
+            ),
+            "tps_output_tokens": event.usage.output_tokens,
+            "tps_trustworthy": bool(message.get("stop_reason")),
+        })
+        events.append(event)
+        if model:
+            models[model] += 1
 
     result: UsageSession | None
     if not events:
@@ -231,17 +276,7 @@ def _parse_session_file(path: Path) -> UsageSession | None:
             start_time=first_timestamp,
             end_time=last_timestamp,
             activity_at=last_timestamp,
-            usage=TokenUsage(
-                input_tokens=sum(event.usage.input_tokens for event in events),
-                cached_input_tokens=sum(event.usage.cached_input_tokens for event in events),
-                output_tokens=sum(event.usage.output_tokens for event in events),
-                reasoning_output_tokens=sum(event.usage.reasoning_output_tokens for event in events),
-                total_tokens=sum(event.usage.total_tokens for event in events),
-                cache_read_tokens=sum(event.usage.cache_read_tokens or 0 for event in events),
-                cache_write_tokens=sum(event.usage.cache_write_tokens for event in events),
-                cache_write_5m_tokens=sum(event.usage.cache_write_5m_tokens for event in events),
-                cache_write_1h_tokens=sum(event.usage.cache_write_1h_tokens for event in events),
-            ),
+            usage=_sum_event_usage(events),
             events=events,
             metadata={"cwd": cwd, "git_branch": git_branch} if cwd or git_branch else {},
             call_count=len(events),
@@ -293,6 +328,36 @@ class ClaudeCodeSource:
             for path in _session_files(base_dir)
             if (session := _parse_session_file(path)) is not None
         ]
+        final_events: dict[str, UsageEvent] = {}
+        for session in sessions:
+            for event in session.events:
+                if event.event_id is None:
+                    continue
+                previous = final_events.get(event.event_id)
+                if previous is None or (
+                    event.timestamp is not None
+                    and (previous.timestamp is None or event.timestamp > previous.timestamp)
+                ) or (
+                    event.timestamp == previous.timestamp
+                    and previous.metadata.get("tps_duration_seconds") is None
+                    and event.metadata.get("tps_duration_seconds") is not None
+                ):
+                    final_events[event.event_id] = event
+        unique_sessions: list[UsageSession] = []
+        for session in sessions:
+            retained = [
+                event for event in session.events
+                if event.event_id is None or final_events[event.event_id] is event
+            ]
+            if not retained:
+                continue
+            if len(retained) != len(session.events):
+                session = replace(
+                    session, events=retained, usage=_sum_event_usage(retained),
+                    cost=None, call_count=len(retained),
+                )
+            unique_sessions.append(session)
+        sessions = unique_sessions
         sessions.sort(
             key=lambda session: str(session.activity_at or session.created_at or session.id),
             reverse=True,

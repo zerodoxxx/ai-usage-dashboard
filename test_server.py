@@ -35,7 +35,7 @@ def test_index_html_cache_busts_charts_js() -> None:
     )
     out = version_static_assets(html)
     charts_v = _static_asset_version("/static/js/charts.js")
-    assert "Cost per 1M Tokens by Model" in out
+    assert "Cost by tool" in out
     assert f"/static/js/charts.js?v={charts_v}" in out
     assert "Cost / 1K Tokens" not in out
 
@@ -118,17 +118,17 @@ def main() -> None:
     assert status == 200, f"Expected 200, got {status}"
     assert "<!DOCTYPE html>" in html
     assert "AI Usage & Cost Visualizer" in html
-    assert "Executive Overview" in html
-    assert "Tracked sessions" in html
+    assert "Usage meter" in html
+    assert "API calls" in html
     assert "odo-total-cost" in html
-    assert "chart-tokens" in html
+    assert "model-ledger" in html
     assert "daily-usage-heatmap" in html
-    assert "Past 30 Days" in html
+    assert "Last 30 days" in html
     assert "models-table-body" in html
     assert "time-range-select" in html
     assert "export-sessions-btn" not in html
     assert "unpriced-summary-banner" in html
-    assert "Projected 30 Day Cost" in html
+    assert "Projected 30-day cost" in html
     assert "Projected Monthly Cost" not in html
     assert "/static/js/charts.js?v=" in html
     assert "no-store" in headers.get("cache-control", "")

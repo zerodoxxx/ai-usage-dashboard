@@ -7,7 +7,6 @@
 
   const PROJECTION_LABELS = {
     all_run_rate: 'All-time daily average × 30',
-    last_30_days: 'All-time daily average × 30',
     current_month_run_rate: 'Current-month daily average × 30',
     custom_run_rate: 'Selected-range daily average × 30',
     '30d_run_rate': '30-day daily average × 30',
@@ -26,10 +25,20 @@
    * @param {object} ctx element refs + selectedRangeLabel
    */
   function updateAnalytics(analytics, summary, ctx) {
-    const { formatCompactNumber, formatDateTime, providerBadge, escapeHtml } = window.DashboardUtils;
+    const { formatCompactNumber } = window.DashboardUtils;
     const details = analytics && typeof analytics === 'object' ? analytics : {};
     const totals = summary && typeof summary === 'object' ? summary : {};
-    const formatCurrency = (value) => `$${Number(value || 0).toFixed(4)}`;
+    // Two decimals from $1 up, four below so small per-session costs stay readable.
+    const formatCurrency = (value) => {
+      const amount = Number(value || 0);
+      return window.DashboardUtils.formatUsd(amount, Math.abs(amount) >= 1 ? 2 : 4);
+    };
+    const formatDay = (value) => {
+      const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ''));
+      if (!match) return String(value || '');
+      const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+      return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    };
     const formatChange = (value) => {
       if (value === null || value === undefined || !Number.isFinite(Number(value))) return 'n/a';
       const numericValue = Number(value);
@@ -69,11 +78,11 @@
 
     const peakDay = details.peak_day;
     if (ctx.analyticsPeakDayCost) {
-      ctx.analyticsPeakDayCost.textContent = peakDay ? formatCurrency(peakDay.cost_cached_usd) : '$0.0000';
+      ctx.analyticsPeakDayCost.textContent = peakDay ? formatCurrency(peakDay.cost_cached_usd) : '$0.00';
     }
     if (ctx.analyticsPeakDayDetail) {
       ctx.analyticsPeakDayDetail.textContent = peakDay
-        ? `${peakDay.date} · ${Number(peakDay.call_count || 0).toLocaleString()} calls`
+        ? `${formatDay(peakDay.date)}, ${Number(peakDay.call_count || 0).toLocaleString()} calls`
         : 'No daily usage yet';
     }
 
@@ -92,7 +101,7 @@
     }
     if (!ctx.comparisonContent) return;
     if (!comparison) {
-      ctx.comparisonContent.innerHTML = '<div class="comparison-empty">No comparison available for All time.</div>';
+      ctx.comparisonContent.innerHTML = '<p class="comparison__empty">No comparison available for this range.</p>';
       return;
     }
 
@@ -118,17 +127,29 @@
       },
     ];
     ctx.comparisonContent.innerHTML = `
-      <div class="comparison-heading">
-        <span>Metric</span><span>Current</span><span>Previous</span><span>Change</span>
+      <div class="table-scroll" role="region" aria-label="Period comparison table" tabindex="0">
+        <table class="data-table">
+          <caption class="visually-hidden">Current period compared with the previous period</caption>
+          <thead>
+            <tr>
+              <th scope="col">Metric</th>
+              <th scope="col" class="cell-right">Current</th>
+              <th scope="col" class="cell-right">Previous</th>
+              <th scope="col" class="cell-right">Change</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${comparisonRows.map((row) => `
+              <tr>
+                <th scope="row" class="comparison__metric">${row.label}</th>
+                <td class="cell-num">${row.current}</td>
+                <td class="cell-num cell-muted">${row.previous}</td>
+                <td class="cell-num ${changeClass(row.change, row.lowerIsBetter)}">${formatChange(row.change)}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
       </div>
-      ${comparisonRows.map((row) => `
-        <div class="comparison-row">
-          <span class="comparison-label">${row.label}</span>
-          <span class="comparison-value">${row.current}</span>
-          <span class="comparison-value">${row.previous}</span>
-          <span class="comparison-change ${changeClass(row.change, row.lowerIsBetter)}">${formatChange(row.change)}</span>
-        </div>
-      `).join('')}
     `;
   }
 
@@ -148,7 +169,7 @@
 
     const sessionList = (Array.isArray(sessions) ? sessions : []).filter((session) => session && typeof session === 'object');
     if (sessionList.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No session cost data available.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No session cost data in this period</td></tr>';
       return;
     }
 
@@ -158,7 +179,7 @@
       const provenance = tokenProvenance(session);
       const est = provenance !== 'reported';
       const estBadge = est
-        ? ` <span class="est-badge ${provenance === 'mixed' ? 'mixed-badge' : ''}" title="${escapeHtml(EST_TOOLTIP)}" aria-label="${escapeHtml(provenanceLabel(session))} token provenance">${escapeHtml(provenanceLabel(session))}</span>`
+        ? `<span class="chip" title="${escapeHtml(EST_TOOLTIP)}" aria-label="${escapeHtml(provenanceLabel(session))} token provenance">${escapeHtml(provenanceLabel(session))}</span>`
         : '';
       const tokTitle = est ? ` title="${escapeHtml(EST_TOOLTIP)}"` : '';
       const tokPrefix = est ? '~' : '';
@@ -171,7 +192,7 @@
       );
       const costText = costAvailable
         ? `${tokPrefix}${formatCurrency(session.cost_cached_usd)}`
-        : '<strong class="cost-unavailable" aria-label="Cost unavailable">—</strong>';
+        : '<span class="cost-unavailable" aria-label="Cost unavailable">–</span>';
       const costTitle = costAvailable ? tokTitle : ' title="Cost unavailable: no catalog rate"';
       const activity = formatDateTime(
         session.activity_at || session.created_at || session.start_time,
@@ -180,13 +201,13 @@
       return `
         <tr>
           <td>
-            <strong class="insight-session-title" title="${escapeHtml(String(session.title || 'Untitled Session'))}">${escapeHtml(String(session.title || 'Untitled Session'))}</strong>
-            <div class="text-muted" style="font-size: 10px; font-family: var(--font-mono);">${escapeHtml(activity)}</div>
+            <strong class="insight-session-title" title="${escapeHtml(String(session.title || 'Untitled session'))}">${escapeHtml(String(session.title || 'Untitled session'))}</strong>
+            <span class="cell-sub">${escapeHtml(activity)}</span>
           </td>
-          <td><span class="provider-badge ${badge.className}">${badge.text}</span>${estBadge}${costAvailable ? '' : ' <span class="unpriced-pill">unpriced</span>'}</td>
-          <td class="cell-mono">${escapeHtml(String(session.model || 'unknown'))}</td>
-          <td class="cell-mono cell-right"${tokTitle}>${tokPrefix}${Number(session.total_tokens || 0).toLocaleString()}</td>
-          <td class="cell-mono cell-right ${costAvailable ? 'text-success' : 'text-muted'}"${costTitle}>${costText}</td>
+          <td><div class="model-cell__meta"><span class="${badge.className}">${badge.text}</span>${estBadge}${costAvailable ? '' : '<span class="chip">unpriced</span>'}</div></td>
+          <td>${escapeHtml(String(session.model || 'unknown'))}</td>
+          <td class="cell-num"${tokTitle}>${tokPrefix}${Number(session.total_tokens || 0).toLocaleString()}</td>
+          <td class="cell-num${costAvailable ? '' : ' cell-muted'}"${costTitle}>${costText}</td>
         </tr>
       `;
     }).join('');
@@ -194,7 +215,5 @@
 
   window.DashboardAnalytics = {
     updateAnalytics,
-    renderTopSessions,
-    projectionBasisLabel,
   };
 })();

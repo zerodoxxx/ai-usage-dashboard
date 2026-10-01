@@ -53,16 +53,16 @@
       meta.error ? `error: ${meta.error}` : null,
       meta.source_url ? `url: ${meta.source_url}` : null,
       modelCount > 0 ? `models: ${modelCount} via LiteLLM` : null,
-    ].filter(Boolean).join(' · ');
+    ].filter(Boolean).join('; ');
     if ((source === 'litellm' || source === 'litellm-cache') && !meta.stale) {
       const text = age && age !== 'just now' ? `Pricing: live ${age}` : 'Pricing: live just now';
-      badge.innerHTML = `<span class="status-dot status-live"></span>${escapeHtml(text)}`;
+      badge.innerHTML = `<span class="status-dot" aria-hidden="true"></span>${escapeHtml(text)}`;
       badge.title = detail || 'LiteLLM community rates are fresh';
     } else if (meta.stale) {
-      badge.innerHTML = `<span class="status-dot status-stale"></span>Pricing: stale`;
+      badge.innerHTML = `<span class="status-dot status-stale" aria-hidden="true"></span>Pricing: stale`;
       badge.title = detail || 'Using cached/stale rates';
     } else {
-      badge.innerHTML = `<span class="status-dot status-offline"></span>Pricing: offline`;
+      badge.innerHTML = `<span class="status-dot status-offline" aria-hidden="true"></span>Pricing: offline`;
       badge.title = detail || 'Using bundled fallback rates';
     }
   }

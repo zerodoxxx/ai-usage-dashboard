@@ -1,0 +1,338 @@
+/* Nixie tubes, boot spin and milestone celebration for the register.
+ *
+ * Loaded after dashboard.css. The drum look (light theme) stays in
+ * dashboard.css; this file adds the Nixie form (dark theme, `.register--nixie`
+ * set by odometer.js), the drum celebration sheen and the token underline.
+ * Sizes are in em so the tubes track --register-size exactly like the drums.
+ */
+
+/* ---------------------------------------------------------------- tokens */
+
+:root {
+  /* Brass sheen across the drum housing on a cost milestone (physical, both themes). */
+  --brass-sheen: rgba(255, 205, 120, .22);
+  --brass-sheen-hot: rgba(255, 226, 160, .62);
+}
+
+/* Nixie tokens live in the dark selectors only: the tubes exist only in dark. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --nixie-housing: linear-gradient(180deg, #131110 0%, #080707 100%);
+    --nixie-housing-edge: rgba(255, 255, 255, .06);
+    --nixie-housing-deep: rgba(0, 0, 0, .85);
+    --nixie-glass: #15100D;
+    --nixie-glass-edge: rgba(255, 255, 255, .07);
+    --nixie-sheen: rgba(255, 255, 255, .06);
+    --nixie-streak: rgba(255, 255, 255, .10);
+    --nixie-mesh: rgba(255, 255, 255, .035);
+    --nixie-socket: #060403;
+    --nixie-socket-edge: rgba(255, 255, 255, .05);
+    --nixie-off: rgb(222, 196, 176);
+    --nixie-off-level: .05;
+    --nixie-core: #FFC27A;
+    --nixie-body: rgba(255, 128, 36, .62);
+    --nixie-glow-1: #FF9B45;
+    --nixie-glow-2: rgba(255, 122, 26, .75);
+    --nixie-glow-3: rgba(255, 90, 10, .4);
+    --nixie-bloom: rgba(255, 122, 26, .5);
+  }
+}
+
+:root[data-theme="dark"] {
+  --nixie-housing: linear-gradient(180deg, #131110 0%, #080707 100%);
+  --nixie-housing-edge: rgba(255, 255, 255, .06);
+  --nixie-housing-deep: rgba(0, 0, 0, .85);
+  --nixie-glass: #15100D;
+  --nixie-glass-edge: rgba(255, 255, 255, .07);
+  --nixie-sheen: rgba(255, 255, 255, .06);
+  --nixie-streak: rgba(255, 255, 255, .10);
+  --nixie-mesh: rgba(255, 255, 255, .035);
+  --nixie-socket: #060403;
+  --nixie-socket-edge: rgba(255, 255, 255, .05);
+  --nixie-off: rgb(222, 196, 176);
+  --nixie-off-level: .05;
+  --nixie-core: #FFC27A;
+  --nixie-body: rgba(255, 128, 36, .62);
+  --nixie-glow-1: #FF9B45;
+  --nixie-glow-2: rgba(255, 122, 26, .75);
+  --nixie-glow-3: rgba(255, 90, 10, .4);
+  --nixie-bloom: rgba(255, 122, 26, .5);
+}
+
+/* --------------------------------------------------------------- housing */
+
+/* The housing is its own stacking context so tube layers never leave it. */
+.register {
+  position: relative;
+  isolation: isolate;
+}
+
+.register--nixie {
+  --nixie-socket-h: max(4px, .065em);
+  background: var(--nixie-housing);
+  box-shadow:
+    inset 0 0 0 1px var(--nixie-housing-edge),
+    inset 0 8px 18px -4px var(--nixie-housing-deep),
+    inset 0 -1px 0 var(--nixie-housing-deep);
+}
+
+/* ----------------------------------------------------------------- tubes */
+
+/* Same footprint as a drum (.66em x 1.18em). Layers, bottom to top:
+   glass (mesh + bloom) 0, cathode stack 1, lit numeral 2, socket 3, sheen 4. */
+.nixie-tube {
+  position: relative;
+  display: block;
+  flex: none;
+  width: .66em;
+  height: 1.18em;
+  border-radius: 45% 45% 3px 3px / 25% 25% 3px 3px;
+  background: var(--nixie-glass);
+}
+
+.nixie-tube--group-start {
+  margin-left: 4px;
+}
+
+/* Glass sheen, 1px rim and one thin specular streak, over everything but the glow. */
+.nixie-tube::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  border-radius: inherit;
+  background:
+    linear-gradient(180deg, transparent, var(--nixie-streak) 30%, var(--nixie-streak) 70%, transparent) 22% 14% / 2.5px 70% no-repeat,
+    linear-gradient(180deg, var(--nixie-sheen), transparent 35%);
+  box-shadow: inset 0 0 0 1px var(--nixie-glass-edge);
+  pointer-events: none;
+}
+
+/* Anode mesh (4px pitch, 1px lines) and the warm bloom on the glass, clipped to the envelope. */
+.nixie__glass {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  border-radius: inherit;
+  background-image:
+    linear-gradient(90deg, var(--nixie-mesh) 1px, transparent 1px),
+    linear-gradient(0deg, var(--nixie-mesh) 1px, transparent 1px);
+  background-size: 4px 4px;
+}
+
+.nixie__bloom {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse 70% 55% at 50% 46%, var(--nixie-bloom) 0%, transparent 100%);
+  opacity: 0;
+  transition: opacity 120ms linear;
+}
+
+.nixie-tube:not(.nixie-tube--blank) .nixie__bloom {
+  opacity: 1;
+  transition-duration: 80ms;
+}
+
+/* The numeral box: 28x48 viewBox inside the glass, above the socket band. */
+.nixie__stack,
+.nixie__lit {
+  position: absolute;
+  top: .13em;
+  left: .07em;
+  width: calc(100% - .14em);
+  height: calc(100% - .2em - var(--nixie-socket-h));
+}
+
+/* Unlit cathodes: the faint stack seen through the glass. The strokes are opaque and the
+   whole stack is faded as one group, so overlapping numerals never add up brighter. */
+.nixie__stack {
+  z-index: 1;
+  display: block;
+  overflow: visible;
+  opacity: var(--nixie-off-level);
+  fill: none;
+  stroke: var(--nixie-off);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.nixie__lit {
+  z-index: 2;
+}
+
+.nixie__lit svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  filter:
+    drop-shadow(0 0 max(1px, .012em) var(--nixie-glow-1))
+    drop-shadow(0 0 max(2px, .025em) var(--nixie-glow-2))
+    drop-shadow(0 0 max(3px, .05em) var(--nixie-glow-2))
+    drop-shadow(0 0 max(6px, .1em) var(--nixie-glow-2))
+    drop-shadow(0 0 max(10px, .17em) var(--nixie-glow-3))
+    drop-shadow(0 0 max(14px, .24em) var(--nixie-glow-3));
+}
+
+.nixie-tube--fraction .nixie__lit {
+  opacity: .8;
+}
+
+.nixie__num {
+  opacity: 0;
+  transition: opacity 120ms linear;
+}
+
+/* A lit cathode: a wider orange body around a hot pale core wire. */
+.nixie__body {
+  stroke: var(--nixie-body);
+  stroke-width: 4.4;
+}
+
+.nixie__wire {
+  stroke: var(--nixie-core);
+  stroke-width: 2;
+}
+
+.nixie__num.is-on {
+  opacity: 1;
+  transition-duration: 80ms;
+}
+
+.nixie__socket {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 3;
+  height: var(--nixie-socket-h);
+  border-radius: 0 0 3px 3px;
+  background: var(--nixie-socket);
+  box-shadow: inset 0 1px 0 var(--nixie-socket-edge);
+}
+
+/* Decimal point: a small glowing dot cathode at the base, between the integer and cents tubes. */
+.register--nixie .nixie-point {
+  position: relative;
+  z-index: 2;
+}
+
+.nixie-point__dot {
+  display: block;
+  flex: none;
+  width: max(4px, .06em);
+  height: max(4px, .06em);
+  margin-bottom: calc(var(--nixie-socket-h) + .145em);
+  border-radius: 50%;
+  background: var(--nixie-core);
+  box-shadow:
+    0 0 max(1px, .016em) var(--nixie-glow-1),
+    0 0 max(3px, .065em) var(--nixie-glow-2),
+    0 0 max(8px, .17em) var(--nixie-glow-3);
+  opacity: .8;
+}
+
+/* Fades are off while cycling cathodes (boot) or while snapping to a new form. */
+.nixie-tube.is-cycling .nixie__num,
+.nixie-tube.is-cycling .nixie__bloom,
+.register--nixie.is-snap .nixie__num,
+.register--nixie.is-snap .nixie__bloom {
+  transition: none !important;
+}
+
+/* ----------------------------------------------------------- celebration */
+
+/* Nixie: every lit tube surges from 1.7 and the glass bloom swells. */
+@keyframes nixie-celebrate {
+  from { filter: brightness(1.7) drop-shadow(0 0 .14em var(--nixie-glow-2)); }
+  to { filter: brightness(1) drop-shadow(0 0 0 transparent); }
+}
+
+@keyframes nixie-bloom-swell {
+  0% { transform: scale(1); }
+  22% { transform: scale(1.9); }
+  100% { transform: scale(1); }
+}
+
+.register--nixie.is-celebrating .nixie__lit {
+  animation: nixie-celebrate 900ms cubic-bezier(.2, .6, .3, 1);
+}
+
+.register--nixie.is-celebrating .nixie-tube:not(.nixie-tube--blank) .nixie__bloom {
+  animation: nixie-bloom-swell 900ms ease-out;
+}
+
+.register--nixie.is-celebrating .nixie-point__dot {
+  animation: nixie-celebrate 900ms cubic-bezier(.2, .6, .3, 1);
+}
+
+/* Drums: one bright-brass band sweeps across the housing, with a "ka-chunk" drop. */
+.register::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  border-radius: inherit;
+  background: linear-gradient(112deg,
+    transparent 0 40%,
+    var(--brass-sheen) 46%,
+    var(--brass-sheen-hot) 50%,
+    var(--brass-sheen) 54%,
+    transparent 60% 100%) 100% 0 / 220% 100% no-repeat;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.register--nixie::after {
+  display: none;
+}
+
+@keyframes register-sheen {
+  0% { opacity: 0; background-position: 100% 0; }
+  10% { opacity: 1; }
+  90% { opacity: 1; }
+  100% { opacity: 0; background-position: 0% 0; }
+}
+
+@keyframes register-kachunk {
+  0% { transform: translateY(0); }
+  35% { transform: translateY(2px); }
+  100% { transform: translateY(0); }
+}
+
+.register.is-celebrating:not(.register--nixie) {
+  animation: register-kachunk 180ms ease-out;
+}
+
+.register.is-celebrating:not(.register--nixie)::after {
+  animation: register-sheen 900ms linear;
+}
+
+/* Tokens milestone: a 2px steel underline sweeps under the value, then fades. */
+@keyframes tokens-sweep {
+  0% { opacity: 1; transform: scaleX(0); }
+  55% { opacity: 1; transform: scaleX(1); }
+  100% { opacity: 0; transform: scaleX(1); }
+}
+
+#readout-tokens.is-celebrating {
+  position: relative;
+}
+
+#readout-tokens.is-celebrating::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: -4px;
+  left: 0;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--tokens);
+  transform-origin: 0 50%;
+  animation: tokens-sweep 900ms ease-out both;
+}
