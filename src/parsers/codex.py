@@ -98,6 +98,21 @@ def _event_totals(events: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+def _advance_usage_total(
+    previous: dict[str, int],
+    usage: dict[str, int] | None,
+    cumulative: dict[str, int] | None,
+) -> dict[str, int]:
+    """Keep observed responses plus any history supplied by a scoped total."""
+    return {
+        field: max(
+            previous[field] + (usage[field] if usage else 0),
+            cumulative[field] if cumulative else 0,
+        )
+        for field in _USAGE_FIELDS
+    }
+
+
 def _timestamp_seconds(value: Any) -> float | None:
     """Parse a rollout timestamp for inferred call intervals."""
     try:
@@ -254,7 +269,12 @@ def _parse_rollout_file_uncached(
     event_msg_fallback_events: list[dict[str, Any]] = []
     token_record_count = 0
     previous_event_msg_cumulative: dict[str, int] | None = None
-    last_cumulative: dict[str, int] | None = None
+    modern_total = dict.fromkeys(_USAGE_FIELDS, 0)
+    turn_totals: dict[str, dict[str, int]] = {}
+    unscoped_total = dict.fromkeys(_USAGE_FIELDS, 0)
+    has_thread_total = False
+    has_inherited_history = False
+    active_turn: str | None = None
     active_model: str | None = None
     modern_timing = _ResponseTiming()
     legacy_timing = _ResponseTiming()
@@ -307,6 +327,7 @@ def _parse_rollout_file_uncached(
                     payload = {}
 
                 if rec_type == "turn_context":
+                    active_turn = str(payload["turn_id"]) if payload.get("turn_id") else None
                     model_value = payload.get("model")
                     if model_value:
                         active_model = str(model_value).strip()
@@ -323,6 +344,12 @@ def _parse_rollout_file_uncached(
                             timing.observe_output(ts, active_model or extracted_model)
 
                 if rec_type == "session_meta" and isinstance(payload, dict):
+                    # Forks and paginated continuations may retain cumulative
+                    # counters for history outside this file. Only its local
+                    # responses belong to this capture fragment.
+                    has_inherited_history = has_inherited_history or bool(
+                        payload.get("forked_from_id") or payload.get("history_base")
+                    )
                     prov = payload.get("provenance")
                     if isinstance(prov, dict):
                         extracted_model = prov.get("model")
@@ -349,10 +376,22 @@ def _parse_rollout_file_uncached(
                             usage_event["event_id"] = str(response_id)
                         token_record_events.append(usage_event)
 
-                    thread_cum = payload.get("thread_token_usage") or payload.get("turn_token_usage")
-                    normalized_thread_cum = _normalize_usage(thread_cum)
-                    if normalized_thread_cum:
-                        last_cumulative = normalized_thread_cum
+                    normalized_usage = _normalize_usage(u)
+                    thread_total = _normalize_usage(payload.get("thread_token_usage"))
+                    has_thread_total = has_thread_total or thread_total is not None
+                    modern_total = _advance_usage_total(modern_total, normalized_usage, thread_total)
+                    turn_id = payload.get("turn_id") or active_turn
+                    if turn_id:
+                        turn_key = str(turn_id)
+                        turn_totals[turn_key] = _advance_usage_total(
+                            turn_totals.get(turn_key, dict.fromkeys(_USAGE_FIELDS, 0)),
+                            normalized_usage,
+                            _normalize_usage(payload.get("turn_token_usage")),
+                        )
+                    else:
+                        # Without a turn identity this counter cannot safely
+                        # describe the session. Distinct responses still add.
+                        unscoped_total = _advance_usage_total(unscoped_total, normalized_usage, None)
 
                 # Format 2: event_msg with payload.type == 'token_count'
                 elif rec_type == "event_msg" and payload.get("type") == "token_count":
@@ -375,7 +414,6 @@ def _parse_rollout_file_uncached(
                                 trustworthy=event_delta == _normalize_usage(last_u),
                             )
                             event_msg_events.append(usage_event)
-                        last_cumulative = normalized_total
                     else:
                         usage_event = _build_usage_event(ts, last_u)
                         if usage_event:
@@ -387,30 +425,33 @@ def _parse_rollout_file_uncached(
     if reject_malformed_tail and malformed_record_seen:
         read_succeeded = False
 
-    if last_cumulative:
-        input_tokens = last_cumulative["input_tokens"]
-        cached_input_tokens = last_cumulative["cached_input_tokens"]
-        output_tokens = last_cumulative["output_tokens"]
-        reasoning_output_tokens = last_cumulative["reasoning_output_tokens"]
-        cache_write_tokens = last_cumulative["cache_write_input_tokens"]
-        total_tokens = last_cumulative["total_tokens"]
-    else:
-        usage_events_for_totals = token_record_events or event_msg_fallback_events
-        input_tokens = sum(event["input_tokens"] for event in usage_events_for_totals)
-        cached_input_tokens = sum(event["cached_input_tokens"] for event in usage_events_for_totals)
-        output_tokens = sum(event["output_tokens"] for event in usage_events_for_totals)
-        reasoning_output_tokens = sum(event["reasoning_output_tokens"] for event in usage_events_for_totals)
-        cache_write_tokens = sum(event["cache_write_input_tokens"] for event in usage_events_for_totals)
-        total_tokens = sum(event["total_tokens"] for event in usage_events_for_totals)
+    if not has_thread_total:
+        modern_total = {
+            field: unscoped_total[field] + sum(turn[field] for turn in turn_totals.values())
+            for field in _USAGE_FIELDS
+        }
+    # These streams overlap: never add their totals. A legacy status can omit
+    # responses already present in the modern stream, even when emitted later.
+    # Cumulative counters may fill gaps, but cannot erase observed responses.
+    target_totals = {
+        field: max(modern_total[field], (previous_event_msg_cumulative or {}).get(field, 0))
+        for field in _USAGE_FIELDS
+    }
+    if has_inherited_history and token_record_events:
+        target_totals = _event_totals(token_record_events)
+    if not any(target_totals.values()):
+        target_totals = _event_totals(event_msg_fallback_events)
+    input_tokens = target_totals["input_tokens"]
+    cached_input_tokens = target_totals["cached_input_tokens"]
+    output_tokens = target_totals["output_tokens"]
+    reasoning_output_tokens = target_totals["reasoning_output_tokens"]
+    cache_write_tokens = target_totals["cache_write_input_tokens"]
+    total_tokens = target_totals["total_tokens"]
 
     # A rollout may contain both a token_usage_record and a token_count status
     # message for the same call. Prefer whichever event stream matches the
     # authoritative session total, then reconcile a partially-written stream.
-    target_totals = {
-        field: _as_int(value)
-        for field, value in last_cumulative.items()
-    } if last_cumulative else None
-    if target_totals:
+    if any(target_totals.values()):
         token_totals = _event_totals(token_record_events)
         message_totals = _event_totals(event_msg_events)
         if token_record_events and token_totals == target_totals:
@@ -418,7 +459,9 @@ def _parse_rollout_file_uncached(
         elif event_msg_events and message_totals == target_totals:
             usage_events = event_msg_events
         else:
-            usage_events = event_msg_events or token_record_events or event_msg_fallback_events
+            # Preserve response identities when neither partial stream covers
+            # the target; a shorter legacy stream must not collapse responses.
+            usage_events = token_record_events or event_msg_events or event_msg_fallback_events
             usage_events = _reconcile_usage_events(usage_events, target_totals)
     else:
         usage_events = token_record_events or event_msg_fallback_events

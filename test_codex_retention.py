@@ -621,6 +621,10 @@ def test_independent_verification_keeps_ambiguous_usage(tmp_path: Path, variant:
         "unreconciled": [_raw_token("one", thread_token_usage=doubled)],
     }
     root, db, path, now = _capture_raw_records(tmp_path, variants[variant])
+    if variant in {"stale_thread", "unscoped_turn"}:
+        # Both identities represent real usage, even though the scoped
+        # counters are incomplete. Retention must still reject that ambiguity.
+        assert read_usage_sessions("codex", db_path=db)[0].usage.total_tokens == 28
     plan = build_retention_plan(now=now, codex_dir=root, db_path=db)
     assert plan.trees == []
     assert plan.skipped["usage_ambiguous"] >= 1
@@ -678,6 +682,36 @@ def test_apply_requires_backup_before_first_delete(tmp_path: Path) -> None:
     assert apply_retention_plan(plan, codex_dir=root, db_path=db, process_check=lambda: [], run=run,
                                 codex_executable="codex", expected_codex_version=SAFE_CODEX_VERSION,
                                 now=lambda: now) == (1, [])
+
+
+@pytest.mark.parametrize("scope", ["thread", "turn"])
+def test_independent_verification_distinguishes_valid_scoped_totals(tmp_path: Path, scope: str) -> None:
+    usage = _raw_token("one")["payload"]["usage"]
+    doubled = {name: value * 2 for name, value in usage.items()}
+    if scope == "thread":
+        records = [_raw_token("one", thread_token_usage=usage), _raw_token("two", thread_token_usage=doubled)]
+    else:
+        records = [_raw_token("one", turn_id="turn-one", turn_token_usage=usage),
+                   _raw_token("two", turn_id="turn-two", turn_token_usage=usage)]
+    root, db, path, now = _capture_raw_records(tmp_path, records)
+    assert codex_retention._independent_rollout_usage(path, _ROOT_ID)["total_tokens"] == 28
+    captured = read_usage_sessions("codex", db_path=db)[0]
+    assert captured.usage.total_tokens == 28
+    plan = build_retention_plan(now=now, codex_dir=root, db_path=db)
+    assert len(plan.trees) == 1
+
+    # Deliberately persist only the first response under the same source
+    # revision. Independent verification must catch an under-captured DB for
+    # either scope, without relying on a bug in the production parser.
+    captured.events = captured.events[:1]
+    captured.usage = captured.events[0].usage
+    captured.call_count = 1
+    assert write_usage_sessions("codex", [captured], db_path=db) == 1
+    assert read_usage_sessions("codex", db_path=db)[0].usage.total_tokens == 14
+    plan = build_retention_plan(now=now, codex_dir=root, db_path=db)
+    assert plan.trees == []
+    assert plan.skipped["sqlite_usage_below_rollout_totals"] == 1
+    assert path.exists()
 
 
 @pytest.mark.parametrize("variant", ["valid", "decrease", "mismatch", "dual_mismatch", "conflicting_id"])

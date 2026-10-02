@@ -326,6 +326,223 @@ def test_single_transcript_capture_uses_only_that_file_and_observed_child_model(
     assert "rollout_path" not in captured.metadata
 
 
+def _codex_counters(input_tokens: int, cached: int, output: int, reasoning: int = 0) -> dict:
+    return {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached,
+        "output_tokens": output,
+        "reasoning_output_tokens": reasoning,
+        "cache_write_input_tokens": 0,
+        "total_tokens": input_tokens + output,
+    }
+
+
+def _codex_token_record(response_id: str, usage: dict, **scope) -> dict:
+    return {
+        "timestamp": _TIME,
+        "type": "token_usage_record",
+        "payload": {"response_id": response_id, "usage": usage, **scope},
+    }
+
+
+def _codex_status_record(last: dict, total: dict) -> dict:
+    return {
+        "timestamp": _TIME,
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {"last_token_usage": last, "total_token_usage": total},
+        },
+    }
+
+
+def _capture_codex_records(tmp_path: Path, records: list[dict]) -> UsageSession:
+    root = tmp_path / "codex"
+    transcript = _write_rollout(root, "minimised", 100)
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in [
+            {"timestamp": _TIME, "type": "session_meta", "payload": {"model": _MODEL}},
+            *records,
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    captured = extract_codex_session_for_capture(transcript, "minimised", codex_dir=root)
+    assert captured is not None
+    for field in (
+        "input_tokens", "cached_input_tokens", "output_tokens",
+        "reasoning_output_tokens", "cache_write_tokens", "total_tokens",
+    ):
+        assert getattr(captured.usage, field) == sum(
+            getattr(event.usage, field) for event in captured.events
+        )
+    return captured
+
+
+@pytest.mark.parametrize("omitted", [
+    # Actual omitted responses from 01a08499, 01a084f8, and 01a08537;
+    # preceding history is reduced to one response, with payload text removed.
+    _codex_counters(219376, 213120, 3550),
+    _codex_counters(246378, 233216, 6660),
+    _codex_counters(245892, 240384, 7623),
+])
+def test_codex_capture_legacy_status_cannot_erase_modern_response(tmp_path: Path, omitted: dict) -> None:
+    first = _codex_counters(100, 20, 10, 2)
+    final = _codex_counters(50, 10, 5, 1)
+    cumulative = {field: first[field] + omitted[field] for field in first}
+    final_cumulative = {field: cumulative[field] + final[field] for field in first}
+    legacy_final = {field: first[field] + final[field] for field in first}
+    # Codex re-emits an unchanged legacy cumulative counter with zeroed
+    # component usage (and sometimes a nonzero last total) after the response.
+    zeroed = {field: 0 for field in first}
+    zeroed["total_tokens"] = 13918
+    missing = _codex_token_record(
+        "omitted", omitted, turn_id="turn", thread_token_usage=cumulative, turn_token_usage=cumulative,
+    )
+    captured = _capture_codex_records(tmp_path, [
+        _codex_token_record("first", first, turn_id="turn", thread_token_usage=first, turn_token_usage=first),
+        _codex_status_record(first, first),
+        missing,
+        _codex_status_record(zeroed, first),
+        missing,  # Replayed identity must still count only once.
+        _codex_token_record("final", final, turn_id="turn", thread_token_usage=final_cumulative),
+        _codex_status_record(final, legacy_final),
+    ])
+    assert captured.usage.total_tokens == final_cumulative["total_tokens"]
+    assert captured.usage.cached_input_tokens == final_cumulative["cached_input_tokens"]
+    assert captured.usage.reasoning_output_tokens == final_cumulative["reasoning_output_tokens"]
+    assert captured.call_count == 3
+    assert [event.event_id for event in captured.events] == ["first", "omitted", "final"]
+    assert [event.usage.total_tokens for event in captured.events] == [
+        first["total_tokens"], omitted["total_tokens"], final["total_tokens"],
+    ]
+
+
+@pytest.mark.parametrize("scope", [
+    "thread_first_only", "thread_last_only", "unscoped_turn", "explicit_turns", "context_turns", "both_scopes",
+])
+def test_codex_capture_distinct_responses_survive_sparse_and_turn_totals(tmp_path: Path, scope: str) -> None:
+    # Minimise the real two-stream records to two identical usages with
+    # distinct identities, retaining or removing scoped cumulative fields.
+    usage = _codex_counters(100, 20, 10, 2)
+    doubled = {field: value * 2 for field, value in usage.items()}
+    first = _codex_token_record("one", usage)
+    second = _codex_token_record("two", usage)
+    records = [first, first, second, second]
+    if scope == "thread_first_only":
+        first["payload"]["thread_token_usage"] = usage
+    elif scope == "thread_last_only":
+        second["payload"]["thread_token_usage"] = doubled
+    else:
+        first["payload"]["turn_token_usage"] = usage
+        second["payload"]["turn_token_usage"] = usage
+        if scope in ("explicit_turns", "both_scopes"):
+            first["payload"]["turn_id"] = "turn-one"
+            second["payload"]["turn_id"] = "turn-two"
+        if scope == "context_turns":
+            records = [
+                {"type": "turn_context", "payload": {"turn_id": "turn-one"}}, first, first,
+                {"type": "turn_context", "payload": {"turn_id": "turn-two"}}, second, second,
+            ]
+        if scope == "both_scopes":
+            first["payload"]["thread_token_usage"] = usage
+            second["payload"]["thread_token_usage"] = doubled
+    captured = _capture_codex_records(tmp_path, records)
+    assert captured.usage.total_tokens == 220
+    assert captured.usage.cached_input_tokens == 40
+    assert captured.call_count == 2
+    assert [event.event_id for event in captured.events] == ["one", "two"]
+    assert [event.usage.total_tokens for event in captured.events] == [110, 110]
+
+
+@pytest.mark.parametrize("scope", ["thread_token_usage", "turn_token_usage", "legacy"])
+def test_codex_capture_cumulative_gaps_remain_available(tmp_path: Path, scope: str) -> None:
+    usage = _codex_counters(100, 20, 10, 2)
+    cumulative = {field: value * 2 for field, value in usage.items()}
+    if scope == "legacy":
+        records = [
+            _codex_token_record("one", usage),
+            _codex_status_record(usage, cumulative),
+        ]
+        expected = 220
+    else:
+        records = [
+            _codex_token_record("one", usage, turn_id="turn", **{scope: cumulative}),
+            _codex_status_record(usage, cumulative),
+            _codex_token_record("two", usage, turn_id="turn"),
+        ]
+        expected = 330
+    captured = _capture_codex_records(tmp_path, records)
+    assert captured.usage.total_tokens == expected
+    assert captured.usage.cached_input_tokens == expected // 110 * 20
+    assert all(event.metadata["tps_trustworthy"] is False for event in captured.events)
+    if scope != "legacy":
+        assert captured.call_count == 2
+        assert [event.event_id for event in captured.events] == ["one", "two"]
+
+
+@pytest.mark.parametrize("history", [
+    {"forked_from_id": "parent"},
+    {"history_base": {"thread_id": "minimised", "end_ordinal_exclusive": 227}},
+    {"history_base": {"thread_id": "previous-fragment", "end_ordinal_exclusive": 218}},
+])
+@pytest.mark.parametrize("legacy_inherits", [False, True])
+def test_codex_capture_excludes_inherited_counters(
+    tmp_path: Path, history: dict, legacy_inherits: bool,
+) -> None:
+    # Real fork 01a0aeab starts with 190208 local tokens but a 5420628
+    # cumulative total. Real paginated continuations also carry prior totals.
+    usage = _codex_counters(190000, 180000, 208)
+    inherited = _codex_counters(5000000, 4000000, 230420)
+    first_total = {field: usage[field] + inherited[field] for field in usage}
+    local_total = {field: value * 2 for field, value in usage.items()}
+    last_total = {field: local_total[field] + inherited[field] for field in usage}
+    first = _codex_token_record(
+        "one", usage, turn_id="turn", thread_token_usage=first_total, turn_token_usage=first_total,
+    )
+    captured = _capture_codex_records(tmp_path, [
+        {"type": "session_meta", "payload": history},
+        first,
+        _codex_status_record(usage, first_total if legacy_inherits else usage),
+        # A later metadata record must not erase the inherited-history marker.
+        {"type": "session_meta", "payload": {"id": "minimised"}},
+        first,
+        _codex_token_record("two", usage, turn_id="turn", thread_token_usage=last_total),
+        _codex_status_record(usage, last_total if legacy_inherits else local_total),
+    ])
+    assert captured.usage.total_tokens == local_total["total_tokens"]
+    assert captured.usage.input_tokens == local_total["input_tokens"]
+    assert captured.usage.cached_input_tokens == local_total["cached_input_tokens"]
+    assert captured.call_count == 2
+    assert [event.event_id for event in captured.events] == ["one", "two"]
+
+
+def test_codex_capture_merges_paginated_fragments_without_repeating_history(tmp_path: Path) -> None:
+    root = tmp_path / "codex"
+    thread_id = "33333333-3333-4333-8333-333333333333"
+    first = _write_rollout(root, thread_id, 110)
+    usage = _codex_counters(90, 0, 20)
+    continuation = first.with_name(first.stem + "_44444444-4444-4444-8444-444444444444.jsonl")
+    records = [{"type": "session_meta", "payload": {
+        "model": _MODEL, "history_base": {"thread_id": thread_id, "end_ordinal_exclusive": 227},
+    }}]
+    for ordinal in (2, 3):
+        record = _codex_token_record(
+            f"response-{ordinal}", usage,
+            thread_token_usage={field: value * ordinal for field, value in usage.items()},
+        )
+        record["timestamp"] = f"2026-09-30T10:0{ordinal}:00+00:00"
+        records.append(record)
+    continuation.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+    _write_threads_db(root, [(thread_id, str(continuation), 330)])
+    sessions = extract_all_codex_sessions_for_capture(root)
+    assert len(sessions) == 1
+    assert sessions[0].usage.total_tokens == 330
+    assert len(sessions[0].events) == 3
+    assert {event.event_id for event in sessions[0].events} == {
+        f"response-{thread_id}", "response-2", "response-3",
+    }
+
+
 def test_codex_capture_rejects_missing_zero_and_never_stable_files(
     tmp_path: Path,
     monkeypatch,
