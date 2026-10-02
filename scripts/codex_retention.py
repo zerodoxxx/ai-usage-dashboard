@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -28,7 +29,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.usage_store import is_provider_capture_enabled, read_usage_sessions, resolve_db_path
+from src.parsers.codex import extract_codex_session_for_capture
+from src.usage_store import LEGACY_DB_RELATIVE_PATH, read_usage_sessions, resolve_db_path
 
 DEFAULT_DAYS = 15
 SAFE_CODEX_VERSION = "0.159.2"
@@ -53,6 +55,91 @@ _CHILD_EDGE_COLUMNS = (
     "child_session_id",
     "spawned_thread_id",
 )
+_TOKEN_DIMENSIONS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "uncached_input_tokens",
+    "output_tokens",
+    "cache_write_tokens",
+    "cache_write_5m_tokens",
+    "cache_write_1h_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+
+
+class RetentionDatabaseError(RuntimeError):
+    """The configured shared database cannot safely support retention."""
+
+
+def _validated_database_snapshot(db_path: str | Path | None) -> tuple[Path, set[str]]:
+    """Resolve and inspect the active database without creating or migrating it."""
+    try:
+        path = Path(resolve_db_path(db_path)).expanduser().resolve(strict=False)
+        legacy_path = (Path.home() / LEGACY_DB_RELATIVE_PATH).resolve(strict=False)
+        if path == legacy_path:
+            raise RetentionDatabaseError("usage database resolves to the frozen legacy path")
+        try:
+            if path.exists() and legacy_path.exists() and os.path.samefile(path, legacy_path):
+                raise RetentionDatabaseError("usage database resolves to the frozen legacy path")
+        except OSError:
+            pass
+        if not path.is_file():
+            raise RetentionDatabaseError("shared usage database is missing or unreadable")
+
+        uri = f"file:{quote(str(path), safe='/')}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=2.0)
+        try:
+            connection.execute("PRAGMA query_only = ON")
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(sessions)")
+            }
+            if not {"session_id", "provider"}.issubset(columns):
+                raise RetentionDatabaseError("shared usage database has no provider-tagged Codex rows")
+            rows = connection.execute(
+                "SELECT session_id FROM sessions WHERE provider = 'codex'"
+            ).fetchall()
+        finally:
+            connection.close()
+        session_ids = {str(row[0]) for row in rows if row[0] is not None}
+        if not session_ids:
+            raise RetentionDatabaseError("shared usage database has no provider-tagged Codex rows")
+        return path, session_ids
+    except RetentionDatabaseError:
+        raise
+    except (OSError, sqlite3.Error, RuntimeError, ValueError, TypeError) as exc:
+        raise RetentionDatabaseError("shared usage database is missing or unreadable") from exc
+
+
+def _usage_covers(persisted: Any, rollout: Any) -> bool:
+    """Require each stored usage counter to cover the current rollout's count."""
+    def value(usage: Any, name: str) -> int:
+        if isinstance(usage, dict):
+            if name not in usage:
+                raise KeyError(name)
+            item = usage[name]
+        else:
+            if not hasattr(usage, name):
+                raise AttributeError(name)
+            item = getattr(usage, name)
+        if item is None or isinstance(item, bool):
+            raise ValueError(name)
+        return int(item)
+
+    try:
+        dimensions_are_covered = all(
+            value(persisted, name) >= value(rollout, name)
+            for name in _TOKEN_DIMENSIONS
+        )
+        if not dimensions_are_covered:
+            return False
+        # Codex and the shared schema store input inclusive of cache reads.
+        # Check the derived regular-input portion separately so cached counts
+        # cannot mask a shortfall in uncached input.
+        return value(persisted, "uncached_input_tokens") >= value(rollout, "uncached_input_tokens")
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+        return False
 
 
 @dataclass(frozen=True)
@@ -339,6 +426,20 @@ def _revision_matches(source: TranscriptSource, revision: dict[str, int]) -> boo
     )
 
 
+def _captured_source_matches(source: TranscriptSource, metadata: Any) -> bool:
+    if not isinstance(metadata, dict) or metadata.get("capture_source_hash") != source.source_hash:
+        return False
+    try:
+        revision = {
+            "capture_mtime_ns": int(metadata["capture_mtime_ns"]),
+            "capture_ctime_ns": int(metadata["capture_ctime_ns"]),
+            "capture_size": int(metadata["capture_size"]),
+        }
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    return _revision_matches(source, revision)
+
+
 def _session_activity(session: Any) -> datetime | None:
     values = (getattr(session, "activity_at", None), getattr(session, "end_time", None))
     parsed = [value for item in values if (value := _utc_datetime(item)) is not None]
@@ -359,18 +460,21 @@ def build_retention_plan(
     current_time = current_time.astimezone(timezone.utc)
     plan = RetentionPlan(cutoff=current_time - timedelta(days=days))
     try:
+        resolved_db_path, namespaced_session_ids = _validated_database_snapshot(db_path)
         codex_root = _safe_codex_root(codex_dir)
-        if not is_provider_capture_enabled("codex", db_path=db_path):
-            plan.skip("sqlite_capture_not_enabled")
-            return plan
         threads, edges = _state_snapshot(codex_root)
         if not threads:
             return plan
-        sessions = read_usage_sessions("codex", db_path=db_path)
+        sessions = read_usage_sessions("codex", db_path=resolved_db_path)
+        if not sessions:
+            raise RetentionDatabaseError("shared usage database Codex rows could not be read")
         sessions_by_id = {
             str(session.id).casefold(): session
             for session in sessions
             if str(session.provider or session.tool).casefold() == "codex"
+        }
+        namespaced_session_ids_casefolded = {
+            item.casefold() for item in namespaced_session_ids
         }
         files_by_thread, unsafe_ids = _discover_transcripts(codex_root)
 
@@ -413,7 +517,8 @@ def build_retention_plan(
             activity_values: list[datetime] = []
             state_activity_unknown = False
             capture_missing = False
-            source_mismatch = False
+            source_mismatch_count = 0
+            usage_mismatch_count = 0
             no_usage = False
             for thread_id in component:
                 thread = threads[thread_id]
@@ -431,7 +536,12 @@ def build_retention_plan(
                 activity_values.extend(parsed_thread_times)
 
                 session = sessions_by_id.get(thread_id)
-                if session is None:
+                stored_id = f"codex:{thread['id']}"
+                if (
+                    session is None
+                    or stored_id.casefold() not in namespaced_session_ids_casefolded
+                    or str(session.provider or "").casefold() != "codex"
+                ):
                     capture_missing = True
                     continue
                 if (
@@ -451,20 +561,47 @@ def build_retention_plan(
                     else:
                         current_sources = [*current_sources, pointed_source]
                 if thread_id in unsafe_ids:
-                    source_mismatch = True
+                    source_mismatch_count += 1
                 unique_sources = {str(source.path): source for source in current_sources}
                 if not unique_sources:
                     capture_missing = True
+                rollout_totals = {name: 0 for name in _TOKEN_DIMENSIONS}
+                parsed_source_count = 0
                 for source in unique_sources.values():
                     revision = manifest.get(source.source_hash)
                     if revision is None or not _revision_matches(source, revision):
-                        source_mismatch = True
-                    else:
-                        sources[str(source.path)] = source
+                        source_mismatch_count += 1
+                        continue
+                    parser_logger = logging.getLogger("src.parsers.codex")
+                    parser_was_disabled = parser_logger.disabled
+                    parser_logger.disabled = True
+                    try:
+                        rollout_session = extract_codex_session_for_capture(
+                            source.path,
+                            str(thread["id"]),
+                            codex_dir=codex_root,
+                        )
+                    except Exception:
+                        rollout_session = None
+                    finally:
+                        parser_logger.disabled = parser_was_disabled
+                    if (
+                        rollout_session is None
+                        or str(rollout_session.id).casefold() != thread_id
+                        or not _captured_source_matches(source, rollout_session.metadata)
+                    ):
+                        source_mismatch_count += 1
+                        continue
+                    for name in _TOKEN_DIMENSIONS:
+                        rollout_totals[name] += int(getattr(rollout_session.usage, name, 0) or 0)
+                    parsed_source_count += 1
+                    sources[str(source.path)] = source
                     activity_values.append(datetime.fromtimestamp(
                         source.mtime_ns / 1_000_000_000,
                         tz=timezone.utc,
                     ))
+                if parsed_source_count and not _usage_covers(session.usage, rollout_totals):
+                    usage_mismatch_count += 1
                 session_time = _session_activity(session)
                 if session_time is not None:
                     activity_values.append(session_time)
@@ -472,8 +609,11 @@ def build_retention_plan(
             if state_activity_unknown:
                 plan.skip("thread_activity_unknown")
                 continue
-            if source_mismatch:
-                plan.skip("transcript_not_exactly_captured")
+            if source_mismatch_count:
+                plan.skip("transcript_not_exactly_captured", source_mismatch_count)
+                continue
+            if usage_mismatch_count:
+                plan.skip("sqlite_usage_below_rollout_totals", usage_mismatch_count)
                 continue
             if capture_missing:
                 plan.skip("sqlite_usage_missing")
@@ -494,6 +634,9 @@ def build_retention_plan(
                 sources=tuple(sorted(sources.values(), key=lambda source: str(source.path))),
                 latest_activity=latest_activity,
             ))
+    except RetentionDatabaseError as exc:
+        plan.trees.clear()
+        plan.error = str(exc)
     except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
         plan.trees.clear()
         plan.error = f"retention scan failed ({type(exc).__name__})"
@@ -585,6 +728,10 @@ def apply_retention_plan(
     """Delete eligible trees through Codex after closed-state and race checks."""
     if plan.error:
         return 0, [plan.error]
+    try:
+        _validated_database_snapshot(db_path)
+    except RetentionDatabaseError as exc:
+        return 0, [str(exc)]
     try:
         active = process_check()
     except RuntimeError as exc:
@@ -733,6 +880,20 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     active_count: int | None = None
     if args.apply:
+        try:
+            _validated_database_snapshot(args.db)
+        except RetentionDatabaseError as exc:
+            record = {"status": "safety_check_failed", "error": str(exc)}
+            print(
+                json.dumps(record, sort_keys=True) if args.json else str(exc),
+                file=sys.stderr,
+            )
+            if args.log_file:
+                try:
+                    _append_aggregate_log(args.log_file, record)
+                except OSError:
+                    pass
+            return 2
         try:
             active = find_active_codex_processes()
         except RuntimeError as exc:

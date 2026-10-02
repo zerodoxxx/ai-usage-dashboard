@@ -15,8 +15,10 @@ from scripts.install_codex_retention import (
     RETENTION_DAYS,
     RUN_INTERVAL_SECONDS,
     SAFE_CODEX_VERSION,
+    _database_path,
     install_codex_retention,
 )
+from src.usage_store import LEGACY_DB_RELATIVE_PATH
 
 
 def _fake_codex(path: Path, version: str = SAFE_CODEX_VERSION) -> Path:
@@ -92,6 +94,45 @@ def test_rejects_codex_version_without_writing_a_job(tmp_path: Path) -> None:
 
     assert not (launch_agents / LAUNCH_AGENT_FILENAME).exists()
     assert not (codex_home / "usage-retention").exists()
+
+
+def test_installer_resolves_default_shared_database_into_plist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_home = tmp_path / "user home"
+    user_home.mkdir()
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.delenv("AI_USAGE_DB_PATH", raising=False)
+    codex_home = tmp_path / "Codex Home"
+    codex_home.mkdir()
+    launch_agents = tmp_path / "Library" / "LaunchAgents"
+    launch_agents.mkdir(parents=True)
+    codex = _fake_codex(tmp_path / "codex")
+
+    installed = install_codex_retention(
+        codex_home=codex_home,
+        launch_agents_dir=launch_agents,
+        codex_executable=codex,
+    )
+
+    expected = user_home / ".local" / "share" / "ai-usage" / "usage.db"
+    document = plistlib.loads(installed.launch_agent_path.read_bytes())
+    assert _database_path(None) == expected
+    assert document["ProgramArguments"][document["ProgramArguments"].index("--db") + 1] == str(expected)
+
+
+def test_installer_refuses_frozen_legacy_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_home = tmp_path / "user home"
+    user_home.mkdir()
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("AI_USAGE_DB_PATH", str(user_home / LEGACY_DB_RELATIVE_PATH))
+
+    with pytest.raises(InstallError, match="frozen legacy"):
+        _database_path(None)
 
 
 def test_refuses_to_replace_an_unrelated_existing_launch_agent(tmp_path: Path) -> None:

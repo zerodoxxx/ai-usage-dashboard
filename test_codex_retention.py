@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -19,7 +20,7 @@ from scripts.codex_retention import (
     find_active_codex_processes,
 )
 from src.parsers.contracts import TokenUsage, UsageEvent, UsageSession
-from src.usage_store import mark_provider_capture_enabled, read_usage_sessions, write_usage_sessions
+from src.usage_store import LEGACY_DB_RELATIVE_PATH, mark_provider_capture_enabled, read_usage_sessions, write_usage_sessions
 
 
 _ROOT_ID = "11111111-1111-4111-8111-111111111111"
@@ -56,6 +57,28 @@ def _state_db(path: Path, threads: list[tuple[str, str | None, str]], edges: lis
         connection.close()
 
 
+def _write_rollout(path: Path, thread_id: str, activity: datetime, ordinal: int) -> None:
+    usage = {
+        "input_tokens": 10,
+        "cached_input_tokens": 3,
+        "cache_write_input_tokens": 2,
+        "output_tokens": 4,
+        "reasoning_output_tokens": 1,
+        "total_tokens": 14,
+    }
+    record = {
+        "timestamp": activity.isoformat().replace("+00:00", "Z"),
+        "ordinal": ordinal,
+        "type": "token_usage_record",
+        "payload": {
+            "thread_id": thread_id,
+            "response_id": f"{thread_id}-{ordinal}",
+            "usage": usage,
+        },
+    }
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+
 def _make_capture(
     codex_root: Path,
     db_path: Path,
@@ -80,7 +103,7 @@ def _make_capture(
         for index in range(fragments):
             filename = f"rollout-2026-09-01-{thread_id}-{index}.jsonl"
             path = sessions_root / filename
-            path.write_text("synthetic transcript body not parsed by retention\n", encoding="utf-8")
+            _write_rollout(path, thread_id, activity, index + 1)
             old_ns = int((now - timedelta(days=20)).timestamp() * 1_000_000_000)
             os.utime(path, ns=(old_ns, old_ns))
             paths.append(path)
@@ -96,7 +119,15 @@ def _make_capture(
                 "capture_ctime_ns": stat.st_ctime_ns,
                 "capture_size": stat.st_size,
             }
-        usage = TokenUsage(input_tokens=10, output_tokens=4, total_tokens=14, preserve_total=True)
+        usage = TokenUsage(
+            input_tokens=10 * fragments,
+            cached_input_tokens=3 * fragments,
+            output_tokens=4 * fragments,
+            reasoning_output_tokens=1 * fragments,
+            cache_write_tokens=2 * fragments,
+            total_tokens=14 * fragments,
+            preserve_total=True,
+        )
         events = [UsageEvent(
             timestamp=activity,
             usage=usage,
@@ -181,7 +212,7 @@ def test_changed_transcript_revision_is_not_eligible(tmp_path: Path) -> None:
     assert plan.skipped["transcript_not_exactly_captured"] == 1
 
 
-def test_disabled_capture_does_not_qualify_transcripts(tmp_path: Path) -> None:
+def test_provider_wide_capture_flag_does_not_replace_per_file_verification(tmp_path: Path) -> None:
     now = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
     codex_root = tmp_path / "codex"
     codex_root.mkdir()
@@ -196,8 +227,178 @@ def test_disabled_capture_does_not_qualify_transcripts(tmp_path: Path) -> None:
 
     plan = build_retention_plan(days=15, now=now, codex_dir=codex_root, db_path=db_path)
 
+    assert len(plan.trees) == 1
+
+
+def test_missing_session_row_keeps_the_whole_tree(tmp_path: Path) -> None:
+    now = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    codex_root = tmp_path / "codex"
+    codex_root.mkdir()
+    db_path = tmp_path / "usage.db"
+    _make_capture(codex_root, db_path, now=now)
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "DELETE FROM sessions WHERE provider='codex' AND session_id=?",
+            (f"codex:{_CHILD_ID}",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    plan = build_retention_plan(days=15, now=now, codex_dir=codex_root, db_path=db_path)
+
     assert plan.trees == []
-    assert plan.skipped["sqlite_capture_not_enabled"] == 1
+    assert plan.skipped["sqlite_usage_missing"] == 1
+
+
+def test_sqlite_total_below_combined_fragments_keeps_the_tree(tmp_path: Path) -> None:
+    now = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    codex_root = tmp_path / "codex"
+    codex_root.mkdir()
+    db_path = tmp_path / "usage.db"
+    _make_capture(codex_root, db_path, now=now, capture_child=False, root_fragments=2)
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            """UPDATE sessions
+               SET input_tokens=10, cached_input_tokens=3, output_tokens=4,
+                   cache_write_tokens=2, reasoning_output_tokens=1, total_tokens=14
+               WHERE provider='codex' AND session_id=?""",
+            (f"codex:{_ROOT_ID}",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    plan = build_retention_plan(days=15, now=now, codex_dir=codex_root, db_path=db_path)
+
+    assert plan.trees == []
+    assert plan.skipped["sqlite_usage_below_rollout_totals"] == 1
+
+
+def test_cached_input_cannot_mask_a_shortfall_in_uncached_input(tmp_path: Path) -> None:
+    now = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    codex_root = tmp_path / "codex"
+    codex_root.mkdir()
+    db_path = tmp_path / "usage.db"
+    _make_capture(codex_root, db_path, now=now, capture_child=False, root_fragments=1)
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            """UPDATE sessions SET cached_input_tokens=9
+               WHERE provider='codex' AND session_id=?""",
+            (f"codex:{_ROOT_ID}",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    plan = build_retention_plan(days=15, now=now, codex_dir=codex_root, db_path=db_path)
+
+    assert plan.trees == []
+    assert plan.skipped["sqlite_usage_below_rollout_totals"] == 1
+
+
+def test_missing_shared_database_refuses_apply_before_process_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "missing" / "usage.db"
+    codex_root = tmp_path / "codex"
+    codex_root.mkdir()
+    seed_db = tmp_path / "seed.db"
+    paths, _ = _make_capture(
+        codex_root,
+        seed_db,
+        now=datetime(2026, 10, 2, 12, tzinfo=timezone.utc),
+    )
+    monkeypatch.setenv("AI_USAGE_DB_PATH", str(db_path))
+    plan = build_retention_plan(codex_dir=codex_root)
+    assert plan.trees == []
+    assert plan.error == "shared usage database is missing or unreadable"
+
+    checked = False
+
+    def process_check() -> list[str]:
+        nonlocal checked
+        checked = True
+        return []
+
+    deleted, errors = apply_retention_plan(
+        plan,
+        process_check=process_check,
+        codex_executable="/usr/bin/codex",
+        expected_codex_version=SAFE_CODEX_VERSION,
+    )
+
+    assert deleted == 0
+    assert errors == ["shared usage database is missing or unreadable"]
+    assert not checked
+    assert not db_path.exists()
+    assert all(path.is_file() for path in paths)
+
+    monkeypatch.setattr(codex_retention, "find_active_codex_processes", process_check)
+    exit_code = codex_retention.main(["--apply", "--codex-dir", str(codex_root)])
+    assert exit_code == 2
+    assert not checked
+    assert all(path.is_file() for path in paths)
+
+
+def test_legacy_database_path_is_refused_via_environment_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del tmp_path
+    legacy_path = Path.home() / LEGACY_DB_RELATIVE_PATH
+    monkeypatch.setenv("AI_USAGE_DB_PATH", str(legacy_path))
+
+    plan = build_retention_plan(codex_dir=Path.home() / ".codex")
+
+    assert plan.trees == []
+    assert plan.error == "usage database resolves to the frozen legacy path"
+    exit_code = codex_retention.main(["--apply", "--codex-dir", str(Path.home() / ".codex")])
+    assert exit_code == 2
+    assert not legacy_path.exists()
+
+
+def test_legacy_database_symlink_alias_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy_path = Path.home() / LEGACY_DB_RELATIVE_PATH
+    alias = tmp_path / "usage-db-alias"
+    alias.symlink_to(legacy_path)
+    monkeypatch.setenv("AI_USAGE_DB_PATH", str(alias))
+
+    plan = build_retention_plan(codex_dir=Path.home() / ".codex")
+
+    assert plan.trees == []
+    assert plan.error == "usage database resolves to the frozen legacy path"
+
+
+def test_database_without_codex_rows_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "usage.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, provider TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO sessions (session_id, provider) VALUES ('agy:one', 'antigravity')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    monkeypatch.setenv("AI_USAGE_DB_PATH", str(db_path))
+
+    plan = build_retention_plan(codex_dir=Path.home() / ".codex")
+
+    assert plan.trees == []
+    assert plan.error == "shared usage database has no provider-tagged Codex rows"
 
 
 def test_apply_refuses_while_codex_is_running(tmp_path: Path) -> None:
@@ -227,13 +428,17 @@ def test_apply_refuses_while_codex_is_running(tmp_path: Path) -> None:
     assert all(path.is_file() for path in paths)
 
 
-def test_apply_uses_codex_delete_and_keeps_sqlite_usage(tmp_path: Path) -> None:
+def test_apply_uses_codex_delete_and_keeps_sqlite_usage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     now = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
     codex_root = tmp_path / "codex"
     codex_root.mkdir()
     db_path = tmp_path / "usage.db"
+    monkeypatch.setenv("AI_USAGE_DB_PATH", str(db_path))
     paths, _ = _make_capture(codex_root, db_path, now=now)
-    plan = build_retention_plan(days=15, now=now, codex_dir=codex_root, db_path=db_path)
+    plan = build_retention_plan(days=15, now=now, codex_dir=codex_root)
     calls: list[list[str]] = []
     process_checks = 0
 
@@ -254,7 +459,6 @@ def test_apply_uses_codex_delete_and_keeps_sqlite_usage(tmp_path: Path) -> None:
         plan,
         days=15,
         codex_dir=codex_root,
-        db_path=db_path,
         process_check=check_closed,
         run=delete_with_codex,
         codex_executable="/usr/bin/codex",
@@ -311,7 +515,7 @@ def test_symlink_rollout_is_never_followed_or_eligible(tmp_path: Path) -> None:
     db_path = tmp_path / "usage.db"
     paths, _ = _make_capture(codex_root, db_path, now=now)
     source = paths[0]
-    payload = source.read_text(encoding="utf-8")
+    target_payload = paths[1].read_text(encoding="utf-8")
     source.unlink()
     source.symlink_to(paths[1])
 
@@ -319,7 +523,7 @@ def test_symlink_rollout_is_never_followed_or_eligible(tmp_path: Path) -> None:
 
     assert plan.trees == []
     assert plan.skipped["transcript_not_exactly_captured"] == 1
-    assert paths[1].read_text(encoding="utf-8") == payload
+    assert paths[1].read_text(encoding="utf-8") == target_payload
 
 
 def test_symlinked_transcript_directory_fails_closed_for_the_plan(tmp_path: Path) -> None:

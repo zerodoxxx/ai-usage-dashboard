@@ -25,9 +25,13 @@ from typing import Any
 import uuid
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from src.usage_store import LEGACY_DB_RELATIVE_PATH, resolve_db_path
+
 RETENTION_RELATIVE_PATH = Path("scripts/codex_retention.py")
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
-DEFAULT_DATABASE_PATH = Path.home() / ".gemini/antigravity-cli/token_usage.db"
 LAUNCH_AGENT_LABEL = "com.zerodoxxx.ai-usage-dashboard.codex-retention"
 LAUNCH_AGENT_FILENAME = f"{LAUNCH_AGENT_LABEL}.plist"
 RETENTION_DAYS = 15
@@ -58,10 +62,16 @@ class InstallError(RuntimeError):
 
 
 def _database_path(configured: str | Path | None) -> Path:
-    if configured is not None:
-        return Path(configured).expanduser().absolute()
-    override = os.environ.get("AI_USAGE_DB_PATH")
-    return Path(override).expanduser().absolute() if override else DEFAULT_DATABASE_PATH
+    resolved = Path(resolve_db_path(configured)).expanduser().resolve(strict=False)
+    legacy = (Path.home() / LEGACY_DB_RELATIVE_PATH).resolve(strict=False)
+    if resolved == legacy:
+        raise InstallError("The frozen legacy usage database cannot be used for retention")
+    try:
+        if resolved.exists() and legacy.exists() and os.path.samefile(resolved, legacy):
+            raise InstallError("The frozen legacy usage database cannot be used for retention")
+    except OSError:
+        pass
+    return resolved
 
 
 def _validate_python(interpreter: str | Path) -> Path:
