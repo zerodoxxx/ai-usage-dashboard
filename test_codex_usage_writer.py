@@ -221,3 +221,67 @@ def test_status_output_has_only_aggregate_data(tmp_path: Path, monkeypatch) -> N
     assert status["providers"]["codex"]["events"] == 1
     assert "private-thread-id" not in stdout.getvalue()
     assert "usage test" not in stdout.getvalue()
+
+
+def test_cli_stop_with_real_codex_payload_shape_writes_row(tmp_path: Path) -> None:
+    """Regression: the exact Stop payload Codex 0.159 sends, over a real pipe.
+
+    The writer is run as the hook runs it (subprocess, JSON on stdin, cwd
+    elsewhere, stdout/stderr piped) against a rollout shaped like a real
+    ``codex exec`` transcript, and must persist the row.
+    """
+    import subprocess
+    import sys
+
+    thread = "01a0fcd9-a16d-7db2-88f0-b31464da79ff"
+    turn = "01a0fcd9-a216-7331-8ab6-dc9254da1560"
+    usage = {
+        "input_tokens": 22276, "cached_input_tokens": 0, "cache_write_input_tokens": 0,
+        "output_tokens": 5, "reasoning_output_tokens": 0, "total_tokens": 22281,
+    }
+    lines = [
+        {"timestamp": "2026-10-02T13:41:57.180Z", "ordinal": 0, "type": "session_meta",
+         "payload": {"id": thread, "session_id": thread, "timestamp": "2026-10-02T13:41:57.100Z",
+                     "cwd": "/private/tmp", "originator": "codex_exec", "source": "exec"}},
+        {"timestamp": "2026-10-02T13:41:57.181Z", "ordinal": 1, "type": "turn_context",
+         "payload": {"turn_id": turn, "model": "gpt-6.1-sol"}},
+        {"timestamp": "2026-10-02T13:42:05.589Z", "ordinal": 2, "type": "token_usage_record",
+         "payload": {"thread_id": thread, "turn_id": turn, "session_id": thread,
+                     "response_id": "resp_1", "usage": usage}},
+        {"timestamp": "2026-10-02T13:42:05.590Z", "ordinal": 3, "type": "event_msg",
+         "payload": {"type": "token_count",
+                     "info": {"total_token_usage": usage, "last_token_usage": usage}}},
+        {"timestamp": "2026-10-02T13:42:05.654Z", "ordinal": 4, "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": turn, "last_agent_message": "ok"}},
+    ]
+    rollout = tmp_path / f"rollout-2026-10-02T19-11-57-{thread}.jsonl"
+    rollout.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    payload = {
+        "hook_event_name": "Stop",
+        "session_id": thread,
+        "turn_id": turn,
+        "transcript_path": str(rollout),
+        "cwd": "/private/tmp",
+        "model": "gpt-6.1-sol",
+        "permission_mode": "default",
+        "stop_hook_active": False,
+        "last_assistant_message": "ok",
+    }
+    db_path = tmp_path / "usage.db"
+    script = Path(writer.__file__).resolve()
+    result = subprocess.run(
+        [sys.executable, str(script), "--db", str(db_path), "--codex-dir", str(tmp_path / "home")],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {}
+    assert "captured (22281 tokens)" in result.stderr
+    loaded = read_usage_sessions("codex", db_path)
+    assert [s.id for s in loaded] == [thread]
+    assert loaded[0].usage.total_tokens == 22281

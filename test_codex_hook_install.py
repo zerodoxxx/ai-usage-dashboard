@@ -170,7 +170,9 @@ def test_installs_frozen_payload_merges_existing_hooks_and_quotes_paths(
             if event == "Interrupt"
             else installer.HOOK_TIMEOUT_SECONDS
         )
-        assert publisher_hook["async"] is True
+        # Regression: Codex kills async hook children before they finish, so the
+        # live publisher must be a synchronous hook.
+        assert publisher_hook["async"] is False
 
     # --help imports the deployed src package from the frozen sibling tree.
     validated = subprocess.run(

@@ -262,7 +262,11 @@ def _handler_for(command: str, event: str) -> dict[str, Any]:
         "timeout": (
             INTERRUPT_TIMEOUT_SECONDS if event == "Interrupt" else HOOK_TIMEOUT_SECONDS
         ),
-        "async": True,
+        # Codex (verified on 0.159) reports an async hook "completed" ~20ms after
+        # spawning it and the child is gone before it can finish, so an async
+        # publisher never writes. Run synchronously; the writer takes ~0.2s,
+        # always exits 0 and prints "{}".
+        "async": False,
     }
 
 
