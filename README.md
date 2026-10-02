@@ -51,14 +51,21 @@ AI_USAGE_TIMEZONE=America/New_York python run.py
 
 | Tool | Where Data Comes From |
 |:-----|:---------------------|
-| **Codex** | Shared `token_usage.db` after backfill and trusted hooks; `~/.codex/state_5.sqlite` and rollout logs supply metadata and fallback usage before capture is enabled |
-| **Claude Code** | `~/.claude/projects/**/*.jsonl` assistant usage records |
-| **AGY** | `~/.gemini/antigravity-cli/token_usage.db` + transcripts and `conversation_summaries.db` |
+| **Codex** | Shared `usage.db` (`provider = codex`), filled by Codex hooks and a one-time backfill |
+| **Claude Code** | Shared `usage.db` (`provider = claude-code`), filled by a Claude Code writer and backfill |
+| **AGY** | Shared `usage.db` (`provider = antigravity`), filled by the Antigravity CLI |
+
+The dashboard reads **only** this SQLite database at request time. It never
+parses `~/.claude`, `~/.codex` or Antigravity transcripts and logs; those are
+parsed by the writers and backfills, which import the parsers in
+`src/parsers/`. A provider with no rows shows as empty, not as an error.
 
 The shared database has separate provider and model columns, and namespaced
 session IDs, so Codex records do not mix with Antigravity records. Its default
-path is the existing Antigravity database; set `AI_USAGE_DB_PATH` to override
-it. Claude Code can write to the same store through the shared provider API
+path is `~/.local/share/ai-usage/usage.db`; set `AI_USAGE_DB_PATH` to override
+it. To move an existing database from the old Antigravity location
+(`~/.gemini/antigravity-cli/token_usage.db`), run `python scripts/migrate_usage_db.py`.
+Antigravity's `track_usage.py` honors `AI_USAGE_DB_PATH` and defaults to the new path. Claude Code can write to the same store through the shared provider API
 once its writer is configured. See [the shared usage database guide](docs/SHARED_USAGE_DB.md)
 for Codex setup, backfill, and the writer contract.
 
@@ -87,9 +94,10 @@ src/
 ├── app.py             # FastAPI server
 ├── pricing.py         # Provider-aware pricing catalog
 ├── parsers/
-│   ├── codex.py       # Codex shared-store reader with rollout-log fallback
-│   ├── claude.py      # Claude Code session JSONL parser
-│   ├── agy.py         # AGY transcript + DB parser
+│   ├── store_source.py # Dashboard read path: sessions from the shared SQLite store
+│   ├── codex.py       # Codex rollout parser (used by writers/backfill)
+│   ├── claude.py      # Claude Code JSONL parser (used by writers/backfill)
+│   ├── agy.py         # AGY transcript parser (used by writers/backfill)
 │   ├── contracts.py   # Normalized usage contracts
 │   ├── source_registry.py # Provider adapter registry
 │   └── aggregator.py  # Registration-driven aggregator

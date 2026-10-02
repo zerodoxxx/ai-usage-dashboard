@@ -1,6 +1,6 @@
 """Shared, provider-aware SQLite store for normalized token usage.
 
-The store extends Antigravity's existing ``token_usage.db`` in place. It keeps
+The store lives in a tool-neutral SQLite file (``~/.local/share/ai-usage/usage.db``). It keeps
 only normalized usage records and dashboard metadata; transcript bodies are
 never stored here. Provider IDs are namespaced in SQLite so two tools can use
 the same native session ID without colliding.
@@ -23,7 +23,9 @@ from urllib.parse import quote
 from src.parsers.contracts import CostEstimate, TokenUsage, UsageEvent, UsageSession
 
 DB_PATH_ENV_VAR = "AI_USAGE_DB_PATH"
-DEFAULT_DB_RELATIVE_PATH = Path(".gemini") / "antigravity-cli" / "token_usage.db"
+DEFAULT_DB_RELATIVE_PATH = Path(".local") / "share" / "ai-usage" / "usage.db"
+# Pre-migration location, kept only so scripts/migrate_usage_db.py can find it.
+LEGACY_DB_RELATIVE_PATH = Path(".gemini") / "antigravity-cli" / "token_usage.db"
 SCHEMA_VERSION = 1
 _BUSY_TIMEOUT_MS = 2000
 _WRITE_ATTEMPTS = 3
@@ -90,7 +92,7 @@ _EVENT_METADATA_KEYS = frozenset({
 
 
 def resolve_db_path(db_path: str | Path | None = None) -> Path:
-    """Resolve an explicit path, environment override, or the shared AGY DB."""
+    """Resolve an explicit path, or environment override, else the shared default path."""
     if db_path is not None:
         return Path(db_path).expanduser()
     override = os.environ.get(DB_PATH_ENV_VAR)
@@ -415,6 +417,32 @@ def _cost_from_row(row: sqlite3.Row, prefix: str = "") -> CostEstimate | None:
     )
 
 
+def _usage_from_row_fields(row: sqlite3.Row, keys: set[str]) -> dict[str, int]:
+    """Return token fields for a row, normalizing embedded cache writes.
+
+    Rows with ``cache_write_mode='embedded_in_input'`` (semantics version 1,
+    Antigravity) already include their cache-write count in ``input_tokens``
+    and ``total_tokens``; the count is diagnostic (an estimate of uncached
+    input), not a billable cache write. Readers therefore keep ``input_tokens``
+    and ``total_tokens`` as stored and zero the cache-write fields so the
+    contract never adds or prices them again. Additive rows pass through.
+    """
+    def value(name: str) -> int:
+        return row[name] if name in keys else 0
+
+    embedded = "cache_write_mode" in keys and row["cache_write_mode"] == "embedded_in_input"
+    return {
+        "input_tokens": value("input_tokens"),
+        "cached_input_tokens": value("cached_input_tokens"),
+        "output_tokens": value("output_tokens"),
+        "reasoning_output_tokens": value("reasoning_output_tokens"),
+        "total_tokens": value("total_tokens"),
+        "cache_write_tokens": 0 if embedded else value("cache_write_tokens"),
+        "cache_write_5m_tokens": 0 if embedded else value("cache_write_5m_tokens"),
+        "cache_write_1h_tokens": 0 if embedded else value("cache_write_1h_tokens"),
+    }
+
+
 def read_usage_sessions(
     provider: str,
     db_path: str | Path | None = None,
@@ -481,25 +509,7 @@ def read_usage_sessions(
             for event_row in events_by_session.get(stored_id, []):
                 keys = set(event_row.keys())
                 event_usage = TokenUsage(
-                    input_tokens=event_row["input_tokens"] if "input_tokens" in keys else 0,
-                    cached_input_tokens=event_row["cached_input_tokens"] if "cached_input_tokens" in keys else 0,
-                    output_tokens=event_row["output_tokens"] if "output_tokens" in keys else 0,
-                    reasoning_output_tokens=(
-                        event_row["reasoning_output_tokens"]
-                        if "reasoning_output_tokens" in keys else 0
-                    ),
-                    total_tokens=event_row["total_tokens"] if "total_tokens" in keys else 0,
-                    cache_write_tokens=(
-                        event_row["cache_write_tokens"] if "cache_write_tokens" in keys else 0
-                    ),
-                    cache_write_5m_tokens=(
-                        event_row["cache_write_5m_tokens"]
-                        if "cache_write_5m_tokens" in keys else 0
-                    ),
-                    cache_write_1h_tokens=(
-                        event_row["cache_write_1h_tokens"]
-                        if "cache_write_1h_tokens" in keys else 0
-                    ),
+                    **_usage_from_row_fields(event_row, keys),
                     preserve_total=True,
                 )
                 raw_events.append(UsageEvent(
@@ -516,25 +526,7 @@ def read_usage_sessions(
                 ))
 
             usage = TokenUsage(
-                input_tokens=row["input_tokens"] if "input_tokens" in row_keys else 0,
-                cached_input_tokens=row["cached_input_tokens"] if "cached_input_tokens" in row_keys else 0,
-                output_tokens=row["output_tokens"] if "output_tokens" in row_keys else 0,
-                reasoning_output_tokens=(
-                    row["reasoning_output_tokens"]
-                    if "reasoning_output_tokens" in row_keys else 0
-                ),
-                total_tokens=row["total_tokens"] if "total_tokens" in row_keys else 0,
-                cache_write_tokens=(
-                    row["cache_write_tokens"] if "cache_write_tokens" in row_keys else 0
-                ),
-                cache_write_5m_tokens=(
-                    row["cache_write_5m_tokens"]
-                    if "cache_write_5m_tokens" in row_keys else 0
-                ),
-                cache_write_1h_tokens=(
-                    row["cache_write_1h_tokens"]
-                    if "cache_write_1h_tokens" in row_keys else 0
-                ),
+                **_usage_from_row_fields(row, row_keys),
                 preserve_total=True,
             )
             sessions.append(UsageSession(
@@ -945,6 +937,8 @@ def _prepare_capture_session(session: UsageSession) -> UsageSession:
 
 
 def _usage_from_row(row: sqlite3.Row, keys: set[str]) -> TokenUsage:
+    # Write-side merge helper: keeps stored values verbatim (no read-side
+    # embedded-cache-write normalization).
     return TokenUsage(
         input_tokens=row["input_tokens"] if "input_tokens" in keys else 0,
         cached_input_tokens=row["cached_input_tokens"] if "cached_input_tokens" in keys else 0,
@@ -1392,6 +1386,7 @@ def find_event_owners(
 __all__ = [
     "DB_PATH_ENV_VAR",
     "DEFAULT_DB_RELATIVE_PATH",
+    "LEGACY_DB_RELATIVE_PATH",
     "ensure_schema",
     "find_event_owners",
     "get_usage_store_status",

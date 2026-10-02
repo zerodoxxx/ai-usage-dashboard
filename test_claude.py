@@ -5,6 +5,7 @@ from pathlib import Path
 
 from src.parsers.aggregator import get_tool_usage
 from src.parsers.claude import ClaudeCodeSource
+from tests_support import legacy_file_source_registry
 
 
 def _write_session(root: Path) -> Path:
@@ -98,6 +99,7 @@ def test_claude_source_flows_through_registered_aggregator(tmp_path: Path) -> No
     result = get_tool_usage(
         "cc",
         source_dirs={"claude-code": tmp_path / ".claude"},
+        registry=legacy_file_source_registry(),
     )
 
     assert result["tool"] == "claude-code"
@@ -185,7 +187,11 @@ def test_claude_5_5_session_extraction_and_reasoning_tokens(tmp_path: Path, monk
     assert s.events[1].cost is not None
 
     # Verify flow through aggregator and model breakdown
-    result = get_tool_usage("claude-code", claude_dir=tmp_path / "custom-claude")
+    result = get_tool_usage(
+        "claude-code",
+        claude_dir=tmp_path / "custom-claude",
+        registry=legacy_file_source_registry(),
+    )
     models = {m["canonical_model"]: m for m in result["models"]}
     assert "Claude Sonnet 5.5" in models
     assert "Claude Opus 5.5" in models
@@ -193,4 +199,3 @@ def test_claude_5_5_session_extraction_and_reasoning_tokens(tmp_path: Path, monk
     assert models["Claude Opus 5.5"]["pricing_status"] == "known"
     assert models["Claude Sonnet 5.5"]["reasoning_output"] == 120
     assert models["Claude Opus 5.5"]["reasoning_output"] == 250
-

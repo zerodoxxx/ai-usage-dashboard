@@ -200,3 +200,20 @@ def test_current_repository_payload_stages_cleanly(tmp_path: Path) -> None:
         claude_home=tmp_path / "home", python_interpreter=sys.executable, dry_run=True
     )
     assert result.settings is not None and set(result.settings["hooks"]) == set(installer.HOOK_EVENTS)
+
+
+def test_default_install_pins_tool_neutral_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.usage_store import DEFAULT_DB_RELATIVE_PATH
+
+    monkeypatch.delenv("AI_USAGE_DB_PATH", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    home = tmp_path / "Claude Home"
+    home.mkdir()
+    _install(tmp_path, _make_source_tree(tmp_path / "repo"), home)
+    document = json.loads((home / "settings.json").read_text(encoding="utf-8"))
+    expected = str((Path.home() / DEFAULT_DB_RELATIVE_PATH).resolve())
+    for event in installer.HOOK_EVENTS:
+        (handler,) = _ours(document, event)
+        assert expected in handler["command"]

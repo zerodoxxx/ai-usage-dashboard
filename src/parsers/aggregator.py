@@ -19,11 +19,9 @@ from ..pricing import (
     calculate_cost_strict,
 )
 from ..timezones import local_timezone, timezone_name
-from .agy import AntigravitySource
-from .claude import ClaudeCodeSource
-from .codex import CodexSource
 from .contracts import CostEstimate, TokenUsage, UsageEvent, UsageSession
 from .source_registry import SOURCE_REGISTRY, SourceRegistry, normalize_source_key
+from .store_source import antigravity_store_source, claude_store_source, codex_store_source
 
 _CANONICAL_MODELS: dict[str, str] = {k.lower(): k for k in MODEL_PRICING}
 _TIME_RANGES = {"all", "month", "30d", "7d", "24h", "custom"}
@@ -31,7 +29,9 @@ _WEEKDAY_LABELS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _PARSER_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="usage-parser")
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_SOURCE_REGISTRY = SOURCE_REGISTRY
-for _builtin_source in (CodexSource(), AntigravitySource(), ClaudeCodeSource()):
+# The dashboard reads only the shared SQLite usage store; it never parses
+# provider transcripts or logs. Writers import the parsers separately.
+for _builtin_source in (codex_store_source(), antigravity_store_source(), claude_store_source()):
     if DEFAULT_SOURCE_REGISTRY.lookup(_builtin_source.key) is None:
         DEFAULT_SOURCE_REGISTRY.register(_builtin_source)
 

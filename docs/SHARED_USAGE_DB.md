@@ -1,13 +1,40 @@
 # Shared usage database
 
-Codex, Claude Code, and Antigravity share Antigravity's existing SQLite
-database:
+Codex, Claude Code, and Antigravity share one tool-neutral SQLite database:
 
 ```text
-~/.gemini/antigravity-cli/token_usage.db
+~/.local/share/ai-usage/usage.db
 ```
 
-Set `AI_USAGE_DB_PATH` to override that path. Tests and custom Codex data roots
+Set `AI_USAGE_DB_PATH` to override that path. Writers create the parent
+directory if it is missing; the dashboard never creates the database or its
+directory, and a missing database simply shows as empty. There is no fallback
+to the old location. Antigravity's `track_usage.py` honors `AI_USAGE_DB_PATH`
+and defaults to the same new path.
+
+## Migrating from the old location
+
+Earlier versions stored the database at the Antigravity path
+`~/.gemini/antigravity-cli/token_usage.db`. Copy it once with:
+
+```bash
+python scripts/migrate_usage_db.py --dry-run   # preview per-provider counts
+python scripts/migrate_usage_db.py             # copy to the new default path
+```
+
+The script uses the SQLite backup API (so WAL contents are included), refuses
+to overwrite an existing target unless `--force` is given, verifies per-provider
+session and event counts, token sums and `PRAGMA integrity_check`, and leaves
+the old database untouched. `--source` and `--target` select other paths.
+After migrating, re-run the Codex and Claude Code hook installers so the pinned
+`--db` path is updated:
+
+```bash
+python scripts/install_codex_usage_hooks.py
+python scripts/install_claude_usage_hooks.py
+```
+
+Tests and custom Codex data roots
 should pass `db_path=` explicitly so they do not touch a user's live database.
 The database stores normalized token counts, timestamps, model IDs, cost
 provenance, dashboard timing metadata, and the session title/workspace fields
@@ -61,8 +88,9 @@ New Codex and Claude Code sessions use semantics version 2 and
 
 Existing Antigravity rows use semantics version 1 and
 `cache_write_mode='embedded_in_input'`. Antigravity's cache-write count is
-diagnostic and already included in its input and total, so readers must not add
-it again.
+diagnostic (an estimate of uncached input) and already included in its input and
+total, so readers keep input and total as stored, zero the cache-write fields on
+read, and price the non-cached remainder as ordinary input.
 
 `cost_usd` retains the session's payable or estimated amount for compatibility.
 The additive cost columns preserve `cost_source`, `reported_cost_usd`,

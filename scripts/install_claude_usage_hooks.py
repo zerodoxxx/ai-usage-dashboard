@@ -246,7 +246,7 @@ def install_claude_usage_hooks(
     source = Path(source_root).expanduser().resolve(strict=True)
     home = Path(claude_home).expanduser().resolve()
     # Always pin --db: the explicit path, else AI_USAGE_DB_PATH, else the
-    # shared default (~/.gemini/antigravity-cli/token_usage.db).
+    # shared default (~/.local/share/ai-usage/usage.db).
     database = Path(database_path or _codex._default_database_path()).expanduser().resolve()
     interpreter = _codex._validate_python_interpreter(python_interpreter)
 
@@ -337,7 +337,7 @@ def _build_argument_parser() -> argparse.ArgumentParser:
                         help="Claude Code config directory (defaults to ~/.claude)")
     parser.add_argument("--db", type=Path, default=None,
                         help="usage SQLite path pinned into the hook command "
-                             "(default: AI_USAGE_DB_PATH, else ~/.gemini/antigravity-cli/token_usage.db)")
+                             "(default: AI_USAGE_DB_PATH, else ~/.local/share/ai-usage/usage.db)")
     parser.add_argument("--python", type=Path, default=Path(sys.executable),
                         help="Python 3.12+ interpreter used by the hooks")
     parser.add_argument("--dry-run", action="store_true",

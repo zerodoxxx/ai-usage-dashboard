@@ -648,3 +648,25 @@ def test_capture_mode_activates_only_after_explicit_completion_mark(tmp_path: Pa
             "SELECT backfill_completed_at FROM usage_capture_state WHERE provider = 'codex'"
         ).fetchone()[0]
     assert completed_at
+
+
+def test_default_path_is_tool_neutral_and_env_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.usage_store import DEFAULT_DB_RELATIVE_PATH, LEGACY_DB_RELATIVE_PATH
+
+    assert DEFAULT_DB_RELATIVE_PATH == Path(".local/share/ai-usage/usage.db")
+    assert LEGACY_DB_RELATIVE_PATH == Path(".gemini/antigravity-cli/token_usage.db")
+    monkeypatch.delenv(DB_PATH_ENV_VAR, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert resolve_db_path() == tmp_path / ".local/share/ai-usage/usage.db"
+    monkeypatch.setenv(DB_PATH_ENV_VAR, str(tmp_path / "other.db"))
+    assert resolve_db_path() == tmp_path / "other.db"
+
+
+def test_writer_creates_missing_parent_but_reader_does_not(tmp_path: Path) -> None:
+    path = tmp_path / "a" / "b" / "usage.db"
+    assert read_usage_sessions("codex", db_path=path) == []
+    assert not path.parent.exists()
+    ensure_schema(path)
+    assert path.is_file()

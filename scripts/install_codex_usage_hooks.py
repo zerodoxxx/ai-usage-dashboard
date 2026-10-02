@@ -88,7 +88,8 @@ def _default_database_path() -> Path:
     configured = os.environ.get("AI_USAGE_DB_PATH")
     if configured:
         return Path(configured).expanduser()
-    return Path.home() / ".gemini/antigravity-cli/token_usage.db"
+    # Must match src.usage_store.DEFAULT_DB_RELATIVE_PATH.
+    return Path.home() / ".local/share/ai-usage/usage.db"
 
 
 def _timestamp() -> str:
@@ -523,7 +524,7 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         "--db",
         type=Path,
         default=None,
-        help="AGY token usage SQLite database path (defaults to AI_USAGE_DB_PATH or the AGY DB)",
+        help="AGY token usage SQLite database path (defaults to AI_USAGE_DB_PATH or ~/.local/share/ai-usage/usage.db)",
     )
     parser.add_argument(
         "--python",

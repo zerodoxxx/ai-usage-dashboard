@@ -414,3 +414,23 @@ def test_current_repository_payload_stages_without_touching_database(
     assert not list(result.artifact_directory.rglob("test_*.py"))
     assert (result.artifact_directory / "src/usage_store.py").is_file()
     assert (result.artifact_directory / "src/parsers/codex.py").is_file()
+
+
+def test_default_database_is_the_tool_neutral_store_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.usage_store import DEFAULT_DB_RELATIVE_PATH
+
+    monkeypatch.delenv("AI_USAGE_DB_PATH", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    expected = Path.home() / DEFAULT_DB_RELATIVE_PATH
+    assert installer._default_database_path() == expected
+    result = installer.install_codex_usage_hooks(
+        source_root=_make_source_tree(tmp_path / "repo"),
+        codex_home=tmp_path / "codex home",
+        python_interpreter=sys.executable,
+    )
+    command = _publisher_commands(
+        _read_hooks(result.hooks_file), "Stop", result.publisher_script
+    )[0]
+    assert shlex.split(command)[-1] == str(expected.resolve())
