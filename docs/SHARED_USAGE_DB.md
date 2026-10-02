@@ -1,49 +1,40 @@
 # Shared usage database
 
-Codex, Claude Code, and Antigravity share one tool-neutral SQLite database:
+The dashboard's only usage source is `~/.local/share/ai-usage/usage.db`. Set `AI_USAGE_DB_PATH` to override it; writer scripts also accept `--db`. Writers create directories and ensure the schema. Dashboard reads never create or migrate the database and never fall back to provider transcripts or the legacy location.
 
-```text
-~/.local/share/ai-usage/usage.db
-```
+## Schema
 
-Set `AI_USAGE_DB_PATH` to override that path. Writers create the parent
-directory if it is missing; the dashboard never creates the database or its
-directory, and a missing database simply shows as empty. There is no fallback
-to the old location. Antigravity's `track_usage.py` honors `AI_USAGE_DB_PATH`
-and defaults to the same new path.
+`src/usage_store.py` maintains schema version 1 in `PRAGMA user_version`. This schema version is separate from the per-row token semantics version.
 
-## Migrating from the old location
+| Table or view | Purpose |
+|:--------------|:--------|
+| `sessions` | One snapshot per `session_id`: provider, model, title, timestamps, token totals, call counts, cost fields, and allowed metadata |
+| `token_events` | Per-call usage with model, timestamp, event identity, cost, and metadata; unique on `(session_id, step_index)` |
+| `usage_capture_state` | Provider backfill state: `enabled`, `backfill_completed_at`, and `updated_at` |
+| `provider_daily_summary`, `provider_model_summary` | Summaries grouped by provider and day/model |
+| `daily_summary`, `model_summary` | Legacy Antigravity-only views |
 
-Earlier versions stored the database at the Antigravity path
-`~/.gemini/antigravity-cli/token_usage.db`. Copy it once with:
+Canonical providers are `codex`, `claude-code`, and `antigravity`. Codex IDs are stored as `codex:<native-id>`; Claude IDs as `claude-code:<native-id>`. **AGY session IDs remain raw**, preserving compatibility with the external tracker. Reads return native IDs. Old rows without a provider column are treated only as Antigravity data; schema migration adds defaults without changing counters.
 
-```bash
-python scripts/migrate_usage_db.py --dry-run   # preview per-provider counts
-python scripts/migrate_usage_db.py             # copy to the new default path
-```
+Both usage tables retain input, cached input, output, reasoning output, cache writes (including 5-minute and 1-hour splits), and total tokens. Session activity fields support filtering; events preserve missing timestamps through `timestamp_missing`. `metadata_json` uses an allowlist for token provenance, capture revisions, response identities, and safe TPS facts. Transcript bodies, prompts, responses, and tool-output text are not stored.
 
-The script uses the SQLite backup API (so WAL contents are included), refuses
-to overwrite an existing target unless `--force` is given, verifies per-provider
-session and event counts, token sums and `PRAGMA integrity_check`, and leaves
-the old database untouched. `--source` and `--target` select other paths.
-After migrating, re-run the Codex and Claude Code hook installers so the pinned
-`--db` path is updated:
+## Token and cost semantics
 
-```bash
-python scripts/install_codex_usage_hooks.py
-python scripts/install_claude_usage_hooks.py
-```
+New snapshots written through the shared API, including the current AGY writer, use `usage_semantics_version=2` and `cache_write_mode='additive'`:
 
-Tests and custom Codex data roots
-should pass `db_path=` explicitly so they do not touch a user's live database.
-The database stores normalized token counts, timestamps, model IDs, cost
-provenance, dashboard timing metadata, and the session title/workspace fields
-used by the dashboard. It does not store transcript bodies.
+- `input_tokens` includes uncached input and cached reads.
+- `cached_input_tokens` is a subset of input.
+- `cache_write_tokens` is separate input, added once; lifetime fields split that count.
+- `output_tokens` includes reasoning output; reasoning is a subset.
+- `total_tokens` is preserved from the normalized source snapshot.
 
-## Python contract
+Legacy AGY rows use semantics version 1 and `cache_write_mode='embedded_in_input'`. Their cache-write estimate is already included in input and total. Readers preserve those totals but zero the cache-write fields to prevent double counting. The current AGY writer emits additive snapshots with zero cache writes.
 
-Use the existing provider-neutral contracts from
-`src.parsers.contracts` and the shared store APIs from `src.usage_store`:
+The **estimated flag is metadata**, not a standalone table column: `metadata_json.estimated` and `token_source` distinguish token provenance. Current AGY snapshots set `estimated: true` and `token_source: "estimated"`; legacy AGY reads default to estimated. Codex and Claude default to reported token counts. Being stored in SQLite does not make estimates reported.
+
+Cost provenance is separate. `cost_usd` retains the compatible payable/estimated amount; `cost_source`, `reported_cost_usd`, `cost_cached_estimate_usd`, `cost_uncached_usd`, `savings_usd`, and `cost_currency` retain the distinctions. A calculated cost remains estimated even when its token counts are reported. Unknown rates remain unpriced.
+
+## Writer contract
 
 ```python
 from src.usage_store import read_usage_sessions, write_usage_sessions
@@ -52,134 +43,117 @@ write_usage_sessions("claude-code", [usage_session])
 sessions = read_usage_sessions("claude-code")
 ```
 
-`write_usage_sessions` accepts complete `UsageSession` snapshots, not token
-deltas. Replaying the same session replaces its event rows atomically, so
-retries cannot double count tokens and a corrected, shorter transcript removes
-stale events. Give each `UsageEvent` a stable `event_id` when the provider
-exposes one. Store IDs are namespaced (`codex:<native-id>` and
-`claude-code:<native-id>`); reads return the original ID. The canonical
-provider values are `antigravity`, `codex`, and `claude-code`.
+Writes replace full `UsageSession` snapshots and their event lists atomically; they are not token deltas. Replaying a snapshot cannot add the same session twice, and a shorter corrected snapshot removes old tail events. Stable event IDs support deduplication. Codex/Claude capture revisions prevent an older parse from replacing a newer snapshot; Claude additionally claims response ownership to avoid counting copied history twice.
 
-Reads use one SQLite read transaction so concurrent hooks cannot make session
-totals and event rows come from different snapshots. If a provider has no
-event timestamp, the schema preserves that absence even though Antigravity's
-legacy event table requires a non-null timestamp column.
+Capture state records backfill completion, not hook configuration or approval. Dashboard reads do not require `enabled=1`.
 
-Call `ensure_schema()` explicitly when setting up the database. Writes also
-ensure the schema before opening their data transaction. Reads are read-only:
-an absent database returns an empty list, and an old provider-less database is
-treated as Antigravity data only. Schema migration adds defaults to existing
-Antigravity rows without changing their counters. The legacy `daily_summary`
-and `model_summary` views stay Antigravity-only; shared reports are available
-through `provider_daily_summary` and `provider_model_summary`.
+## Writers and hooks
 
-## Token and cost semantics
+All three installers deploy frozen, content-addressed releases and pin the interpreter and database path. Reinstall after code or path changes; branch switches do not change a deployed release.
 
-New Codex and Claude Code sessions use semantics version 2 and
-`cache_write_mode='additive'`:
+| Tool | Writer | Hook events | Configuration |
+|:-----|:-------|:------------|:--------------|
+| Codex | `scripts/codex_usage_writer.py` | `Stop`, `SubagentStop`, `Interrupt`; synchronous | `~/.codex/hooks.json` |
+| Claude Code | `scripts/claude_usage_writer.py` | `Stop`, `SubagentStop`, `SessionEnd`; asynchronous | `~/.claude/settings.json` |
+| AGY | `scripts/agy_usage_writer.py` | `PostInvocation`, `Stop` | `~/.gemini/config/hooks.json` |
 
-- `input_tokens` includes uncached and cached-read input.
-- `cached_input_tokens` is the cached-read subset of input.
-- `cache_write_tokens` is separate and additive to input; the optional 5-minute
-  and 1-hour fields break that write count down by cache lifetime.
-- `output_tokens` includes reasoning output; reasoning is a subset, not an
-  extra category to add again.
-- `total_tokens` is the provider's authoritative total and is preserved.
-
-Existing Antigravity rows use semantics version 1 and
-`cache_write_mode='embedded_in_input'`. Antigravity's cache-write count is
-diagnostic (an estimate of uncached input) and already included in its input and
-total, so readers keep input and total as stored, zero the cache-write fields on
-read, and price the non-cached remainder as ordinary input.
-
-`cost_usd` retains the session's payable or estimated amount for compatibility.
-The additive cost columns preserve `cost_source`, `reported_cost_usd`,
-`cost_cached_estimate_usd`, `cost_uncached_usd`, `savings_usd`, and currency.
-A calculated estimate must
-remain marked `estimated`; it must not be represented as a provider-reported
-charge. When no cost is available, use an unpriced cost or let the dashboard
-reprice from the exact token events.
-
-The store also preserves normalized event timestamps, model names, stable event
-IDs, reasoning effort, and safe TPS metadata (`tps_duration_seconds`,
-`tps_output_tokens`, and `tps_trustworthy`). Metadata with prompt, response,
-message, or tool-output content is discarded.
-
-## Codex capture
-
-Codex's completion-hook payload does not include token counts. The publisher
-`scripts/codex_usage_writer.py` reads only the transcript path supplied by the
-installed `Stop`, `SubagentStop`, or `Interrupt` hook and passes it through the
-existing Codex parser. It writes a normalized snapshot to the shared DB;
-it does not run a dashboard-time history importer. `SubagentStop` must use
-`agent_id` and `agent_transcript_path`, since its `session_id` identifies the
-parent thread. Hook output is always `{}` on stdout, with safe diagnostics on
-stderr, and usage-write failures do not block a Codex turn.
-
-After installing and trusting the hook, capture existing sessions once before
-enabling database-only Codex reads:
-
-```sh
-python scripts/codex_usage_writer.py --backfill
-python scripts/codex_usage_writer.py --status
-```
-
-Backfill parses existing local history and writes one full snapshot per
-session. Only after that write succeeds does it mark Codex capture enabled.
-Repeating backfill after activation is a no-op.
-While capture is enabled, the dashboard reads Codex usage from SQLite and does
-not fall back to raw rollout files. This preserves imported dashboard history
-if an original transcript is later removed. It does not preserve the ability
-to resume that deleted Codex conversation.
-
-`--status` reports only per-provider session/event/token counts and database
-capture state, including whether backfill enabled database-backed reads. It
-omits native session IDs and conversation content. It does not report whether
-hooks are configured or trusted; verify those separately with `/hooks` in the
-Codex CLI. A hook run that persists usage reports its token total on stderr; a
-run that finds no stable transcript usage reports a successful skip.
-
-## Claude Code capture
-
-Claude Code writes provider `claude-code` (alias `claude`). The publisher
-`scripts/claude_usage_writer.py` runs as a `Stop`, `SubagentStop`, and
-`SessionEnd` hook. The hook payload only names a transcript, so the script
-parses that transcript with the existing `src/parsers/claude.py` logic
-(response-ID de-duplication, cache-write splits, estimated cost) and writes one
-complete session snapshot. Re-running on the same transcript replaces the
-session's events and never double counts. `SubagentStop` captures the agent's
-own transcript as a separate session; `SessionEnd` also sweeps the session's
-`subagents/` directory. A response ID that the DB already attributes to another
-session (a resumed transcript copying earlier history) is not counted twice.
-Each snapshot records the transcript's stat revision, so an overlapping hook
-that parsed an older file cannot overwrite a newer snapshot. The hook is
-asynchronous, always exits 0, writes nothing to stdout, and reports skips and
-errors on stderr.
-
-Install, inspect, or remove the hooks (this edits `~/.claude/settings.json`,
-writes a timestamped `settings.json.<time>.bak` first, and preserves every
-other setting and hook):
-
-```sh
-python scripts/install_claude_usage_hooks.py --dry-run
+```bash
+python scripts/install_codex_usage_hooks.py
 python scripts/install_claude_usage_hooks.py
-python scripts/install_claude_usage_hooks.py --uninstall
+python scripts/install_agy_usage_hooks.py
 ```
 
-The installer copies the publisher and `src/` into a content-addressed folder
-under `~/.claude/usage-publisher/releases/`, so switching git branches cannot
-break a running hook. Re-run it after changing the publisher or parser.
+**Approve the exact Codex definitions through `/hooks` after every install.** Start a fresh Codex session or reopen Desktop before relying on capture. Installers save timestamped backups of changed configuration. AGY's installer replaces the external `agy-token-tracker` entry; other named entries are preserved.
 
-Import existing history (every `~/.claude/projects/**/*.jsonl`, subagent
-transcripts included, de-duplicated across transcripts). It is safe to repeat;
-rerunning refreshes snapshots without changing counts for unchanged
-transcripts:
+Codex parses only the hook transcript and matching thread metadata. `SubagentStop` uses `agent_id`/`agent_transcript_path`. Hook stdout is `{}`; diagnostics go to stderr and failures are nonfatal. Claude parses the named transcript, captures subagents separately, and sweeps the subagent directory at session end; it emits no hook stdout and exits 0 on hook errors.
 
-```sh
+AGY estimates tokens with `tiktoken` when available, otherwise a regex/character fallback. It estimates cache reads at zero for the first response and 45% of accumulated context thereafter, with zero additive cache writes. Its hook emits `{}` and nonfatal diagnostics. These are estimates, not provider token reports.
+
+```bash
+python scripts/codex_usage_writer.py --backfill
 python scripts/claude_usage_writer.py --backfill
+python scripts/agy_usage_writer.py --backfill
+python scripts/codex_usage_writer.py --status
 python scripts/claude_usage_writer.py --status
+python scripts/agy_usage_writer.py --status
 ```
 
-Backfill marks `claude-code` capture enabled in `usage_capture_state` (use
-`--no-enable-capture` to skip). Pass `--claude-dir` or `--db` to target other
-locations; tests always do.
+Codex backfill imports history once and becomes a no-op once capture is enabled. Claude and AGY backfills can be repeated. Claude's `--no-enable-capture` suppresses its backfill flag. Status commands report database counts/state, not hook approval. Use `--codex-dir`, `--claude-dir`, or `--agy-dir` on the corresponding writer for alternate history roots.
+
+## Concurrency
+
+Schema setup enables SQLite WAL mode. Writes use `BEGIN IMMEDIATE` and atomic snapshot replacement; per-provider reads use a single read-only transaction. Connections use a 2,000 ms busy timeout. Locked/busy writes retry up to three attempts with short exponential delays.
+
+Codex's `--deadline-seconds` bounds parsing and database waits/retries together. Its installed stop hooks use 25 seconds, and interrupt uses 2.5 seconds. SQLite waits shrink to the remaining deadline; expiry rolls back instead of committing a partial snapshot. A later successful hook can capture newer usage.
+
+## Backup and restore
+
+Create a verified backup:
+
+```bash
+python scripts/backup_usage_db.py
+```
+
+The SQLite backup API includes committed WAL data. The script checks integrity plus per-provider session/event counts and both token sums against one source snapshot, then publishes `<db dir>/backups/usage-<UTC timestamp>.db`. It retains the newest 14 backups by default. `--db`, `--dest-dir`, `--keep`, and `--json` are supported. Retention requires a new successful backup before deletion; installing hooks does not schedule regular backups.
+
+To restore, close Codex, Claude Code, AGY, and the dashboard, and wait for hook/backfill processes to finish. Disable an installed retention job:
+
+```bash
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.zerodoxxx.ai-usage-dashboard.codex-retention.plist"
+```
+
+With **all database users stopped**, the following restores the newest backup from the resolved database's `backups` directory. It checks the backup first and moves the replaced database and any old WAL/SHM files into a separate recovery directory so they cannot be replayed onto the restored file:
+
+```bash
+python - <<'PY'
+from datetime import datetime, timezone
+from pathlib import Path
+import shutil
+import sqlite3
+from src.usage_store import resolve_db_path
+
+db = resolve_db_path().expanduser().resolve()
+backups = sorted((db.parent / "backups").glob("usage-*.db"))
+if not backups:
+    raise SystemExit("No backups found")
+backup = backups[-1]
+with sqlite3.connect(backup.as_uri() + "?mode=ro", uri=True) as conn:
+    if conn.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+        raise SystemExit("Backup failed integrity check")
+saved = db.parent / datetime.now(timezone.utc).strftime("pre-restore-%Y%m%dT%H%M%S.%fZ")
+saved.mkdir()
+for suffix in ("", "-wal", "-shm"):
+    old = Path(str(db) + suffix)
+    if old.exists():
+        shutil.move(str(old), str(saved / old.name))
+shutil.copy2(backup, db)
+print(f"Restored {backup}; previous files saved in {saved}")
+PY
+python scripts/doctor.py
+```
+
+For an older snapshot, change the `backup` selection in the snippet to the desired file. Once doctor reports a readable store, restart capture tools and the dashboard. Restoring changes usage history to the backup's contents; it does not restore deleted Codex transcripts. Re-enable retention with the bootstrap command in [the retention guide](CODEX_RETENTION.md) if desired.
+
+Doctor is read-only. It exits 0 for OK, 1 for failures, and 2 for warnings. Its immutable SQLite check describes the checkpointed database and warns when live WAL data is present.
+
+## Migration
+
+The legacy source is `~/.gemini/antigravity-cli/token_usage.db`. Stop writers and database users before migrating or replacing a target, as for restore.
+
+```bash
+python scripts/migrate_usage_db.py --dry-run
+python scripts/migrate_usage_db.py
+```
+
+Migration uses SQLite backup to include WAL data, verifies per-provider session/event counts and session token sums plus integrity, then publishes the copy. It does not merge databases or run schema migration. The source is archived as `token_usage.db.migrated-YYYY-MM-DD` with sidecars unless `--keep-source` is used.
+
+An existing target is refused, including during `--dry-run`. To preview and intentionally replace it:
+
+```bash
+python scripts/migrate_usage_db.py --force --dry-run
+python scripts/migrate_usage_db.py --force
+```
+
+`--force` first backs up the target to a timestamped `.bak` beside it, then replaces it. This removes target-only rows from the active database. If you already backfilled all tools, do not treat migration as an additive import. `--source` and `--target` can instead select a separate destination for inspection.
+
+After selecting the active database path, re-run all three hook installers, approve Codex definitions with `/hooks`, and run doctor. Backfill any remaining local history into the migrated store as needed; Codex still skips backfill if the copied store already marks capture enabled.

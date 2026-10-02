@@ -1,222 +1,116 @@
-# How It Works — AI Tools Usage & Cost Visualizer
+# How it works
 
-## Overview
+## Read path
 
-This project is a local-only web dashboard that reads usage that AI coding tools have recorded into one shared local SQLite database (`usage.db`). Writers (hooks and backfills) parse each tool's own telemetry files and publish into that database; the dashboard itself never parses those files. Built-in adapters support **OpenAI Codex**, **Claude Code**, and **Google Antigravity (AGY)**.
+The dashboard reads only the shared SQLite database at `~/.local/share/ai-usage/usage.db`, overridden by `AI_USAGE_DB_PATH`. Hooks and backfills parse local telemetry and write normalized snapshots; requests never scan provider transcript directories.
 
-No API keys, no cloud connections, no subscriptions. Everything runs locally.
-
----
-
-## The Tools Being Tracked
-
-### 1. OpenAI Codex (`~/.codex/`)
-
-Codex saves detailed session rollout logs in JSONL format. Every time a model makes an API call, Codex appends a structured record to a file like:
-
-```
-~/.codex/sessions/2026/09/08/rollout-<uuid>.jsonl
-```
-
-Each file contains lines with token usage records:
-
-```json
-{
-  "type": "token_usage_record",
-  "payload": {
-    "thread_id": "<uuid>",
-    "usage": {
-      "input_tokens": 25991,
-      "cached_input_tokens": 25600,
-      "cache_write_input_tokens": 0,
-      "output_tokens": 117,
-      "reasoning_output_tokens": 0,
-      "total_tokens": 26108
-    }
-  }
-}
+```text
+Codex rollout JSONL + metadata → codex_usage_writer.py ──┐
+Claude session JSONL           → claude_usage_writer.py ├→ usage.db
+AGY transcripts + summaries    → agy_usage_writer.py ────┘
+                                                            ↓
+                                                  usage_store.py
+                                                            ↓
+                                                  store_source.py
+                                                            ↓
+                                                  aggregator.py
+                                                            ↓
+                                                  app.py → browser
 ```
 
-Codex also maintains `~/.codex/state_5.sqlite` for thread metadata and cumulative totals. Codex does not provide a built-in export of usage to an arbitrary SQLite database. This dashboard uses Codex's supported `Stop`, `SubagentStop`, and `Interrupt` hooks to publish usage into the shared dashboard database. The hook parses only the current transcript named in its payload, along with matching thread metadata; it does not scan conversation history on each dashboard refresh.
+`StoreUsageSource` adapters in `src/parsers/store_source.py` read sessions and events through `src/usage_store.py`. Each provider read uses a read-only SQLite transaction so its session totals and events share a snapshot. The aggregator reads selected providers sequentially, merges sessions, resolves prices, filters events by time, and builds summaries, models, timelines, sessions, and analytics.
 
-The shared database is `~/.local/share/ai-usage/usage.db` (migrate an old Antigravity-path database with `python scripts/migrate_usage_db.py`; Antigravity's `track_usage.py` honors `AI_USAGE_DB_PATH` and defaults to this path). After the hook is installed and trusted, run `python scripts/codex_usage_writer.py --backfill` once to import existing Codex history. Until that backfill has run, the dashboard shows Codex as empty, because it reads only SQLite and never the rollout files. The database records a provider key (`codex` or `antigravity`) and model for each row, and prefixes stored session IDs with the provider, so matching native IDs remain distinct. Set `AI_USAGE_DB_PATH` to use a different location. Setup and schema details are in [Shared usage database](docs/SHARED_USAGE_DB.md).
+Provider keys are `codex`, `claude-code`, and `antigravity`. Codex and Claude database IDs are namespaced; AGY retains native IDs. Reads return native session IDs. The database stores counters and selected metadata, not transcript bodies. See [the shared database guide](docs/SHARED_USAGE_DB.md).
 
-Hook changes may not hot-reload into an already-open Codex Desktop session. In a normal terminal Codex session, use `/hooks` to inspect and trust the exact installed definitions, then reopen Codex Desktop or start a fresh session before relying on captures.
+## Capture
 
-The `Interrupt` hook has a short time limit and may not finish parsing a large transcript. A later `Stop` or a backfill can capture completed work; a turn that remains interrupted can have partial usage until its transcript is complete.
+### Codex
 
-**Key distinction:** `cached_input_tokens` are tokens served from OpenAI's prompt cache (much cheaper). `uncached_input_tokens = input_tokens - cached_input_tokens`.
+`scripts/codex_usage_writer.py` imports the Codex parser to read the transcript named by a hook payload and matching thread metadata. For `SubagentStop`, it uses the agent's ID and transcript rather than the parent's session ID. The installer configures synchronous `Stop`, `SubagentStop`, and `Interrupt` hooks with `--deadline-seconds`: 25 seconds for stop events and 2.5 seconds for interrupts.
 
----
+Approve the exact definitions through `/hooks` in Codex after every installation. Start a fresh session or reopen Desktop to use them. A deadline expiry can leave capture incomplete; a later stop can capture the updated transcript. Hook failures are nonfatal and diagnostics go to stderr.
 
-### 2. Google Antigravity / AGY (`~/.gemini/antigravity-cli/`)
-
-AGY stores conversation state differently. It uses:
-- **SQLite DBs** (`conversations/<uuid>.db`) — protobuf-serialized step blobs, no native token columns
-- **Conversation summaries DB** (`conversation_summaries.db`) — session titles, step counts, timestamps
-- **Brain transcripts** (`brain/<session-uuid>/.system_generated/logs/transcript.jsonl`) — step-by-step text records
-
-Because transcript-based AGY sessions don't store raw token counts locally (quota is tracked server-side by Google), **their token counts are estimated** using a standard heuristic. When the shared `usage.db` contains exact local token records, those records are marked reported instead:
-
-```
-input_tokens  ≈ total_input_chars  // 4
-output_tokens ≈ (output_chars + thinking_chars) // 4
+```bash
+python scripts/codex_usage_writer.py --backfill
+python scripts/codex_usage_writer.py --status
 ```
 
-For multi-turn sessions (where prompt caching is very effective), a **45% cache hit rate** is assumed for input tokens. This is a conservative estimate based on typical coding session patterns. Single-turn sessions assume **0% cache** (no prior context to reuse). Both rules live in `src/parsers/agy.py` as `_AGY_CACHE_HIT_RATE_MULTI_TURN` with a rationale comment.
+Backfill imports remaining local history once and records capture enabled after a successful write. Once enabled, repeating it is a no-op. Capture flags do not gate dashboard reads: existing database rows are visible even before backfill.
 
-Transcript-based AGY sessions are marked estimated in the API (`estimated: true`, `token_source: "estimated"`); `usage.db` sessions carry explicit reported provenance. The database is also Codex's shared usage store, with rows separated by provider and model. A model containing both estimated and reported AGY sources is marked `mixed`. The dashboard renders approximate rows with a `~` prefix and a provenance badge, plus a footnote under the per-model table.
+### Claude Code
 
-### 3. Claude Code (`~/.claude/`)
+`scripts/claude_usage_writer.py` parses assistant usage records from `~/.claude/projects/**/*.jsonl`, including subagent transcripts. Models come from the assistant records. The parser retains base input, cache reads, cache writes split by lifetime, output, and optional reasoning tokens.
 
-Claude Code stores one JSONL transcript per session below `~/.claude/projects` (including delegated sessions under `subagents/`). Assistant records include the model, timestamp, and API usage fields. The adapter reads base input, cache reads, cache writes, output, and optional reasoning tokens, and deduplicates repeated records that share the same message ID. Per-message events are retained internally so rolling time ranges include only calls that occurred inside the selected window. The dashboard does not read those transcripts; a Claude writer and backfill parse them with this adapter and publish into the shared database through the `claude-code` provider contract described in [Shared usage database](docs/SHARED_USAGE_DB.md).
+The installer adds asynchronous `Stop`, `SubagentStop`, and `SessionEnd` hooks to `~/.claude/settings.json`. Subagent stops capture the child separately; session end also sweeps subagent transcripts. The writer deduplicates copied responses across sessions and rejects older capture revisions that would overwrite newer snapshots.
 
-Active model is read from `~/.gemini/antigravity-cli/settings.json`.
-
----
-
-## How the Parser Pipeline Works
-
-```
-Codex rollout logs + hooks ─────┐  (writers/backfill: scripts/*,
-AGY transcripts + summaries ────┼─  import src/parsers/{codex,agy,claude}.py
-Claude Code transcripts ────────┘   to parse raw files)
-                                  │
-                                  ▼
-                 ~/.local/share/ai-usage/usage.db   (AI_USAGE_DB_PATH overrides)
-                   provider + model + namespaced session ID
-                                  │  read-only, request time
-                                  ▼
-                 src/parsers/store_source.py  (one StoreUsageSource per provider)
-                                  │
-                                  ▼
-                       src/parsers/aggregator.py
-                         model, timeline, cost,
-                         sessions, analytics
-                                  │
-                                  ▼
-                       src/app.py → Browser Dashboard
+```bash
+python scripts/claude_usage_writer.py --backfill
+python scripts/claude_usage_writer.py --status
 ```
 
----
+Backfill can be repeated. Both Codex and Claude counts come from recorded usage; calculated dollar amounts remain cost estimates unless a reported charge is available.
 
-## Performance: Refresh and Parse Caching
+### Antigravity (AGY)
 
-The request path does no file scanning and keeps no parsed-file cache. Each usage request reads the selected providers' sessions and events from SQLite (one read-only query for sessions and batched queries for events per provider), then rebuilds aggregates for the selected time range. When all tools are requested, the three provider reads run concurrently. The parsers' own parsed-file cache (`src/parsers/file_cache.py`) is used only by the writers and backfills that parse transcripts.
+`scripts/agy_usage_writer.py` parses `brain/**/transcript.jsonl` under `~/.gemini/antigravity-cli`. It reads titles and workspace metadata from `conversation_summaries.db` and assigns the model from AGY's `settings.json`, with a fallback when absent. This is the model setting at capture time, not a per-response model report.
 
-Because history is already normalized in the database, refresh time depends on the number of stored sessions and events rather than on the size of provider transcript folders. A provider without rows, or a missing database, yields an empty provider rather than an error.
+Token counts are **estimates**, including rows stored in `usage.db`. The writer uses `tiktoken`'s `cl100k_base` encoding when available, otherwise a regex tokenizer with a character-count fallback. It accumulates context from user/system steps and creates an event for each `PLANNER_RESPONSE` or `MODEL` step. Output includes content, serialized tool calls, and thinking.
 
-## How Time Windows Stay Accurate
+The first response estimates zero cached input; later responses estimate 45% of accumulated context as cached input. This is a writer assumption, not measured cache usage. New snapshots use zero additive cache writes and carry `estimated: true` and `token_source: "estimated"`. The old chars/4 estimator in `src/parsers/agy.py` is a legacy parser and is not used by this writer or the dashboard read path.
 
-Each parsed session retains internal per-call usage events. Events are read from the shared SQLite store for every provider; Codex hooks publish a replacement snapshot for the current session rather than adding cumulative totals as new calls. AGY transcripts do not expose token counts directly, so the parser estimates the session total and allocates it across model-response events according to their character weights. The API strips these internal records from its response, but the aggregator uses them when applying `month`, `30d`, `7d`, and `24h` windows.
+The installer replaces the external `agy-token-tracker` entry in `~/.gemini/config/hooks.json` with `PostInvocation` and `Stop` commands pointing to a frozen local writer.
 
-Segments sharing the same tool and session ID are merged before aggregation, and model totals are built from each event's model rather than a single session-level label. A session that genuinely used multiple models is exposed as `mixed`. Metadata-only AGY conversations and user-only transcripts do not create synthetic API calls, tokens, or cost.
-
-That means a long-running conversation is counted by the calls that actually occurred in the selected window, even when the session itself was created much earlier. Older or incomplete records fall back to the best session-level timestamp available. Preset ranges use exact instants, while calendar-month and custom-date boundaries use the dashboard's DST-aware local timezone. Set `AI_USAGE_TIMEZONE` to an IANA zone such as `America/New_York` to override the system timezone.
-
----
-
-## How the Cost Engine Works
-
-File: `src/pricing.py`
-
-For each model, rates are expressed in USD per 1,000,000 tokens:
-- `uncached_input` — tokens not served from cache
-- `cached_input` — tokens served from prompt cache (typically 90–95% cheaper)
-- `output` — generated completion tokens (including reasoning/thinking)
-- `cache_write` — optional prompt-cache creation tokens, when the provider bills them
-
-Model rates are pulled from LiteLLM's public JSON price list at
-`https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json`.
-The refresh is TTL-based (24 hours by default), thread-safe, and persists a
-last-known-good snapshot at `$AI_USAGE_PRICING_CACHE`,
-`$XDG_CACHE_HOME/ai-usage-dashboard/litellm-pricing.json`, or
-`~/.cache/ai-usage-dashboard/litellm-pricing.json`. Only models seen in local
-usage have rates applied from LiteLLM; the bundled `MODEL_PRICING` table remains
-as an offline fallback. Offline startup uses the bundled catalog or that snapshot
-and reports `stale`/`error` metadata rather than failing usage collection. Local
-transcripts do not identify Batch, Flex, Fast, long-context, or regional-processing
-tiers, so Standard short-context rates are used for estimates. The server has one
-process-global active catalog; the default cache path should be used for normal
-operation. Custom cache paths are supported for tests or explicitly switching the
-active storage snapshot, and the payload always reactivates the matching rates
-before returning its metadata.
-
-**Cost formula (with caching):**
-```
-cost = (uncached_input × uncached_rate
-      + cached_input  × cached_rate
-      + output        × output_rate
-      + cache_writes  × applicable_write_rate) / 1,000,000
+```bash
+python scripts/agy_usage_writer.py --backfill
+python scripts/agy_usage_writer.py --status
 ```
 
-**Cost formula (without caching):**
+## Refresh performance
+
+Three caches reduce repeated work:
+
+- `src/app.py` caches serialized usage responses. Keys include the database and WAL signatures (path, modification time, size), tool/range parameters, timezone, pricing catalog revision and metadata, and the current minute.
+- `src/parsers/aggregator.py` caches priced sessions per database/WAL signature, selected sources, pricing revision, and timezone. A new time range can reuse these sessions while rebuilding its aggregates.
+- `src/pricing.py` memoizes model/provider resolution and time-dependent rate selection. Catalog changes invalidate the derived pricing caches.
+
+Responses are cached only for an existing, readable database, and not when its signature changes during the request. Minute-based response keys allow moving windows and analytics to advance even without database writes. Browser responses still use `Cache-Control: no-store`; these caches are in the server process.
+
+Measured on the local history used for this branch: all-time cold response about 1.8 seconds, warm response about 1 millisecond, and 24-hour cold response about 0.32 seconds. These are observations for that dataset, not latency guarantees. Transcript parser caches in `src/parsers/file_cache.py` are separate and used by writers/backfills.
+
+## Capture health
+
+`/api/usage` includes a `store` block with `path`, `database_exists`, `readable`, `error`, and provider summaries containing `last_write_at` and `sessions`. The frontend shows chips for providers with stored sessions. A last write older than 24 hours is marked stale; a missing timestamp has a capture-time-unavailable tooltip. This measures writes to SQLite, not hook approval or tool activity.
+
+A missing or unreadable database produces a banner with setup or doctor guidance. A provider with no rows otherwise shows as empty. `scripts/doctor.py` checks the database, hook configuration, deployed publishers, retention job, and backups; it cannot approve Codex hooks.
+
+## Time windows
+
+Writers replace full session snapshots rather than adding cumulative totals as calls. Event timestamps let the aggregator count calls inside `month`, `30d`, `7d`, `24h`, and custom windows even when the conversation started earlier. AGY events contain the writer's per-response estimates; they are not apportioned from one session total by character weights. Records without events fall back to session timestamps.
+
+Model totals use each event's model. Sessions using multiple models can show `mixed`. User-only AGY transcripts produce no model-response events or tokens. Preset rolling ranges use instants; calendar-month and custom boundaries use the local timezone, including daylight saving. Set `AI_USAGE_TIMEZONE` to override it.
+
+## Costs
+
+`src/pricing.py` expresses USD rates per million tokens for uncached input, cached input, output, and optional cache writes. It refreshes from LiteLLM's public price list with a 24-hour TTL, retaining a last-known-good snapshot and bundled fallback rates. Unknown models remain unpriced. Local records do not identify every billing tier, so estimated costs use standard short-context rates where applicable.
+
+```text
+cost with caching = (uncached input × input rate
+                   + cached input × cache-read rate
+                   + output × output rate
+                   + cache writes × applicable write rate) / 1,000,000
+
+cost without caching = ((uncached input + cached input + cache writes) × input rate
+                      + output × output rate) / 1,000,000
+
+net savings = cost without caching − cost with caching
 ```
-cost = ((uncached_input + cached_input + cache_writes) × uncached_rate
-      + output × output_rate) / 1,000,000
-```
 
-**Net savings = cost_without_caching − cost_with_caching**
+Reasoning tokens are a subset of output. Claude 5-minute and 1-hour cache writes are retained separately and priced at 1.25× and 2× input rates; writes can make net savings negative. Cache-read percentage excludes additive cache writes from its denominator.
 
-Claude 5-minute and 1-hour writes are retained separately and priced at 1.25× and 2× the regular input rate. Expensive writes can therefore produce negative net savings instead of being hidden by a zero clamp. Cache-write tokens are included in `total_input` and `total_tokens`; cache-read percentage uses only regular plus cache-read input as its denominator. AGY's local estimator already includes its source cache-write count in `input_tokens`, so the adapter preserves that source diagnostic without adding the same tokens a second time.
+Legacy AGY `embedded_in_input` cache-write counts are diagnostic and are zeroed on read to avoid counting them twice. New AGY snapshots have zero additive writes. Token provenance (`estimated`/`token_source`) is separate from cost provenance (`cost_source`/`pricing_status`).
 
----
+## Frontend
 
-## The Frontend: How the Dashboard Updates
+`dashboard.js` requests `/api/usage` on load, filter changes, and auto-refresh. The response contains usage, analytics, pricing with freshness metadata, and store health. Odometers, charts, tables, and capture chips use the same selected window. Session search is client-side. New requests cancel in-flight requests through an `AbortController`.
 
-1. **On load:** `dashboard.js` calls `GET /api/usage?tool=all&time_range=all`. The current API includes the matching pricing catalog and its `__meta__` provenance/freshness data in that response; older servers can use the separate `/api/pricing` endpoint as a fallback.
-2. **The API response** contains: `summary` (odometer values), `models` (per-model table rows), `timeline` (chart data), `sessions` (recent activity list), and `analytics` (derived insights for the selected window)
-3. **Odometers** (`odometer.js`): Each number is broken into digit characters. CSS 3D `translateY` shifts a vertical strip of 0–9 digits to land on the right number. Digits animate with staggered delays and `cubic-bezier(0.2, 0.9, 0.3, 1)` easing — right-to-left, like a real counter.
-4. **Charts** (Chart.js): Token breakdown, daily cost/token/call trend, cost by tool, blended cost per 1M tokens, cache-efficiency trend, hourly activity, and a weekday/hour heatmap
-5. **Auto-refresh:** A configurable `setInterval` (10s / 30s / 60s) re-calls `GET /api/usage`. Each user-initiated action (tool switch, manual refresh) creates a new `AbortController`, cancelling any in-flight request before starting a fresh one.
-6. **Session search:** Client-side filtering on `state.allSessions` — no additional server calls.
-7. **Time filtering:** The header time selector requests one of `all`, `month`, `30d`, `7d`, `24h`, or `custom`. The server slices per-call events where available, then rebuilds the summary, model, timeline, session, and analytics results together.
-
----
-
-## Directory Reference
-
-| Path | What It Is |
-|:-----|:-----------|
-| `run.py` | CLI entry point — starts uvicorn, optionally opens browser |
-| `src/app.py` | FastAPI app — 4 endpoints: `/`, `/api/usage`, `/api/pricing`, `/api/health` |
-| `src/litellm_pricing.py` | LiteLLM pricing feed parser, exact key candidates, and model index |
-| `src/pricing.py` | Provider catalog, LiteLLM refresh/cache, and cost calculator |
-| `src/parsers/contracts.py` | Provider-neutral token, event, session, and cost contracts |
-| `src/parsers/source_registry.py` | Provider adapter registry with canonical-key and alias lookup |
-| `src/usage_store.py` | Shared provider-aware SQLite storage and normalized session reads/writes |
-| `scripts/codex_usage_writer.py` | Codex completion-hook publisher and explicit one-time backfill |
-| `src/parsers/store_source.py` | Dashboard read path: loads each provider's sessions from the shared SQLite store |
-| `src/parsers/codex.py` | Parses Codex rollout files (imported by the writer and backfill, not called by the dashboard) |
-| `src/parsers/agy.py` | Parses AGY transcripts + DBs and estimates tokens (writer/backfill use only) |
-| `src/parsers/claude.py` | Parses Claude Code session JSONL and normalizes API usage (writer/backfill use only) |
-| `src/parsers/aggregator.py` | Runs registered adapters, prices normalized sessions, slices time windows, and derives analytics |
-| `src/static/js/odometer.js` | `RollingOdometer` class — zero-dependency vertical digit animation |
-| `src/static/js/utils.js` | Shared formatting, provenance, escaping, and toast helpers |
-| `src/static/js/api.js` | Usage/pricing requests, cancellation, and cache-busting |
-| `src/static/js/dashboard.js` | Frontend orchestrator: state, polling, and filters |
-| `src/static/js/charts.js` | Chart.js visualizations and activity heatmap |
-| `src/static/js/tables.js` | Model/session tables and search filtering |
-| `src/static/js/analytics.js` | Analytics and period-comparison renderer |
-| `src/static/css/dashboard.css` | Dark-mode styles — frosted glass cards, badge colours, table layout |
-| `src/templates/index.html` | Static HTML scaffold — odometer containers, chart canvases, tables |
-| `test_parsers.py` | Tests pricing engine + both parsers against live local data |
-| `test_server.py` | Spins up a test server, hits all endpoints, checks response correctness |
-
----
-
-## Extending It
-
-### Add a new AI tool
-1. Create `src/parsers/<toolname>.py` implementing the `UsageSource` protocol and return normalized `UsageSession` objects from `extract_sessions()`.
-2. Register the adapter in `DEFAULT_SOURCE_REGISTRY`; the aggregator automatically includes it in `tool=all` and resolves its aliases.
-3. If the tool has known prices, register its provider-scoped models in `PricingCatalog`. Unknown models remain explicitly unpriced rather than receiving another provider's fallback rate.
-4. Add an `<option>` to the `<select id="tool-select">` in `index.html` when it should be selectable in the current UI.
-
-New adapters should own only provider-specific discovery and decoding. Token normalization, cost enrichment, time slicing, model/timeline aggregation, and API serialization are shared. The built-in adapters retain their mature legacy parser wrappers during migration, while exposing normalized sessions to the shared pipeline. The contracts include cache-read and cache-write counts plus reported-versus-estimated cost provenance for providers with different billing formats.
-
-### Add a new model's pricing
-New models present in LiteLLM require no manual configuration. If LiteLLM lacks a model or uses an alternate model ID, add an alias in `_ALIASES` in `src/pricing.py` or register a provider/model fallback entry in `PricingCatalog` with `uncached_input`, `cached_input`, and `output` rates ($/1M tokens). Optional `cache_write` or `cache_creation` rates are supported. `MODEL_PRICING`, `get_pricing()`, and `calculate_cost()` remain available for backward compatibility.
-
-### Change the polling interval default
-Edit `state.autoRefreshInterval` in `dashboard.js` (line ~12). Value is in milliseconds.
+See [setup and the file tree](README.md) for entry points, and [retention](docs/CODEX_RETENTION.md) for optional transcript deletion.

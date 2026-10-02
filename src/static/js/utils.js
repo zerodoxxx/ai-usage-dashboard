@@ -90,12 +90,11 @@
     };
   }
 
-  // AGY transcript token counts are chars//4 estimates, unlike the exact
-  // API-reported counts from Codex/Claude. The backend marks those rows with
-  // `estimated:true` / `token_source:'estimated'`; token_usage.db rows carry
-  // explicit reported provenance. Cost provenance stays in
+  // AGY token counts in usage.db are transcript estimates; Codex/Claude
+  // counts come from recorded usage. The backend preserves token provenance
+  // with `estimated` / `token_source`. Cost provenance stays in
   // `cost_source`/`pricing_status`.
-  const EST_TOOLTIP = 'Estimated from transcript text (chars ÷ 4); single-turn assumes 0% cache, multi-turn assumes a flat 45% cached-input share. Codex/Claude counts are exact API reports.';
+  const EST_TOOLTIP = 'Antigravity counts are estimated by tokenizing transcript text, not reported by the API. Codex and Claude counts are exact API reports.';
   const PROVENANCE_LABELS = {
     reported: 'reported',
     estimated: 'est.',
