@@ -10,8 +10,12 @@ execution and never stores transcript text.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
+import math
+import signal
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +29,7 @@ from src.usage_store import (  # noqa: E402
     is_provider_capture_enabled,
     mark_provider_capture_enabled,
     resolve_db_path,
+    UsageStoreDeadlineExceeded,
     write_usage_sessions,
 )
 
@@ -35,6 +40,53 @@ _CAPTURE_EVENTS = frozenset({
     "interrupt",
     "sessionend",
 })
+
+
+class _DeadlineExpired(TimeoutError):
+    """The hook's total capture budget has been exhausted."""
+
+
+@contextmanager
+def _parse_backstop(deadline: float | None):
+    """Last-resort SIGALRM guard around transcript parsing.
+
+    The store enforces the deadline for its own SQLite waits and retries; only
+    parsing (pure Python, no store call) needs an interrupting timer.
+    """
+    if deadline is None:
+        yield
+        return
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _DeadlineExpired()
+
+    def expire(_signum, _frame):
+        raise _DeadlineExpired()
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    started = time.monotonic()
+    try:
+        signal.signal(signal.SIGALRM, expire)
+        signal.setitimer(signal.ITIMER_REAL, remaining)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        delay, interval = previous_timer
+        if delay:
+            delay = max(0.000001, delay - (time.monotonic() - started))
+        signal.setitimer(signal.ITIMER_REAL, delay, interval)
+
+
+def _deadline_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("deadline must be a positive finite number") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("deadline must be a positive finite number")
+    return seconds
 
 
 def _capture_target(payload: dict[str, Any]) -> tuple[str, str, str | None] | None:
@@ -67,6 +119,7 @@ def process_hook_payload(
     *,
     db_path: str | Path | None = None,
     codex_dir: str | Path | None = None,
+    deadline: float | None = None,
 ) -> int | None:
     """Capture one snapshot; return persisted token total, or None on a skip."""
     if not isinstance(payload, dict):
@@ -78,15 +131,16 @@ def process_hook_payload(
 
     from src.parsers.codex import extract_codex_session_for_capture
 
-    session = extract_codex_session_for_capture(
-        transcript_path=transcript_path,
-        session_id=session_id,
-        model=model,
-        codex_dir=codex_dir,
-    )
+    with _parse_backstop(deadline):
+        session = extract_codex_session_for_capture(
+            transcript_path=transcript_path,
+            session_id=session_id,
+            model=model,
+            codex_dir=codex_dir,
+        )
     if session is None:
         return None
-    written = write_usage_sessions("codex", [session], db_path=db_path)
+    written = write_usage_sessions("codex", [session], db_path=db_path, deadline=deadline)
     return session.usage.total_tokens if written else None
 
 
@@ -127,6 +181,10 @@ def _arguments(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--db", type=Path, help="Override the shared usage database path.")
     parser.add_argument("--codex-dir", type=Path, help="Override the Codex history directory.")
+    parser.add_argument(
+        "--deadline-seconds", type=_deadline_seconds,
+        help="Limit total hook capture time, including parsing and database retries.",
+    )
     return parser.parse_args(argv)
 
 
@@ -157,11 +215,17 @@ def main(argv: list[str] | None = None) -> int:
     # operational output off stdout, and never let telemetry failure block a
     # completed user turn.
     try:
-        payload = json.load(sys.stdin)
+        deadline = (
+            None if args.deadline_seconds is None
+            else time.monotonic() + args.deadline_seconds
+        )
+        with _parse_backstop(deadline):
+            payload = json.load(sys.stdin)
         token_total = process_hook_payload(
             payload,
             db_path=args.db,
             codex_dir=args.codex_dir,
+            deadline=deadline,
         )
         if token_total is None:
             print(
@@ -170,6 +234,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             print(f"Codex usage captured ({token_total} tokens).", file=sys.stderr)
+    except (_DeadlineExpired, UsageStoreDeadlineExceeded):
+        print("Codex usage capture skipped (deadline expired).", file=sys.stderr)
     except Exception as exc:
         print(
             f"Codex usage capture skipped ({type(exc).__name__}).",

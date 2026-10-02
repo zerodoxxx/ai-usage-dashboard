@@ -31,6 +31,7 @@ def _make_source_tree(root: Path, publisher_value: str = "v1") -> Path:
         "from src.parsers.codex import MARKER\n"
         "parser = argparse.ArgumentParser()\n"
         "parser.add_argument('--db')\n"
+        "parser.add_argument('--deadline-seconds')\n"
         "args = parser.parse_args()\n"
         "if args.db:\n"
         "    print('{}')\n"
@@ -158,7 +159,10 @@ def test_installs_frozen_payload_merges_existing_hooks_and_quotes_paths(
         assert parts[1].startswith("CODEX_USAGE_PUBLISHER_SHA256=")
         assert parts[2] == str(resolved_python)
         assert parts[3] == str(installed_script)
-        assert parts[4:] == ["--db", str(database.resolve())]
+        assert parts[4:] == [
+            "--db", str(database.resolve()), "--deadline-seconds",
+            "2.5" if event == "Interrupt" else "25",
+        ]
         publisher_hook = next(
             hook
             for group in document["hooks"][event]
@@ -246,7 +250,8 @@ def test_environment_database_default_and_explicit_override(
         "Stop",
         first.publisher_script,
     )[0]
-    assert shlex.split(first_command)[-1] == str(configured_database.resolve())
+    parts = shlex.split(first_command)
+    assert parts[parts.index("--db") + 1] == str(configured_database.resolve())
 
     second = installer.install_codex_usage_hooks(
         source_root=source,
@@ -261,7 +266,8 @@ def test_environment_database_default_and_explicit_override(
         second.publisher_script,
     )
     assert len(commands) == 1
-    assert shlex.split(commands[0])[-1] == str(explicit_database.resolve())
+    parts = shlex.split(commands[0])
+    assert parts[parts.index("--db") + 1] == str(explicit_database.resolve())
 
 
 def test_source_update_uses_a_new_immutable_release_and_updates_hook_command(
@@ -435,4 +441,5 @@ def test_default_database_is_the_tool_neutral_store_path(
     command = _publisher_commands(
         _read_hooks(result.hooks_file), "Stop", result.publisher_script
     )[0]
-    assert shlex.split(command)[-1] == str(expected.resolve())
+    parts = shlex.split(command)
+    assert parts[parts.index("--db") + 1] == str(expected.resolve())

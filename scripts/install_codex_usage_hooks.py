@@ -258,7 +258,9 @@ def _hook_command(
 def _handler_for(command: str, event: str) -> dict[str, Any]:
     return {
         "type": "command",
-        "command": command,
+        "command": command + " " + shlex.join([
+            "--deadline-seconds", "2.5" if event == "Interrupt" else "25",
+        ]),
         "timeout": (
             INTERRUPT_TIMEOUT_SECONDS if event == "Interrupt" else HOOK_TIMEOUT_SECONDS
         ),
@@ -528,7 +530,7 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         "--db",
         type=Path,
         default=None,
-        help="AGY token usage SQLite database path (defaults to AI_USAGE_DB_PATH or ~/.local/share/ai-usage/usage.db)",
+        help="Shared usage SQLite database path (defaults to AI_USAGE_DB_PATH or ~/.local/share/ai-usage/usage.db)",
     )
     parser.add_argument(
         "--python",

@@ -7,6 +7,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 import src.parsers.codex as codex_parser
 import scripts.codex_usage_writer as writer
 from src.parsers.contracts import TokenUsage, UsageEvent, UsageSession
@@ -270,7 +272,8 @@ def test_cli_stop_with_real_codex_payload_shape_writes_row(tmp_path: Path) -> No
     db_path = tmp_path / "usage.db"
     script = Path(writer.__file__).resolve()
     result = subprocess.run(
-        [sys.executable, str(script), "--db", str(db_path), "--codex-dir", str(tmp_path / "home")],
+        [sys.executable, str(script), "--db", str(db_path), "--codex-dir", str(tmp_path / "home"),
+         "--deadline-seconds", "25"],
         input=json.dumps(payload),
         capture_output=True,
         text=True,
@@ -285,3 +288,101 @@ def test_cli_stop_with_real_codex_payload_shape_writes_row(tmp_path: Path) -> No
     loaded = read_usage_sessions("codex", db_path)
     assert [s.id for s in loaded] == [thread]
     assert loaded[0].usage.total_tokens == 22281
+
+
+@pytest.mark.parametrize("existing_schema", [True, False])
+def test_locked_interrupt_returns_json_before_hook_timeout(
+    tmp_path: Path, existing_schema: bool,
+) -> None:
+    import sqlite3
+    import subprocess
+    import sys
+
+    db_path = tmp_path / "usage.db"
+    if existing_schema:
+        writer.write_usage_sessions("codex", [_session()], db_path)
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(json.dumps({
+        "timestamp": "2026-10-02T13:42:05Z",
+        "type": "event_msg",
+        "payload": {"type": "token_count", "info": {"total_token_usage": {
+            "input_tokens": 80, "output_tokens": 30, "total_tokens": 110,
+        }}},
+    }) + "\n", encoding="utf-8")
+    payload = {
+        "hook_event_name": "Interrupt",
+        "session_id": "locked-thread",
+        "transcript_path": str(rollout),
+    }
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        result = subprocess.run(
+            [sys.executable, str(Path(writer.__file__).resolve()),
+             "--db", str(db_path), "--codex-dir", str(tmp_path),
+             "--deadline-seconds", "2.5"],
+            input=json.dumps(payload), capture_output=True, text=True,
+            cwd=tmp_path, timeout=3, check=False,
+        )
+    finally:
+        connection.rollback()
+        connection.close()
+
+    assert result.returncode == 0
+    assert result.stdout == "{}\n"
+    if existing_schema:
+        assert "deadline" in result.stderr.casefold()
+    else:
+        # Journal-mode migration can reject a lock immediately and exhaust
+        # its retry count before the deadline; that is also a safe skip.
+        assert "capture skipped" in result.stderr.casefold()
+    assert [session.id for session in read_usage_sessions("codex", db_path)] == (
+        ["thread-1"] if existing_schema else []
+    )
+
+
+def test_hook_passes_monotonic_deadline_to_store(tmp_path: Path, monkeypatch) -> None:
+    seen = {}
+
+    def fake_write(provider, sessions, db_path=None, *, deadline=None):
+        seen["deadline"] = deadline
+        return 1
+
+    monkeypatch.setattr(writer, "write_usage_sessions", fake_write)
+    monkeypatch.setattr(
+        codex_parser, "extract_codex_session_for_capture", lambda **_kw: _session(),
+    )
+    monkeypatch.setattr(writer.sys, "stdin", io.StringIO(json.dumps({
+        "hook_event_name": "Stop", "session_id": "t",
+        "transcript_path": str(tmp_path / "rollout.jsonl"),
+    })))
+    before = writer.time.monotonic()
+    assert writer.main(["--db", str(tmp_path / "u.db"), "--deadline-seconds", "5"]) == 0
+    assert before + 4.9 <= seen["deadline"] <= writer.time.monotonic() + 5.1
+
+
+def test_deadline_includes_transcript_parsing(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    def extract(**_kwargs):
+        writer.time.sleep(0.2)
+        return _session()
+
+    monkeypatch.setattr(codex_parser, "extract_codex_session_for_capture", extract)
+    monkeypatch.setattr(writer.sys, "stdin", io.StringIO(json.dumps({
+        "hook_event_name": "Interrupt", "session_id": "slow-thread",
+        "transcript_path": str(tmp_path / "rollout.jsonl"),
+    })))
+    db_path = tmp_path / "usage.db"
+    assert writer.main(["--db", str(db_path), "--deadline-seconds", "0.02"]) == 0
+    output = capsys.readouterr()
+    assert output.out == "{}\n"
+    assert "deadline expired" in output.err
+    assert not db_path.exists()
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "not-a-number"])
+def test_deadline_rejects_nonpositive_or_nonfinite_values(value: str) -> None:
+    with pytest.raises(SystemExit) as exc:
+        writer._arguments(["--deadline-seconds", value])
+    assert exc.value.code == 2
