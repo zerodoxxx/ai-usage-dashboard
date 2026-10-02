@@ -1,73 +1,75 @@
 # Codex transcript retention
 
-Codex keeps transcripts so it can reopen and resume older conversations. This
-project can remove inactive transcripts after 15 days while keeping their
-normalized token usage in the shared SQLite database at
-`~/.local/share/ai-usage/usage.db`. The old
-`~/.gemini/antigravity-cli/token_usage.db` file is a frozen backup and is never
-used to decide whether a transcript can be deleted. Set `AI_USAGE_DB_PATH` or
-pass `--db` to use an alternate database.
+Optional macOS retention removes inactive Codex conversation trees after 15 days while preserving normalized usage in the shared SQLite database. **It deletes transcripts: Codex can no longer reopen or resume those conversations.** A database backup preserves usage, not conversation text.
 
-The retention command is read-only by default:
+The active database defaults to `~/.local/share/ai-usage/usage.db`; `AI_USAGE_DB_PATH` or `--db` overrides it. The legacy `~/.gemini/antigravity-cli/token_usage.db` path is rejected for deletion decisions.
 
-```sh
+## Preview and capture checks
+
+The default command is a read-only preview:
+
+```bash
 python scripts/codex_retention.py
 ```
 
-It reports aggregate counts and transcript bytes that meet the policy. Before
-deletion, it reads each candidate rollout to compare the input, cached input,
-uncached input, output, cache-write, reasoning-output, and total token counts
-with the matching provider-tagged row in SQLite. The stored row must have
-`provider='codex'` and the session ID `codex:<Codex session ID>`. Its capture
-metadata must identify that rollout and match its current file revision
-(resolved-path hash, modification time, change time, and size). Provider-wide
-capture flags alone do not prove that a particular rollout was captured.
+The preview reports aggregate eligible trees, threads, transcript count, bytes, and skip reasons. The database must exist, be readable, and contain provider-tagged Codex rows. Missing, unreadable, provider-less, Codex-empty, or legacy-path databases stop the run.
 
-The database must exist, be readable, and contain Codex rows. A missing,
-unreadable, legacy, or Codex-empty database stops the run. A missing session,
-state-summary-only row, undercounted tokens, absent or stale capture metadata,
-changed or symlinked file, unknown activity time, malformed rollout, or
-incomplete thread graph protects the whole conversation tree. Skips are
-reported as aggregate reasons; file paths, IDs, titles, and transcript text
-are not included in the retention log.
+For every rollout fragment, retention independently reads raw token records and checks that the matching `provider='codex'`, `session_id='codex:<native-id>'` snapshot covers input, cached and uncached input, output, cache writes (including lifetime splits), reasoning output, and total tokens. It also requires capture metadata matching the resolved-path hash, modification time, change time, and size. Provider-wide backfill flags alone do not prove capture.
 
-Codex's current live Stop hook has not yet been verified to write successfully.
-The available Codex rows came from the backfill completed at
-`2026-10-02T12:31Z`; a newer rollout is retained until its own row and source
-revision are present in SQLite.
+A session needs positive tokens and verified events; a state-summary-only snapshot is insufficient. Sources must remain inside the verified Codex home and must not be symlinked or change during verification. Unsafe directories or scan failures stop the plan.
 
-The age check uses the newest activity time across every rollout fragment,
-Codex's per-thread update and recency fields, and the stored usage activity.
-Spawned sessions are treated as one tree: a recent child keeps the parent and
-all siblings. The shared database's Codex rows and Antigravity rows are never
-deleted or rewritten by retention.
+Age uses the newest activity across rollout modification times, Codex thread update/recency fields, and stored usage activity. Parent and spawned sessions form one tree: a recent child keeps its parent and siblings.
+
+| Skip reason | Why the tree is kept |
+|:------------|:---------------------|
+| `ambiguous_thread_tree` | Multiple roots/parents, cycles, or an inconsistent graph |
+| `missing_thread_metadata` | A related thread is absent from Codex metadata |
+| `thread_activity_unknown` | Thread activity is absent or cannot be parsed |
+| `transcript_not_exactly_captured` | Missing/stale source revision, unsafe file, or a change during verification |
+| `usage_ambiguous` | Raw counters cannot be independently reconciled |
+| `sqlite_usage_below_rollout_totals` | Stored counters do not cover independently verified rollout usage |
+| `sqlite_usage_missing` | Missing provider-tagged capture or rollout source |
+| `no_verified_token_events` | No positive usage/events, or only a state summary |
+| `no_transcripts` | No verified transcript sources |
+| `within_retention_window` | Activity is newer than the cutoff |
+
+Raw verification accepts records carrying both thread and turn totals, repeated/null-info legacy `token_count` events, and response records exceeding legacy counts. Contradictory or decreasing counters, cumulative totals above summed usage, unscoped turn counts, conflicting response records, and legacy counts above responses remain ambiguous.
+
+## Deletion and backup
+
+Apply requires Codex Desktop, its server, and all Codex CLI processes to be closed. Unknown process state fails the safety check; a running Codex defers scheduled work. Before each deletion, retention rebuilds eligibility and rechecks source revisions and closed state.
+
+Before the first deletion in a run, it makes a **fresh verified SQLite backup** through `scripts/backup_usage_db.py`. Creation, integrity, per-provider session/event counts and token sums, publication, and rotation must succeed. A failure produces `backup_failed` and deletes no trees in that run. Eligibility is checked again after backup. Backups default to `<db dir>/backups`, retaining 14; see [backup and restore](SHARED_USAGE_DB.md#backup-and-restore).
+
+Deletion calls Codex's own `--no-daemon delete <root-id> --force` command instead of unlinking files. Child processes pin **both `CODEX_HOME` and `CODEX_SQLITE_HOME`** to the resolved, verified Codex directory. Ambient home overrides cannot redirect deletion to another Codex store. Codex's writer lock can refuse deletion if a thread becomes active; failures stop remaining work.
+
+Retention never deletes or rewrites usage rows for any provider. Transcript byte counts are estimates; Codex deletion also updates its metadata.
 
 ## Automatic cleanup
 
-The installer writes an immutable, content-addressed runtime and one
-user-level macOS LaunchAgent:
+The installer writes an immutable, content-addressed runtime and one user LaunchAgent. It does not load or unload the job:
 
-```sh
+```bash
 python scripts/install_codex_retention.py
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.zerodoxxx.ai-usage-dashboard.codex-retention.plist"
 ```
 
-The job checks every 15 minutes. If Codex Desktop, its native server, or any
-Codex CLI process is running, it skips the run and tries again later. When
-Codex is closed, it rechecks the full plan and each source revision before
-calling Codex's own `delete` command. Codex's rollout writer lock also refuses
-to delete a conversation whose transcript is actively being written. The job
-does not unlink rollout files directly.
+The job runs on load and every 15 minutes, applying the 15-day policy only when safety checks pass. Disable it with:
 
-The installed job is pinned to Codex CLI `0.159.2`, the version whose delete
-and spawned-thread behavior this policy was checked against. A version change
-stops deletion until the compatibility pin is reviewed and the job is
-reinstalled. The LaunchAgent writes only aggregate JSON status to a bounded
-log at `~/.codex/usage-retention/retention.log`; Codex command output,
-conversation IDs, titles, and transcript content are not logged.
+```bash
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.zerodoxxx.ai-usage-dashboard.codex-retention.plist"
+```
 
-Since usage totals remain in SQLite, older conversations still appear in the
-dashboard after their local transcripts are removed. Codex can no longer
-resume a conversation after Codex deletes it. Transcript bytes shown by the
-preview are an estimate; Codex also updates its own metadata database during
-deletion.
+The installer pins the interpreter, database, Codex home, CLI executable, and supported version **`0.159.2`**. Apply checks that exact version; the installer rejects unsupported versions too. **After a Codex update, deletion stops until the compatibility pin is reviewed and the job is reinstalled.** Reinstallation alone cannot approve an unsupported version.
+
+After a compatible runtime or path change, unload the old job, reinstall, and reload it:
+
+```bash
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.zerodoxxx.ai-usage-dashboard.codex-retention.plist"
+python scripts/install_codex_retention.py
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.zerodoxxx.ai-usage-dashboard.codex-retention.plist"
+```
+
+`--codex-home`, `--db`, `--python`, and `--codex` select alternate install paths. Use matching `--codex-dir` and `--db` for a preview of that installation.
+
+The job writes bounded aggregate JSON status to `~/.codex/usage-retention/retention.log` (under the selected Codex home for custom installs). It omits Codex command output, conversation IDs, titles, and transcript text.

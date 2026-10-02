@@ -20,6 +20,7 @@ from scripts.codex_retention import (
     find_active_codex_processes,
 )
 from src.parsers.contracts import TokenUsage, UsageEvent, UsageSession
+from src.parsers.codex import extract_codex_session_for_capture
 from src.usage_store import LEGACY_DB_RELATIVE_PATH, mark_provider_capture_enabled, read_usage_sessions, write_usage_sessions
 
 
@@ -582,3 +583,253 @@ def test_process_scan_fails_closed_when_ps_omits_this_process(
 
     with pytest.raises(RuntimeError, match="could not verify"):
         find_active_codex_processes(run=lambda *_args, **_kwargs: result)
+
+
+def _capture_raw_records(tmp_path: Path, records: list[dict]) -> tuple[Path, Path, Path, datetime]:
+    now = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    root = tmp_path / "codex"
+    root.mkdir()
+    db = tmp_path / "usage.db"
+    paths, activity = _make_capture(root, db, now=now, capture_child=False, root_fragments=1)
+    path = paths[0]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    old_ns = int(activity.timestamp() * 1_000_000_000)
+    os.utime(path, ns=(old_ns, old_ns))
+    captured = extract_codex_session_for_capture(path, _ROOT_ID, codex_dir=root)
+    assert captured is not None
+    write_usage_sessions("codex", [captured], db_path=db)
+    return root, db, path, now
+
+
+def _raw_token(response: str, **counters: object) -> dict:
+    usage = {"input_tokens": 10, "cached_input_tokens": 3, "output_tokens": 4,
+             "reasoning_output_tokens": 1, "total_tokens": 14}
+    return {"timestamp": "2026-09-12T12:00:00Z", "type": "token_usage_record",
+            "payload": {"thread_id": _ROOT_ID, "response_id": response,
+                        "usage": usage, **counters}}
+
+
+@pytest.mark.parametrize("variant", ["stale_thread", "unscoped_turn", "mixed", "decreasing", "unreconciled"])
+def test_independent_verification_keeps_ambiguous_usage(tmp_path: Path, variant: str) -> None:
+    usage = _raw_token("one")["payload"]["usage"]
+    doubled = {name: value * 2 for name, value in usage.items()}
+    variants = {
+        "stale_thread": [_raw_token("one", thread_token_usage=usage), _raw_token("two")],
+        "unscoped_turn": [_raw_token("one", turn_token_usage=usage), _raw_token("two", turn_token_usage=usage)],
+        "mixed": [_raw_token("one", thread_token_usage=usage), _raw_token("two", turn_token_usage=usage)],
+        "decreasing": [_raw_token("one", thread_token_usage=doubled), _raw_token("two", thread_token_usage=usage)],
+        "unreconciled": [_raw_token("one", thread_token_usage=doubled)],
+    }
+    root, db, path, now = _capture_raw_records(tmp_path, variants[variant])
+    plan = build_retention_plan(now=now, codex_dir=root, db_path=db)
+    assert plan.trees == []
+    assert plan.skipped["usage_ambiguous"] >= 1
+    assert path.exists()
+
+
+def test_apply_pins_verified_home_with_same_uuid_elsewhere(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    root = tmp_path / "verified"
+    root.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    db = tmp_path / "usage.db"
+    paths, _ = _make_capture(root, db, now=now)
+    other_paths, _ = _make_capture(other, tmp_path / "other.db", now=now)
+    monkeypatch.setenv("CODEX_HOME", str(other))
+    monkeypatch.setenv("CODEX_SQLITE_HOME", str(other))
+    plan = build_retention_plan(now=now, codex_dir=root, db_path=db)
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if "--version" in command:
+            return subprocess.CompletedProcess(command, 0, stdout=f"codex-cli {SAFE_CODEX_VERSION}", stderr="")
+        child_env = kwargs.get("env", os.environ)
+        assert child_env["CODEX_HOME"] == str(root.resolve())
+        assert child_env["CODEX_SQLITE_HOME"] == str(root.resolve())
+        for path in paths:
+            path.unlink()
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    deleted, errors = apply_retention_plan(plan, codex_dir=root, db_path=db, process_check=lambda: [],
+                                         run=run, codex_executable="codex", expected_codex_version=SAFE_CODEX_VERSION,
+                                         now=lambda: now)
+    assert (deleted, errors) == (1, [])
+    assert all(path.exists() for path in other_paths)
+
+
+def test_apply_requires_backup_before_first_delete(tmp_path: Path) -> None:
+    now = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    root = tmp_path / "codex"
+    root.mkdir()
+    db = tmp_path / "usage.db"
+    paths, _ = _make_capture(root, db, now=now)
+    plan = build_retention_plan(now=now, codex_dir=root, db_path=db)
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if "--version" in command:
+            return subprocess.CompletedProcess(command, 0, stdout=f"codex-cli {SAFE_CODEX_VERSION}", stderr="")
+        backups = list((db.parent / "backups").glob("usage-*.db"))
+        assert len(backups) == 1
+        assert len(read_usage_sessions("codex", db_path=backups[0])) == 2
+        for path in paths:
+            path.unlink()
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    assert apply_retention_plan(plan, codex_dir=root, db_path=db, process_check=lambda: [], run=run,
+                                codex_executable="codex", expected_codex_version=SAFE_CODEX_VERSION,
+                                now=lambda: now) == (1, [])
+
+
+@pytest.mark.parametrize("variant", ["valid", "decrease", "mismatch", "dual_mismatch", "conflicting_id"])
+def test_independent_verification_legacy_and_conflicting_streams(tmp_path: Path, variant: str) -> None:
+    usage = _raw_token("one")["payload"]["usage"]
+    doubled = {name: value * 2 for name, value in usage.items()}
+    def legacy(last: dict, total: dict) -> dict:
+        return {"type": "event_msg", "payload": {"type": "token_count", "info": {
+            "last_token_usage": last, "total_token_usage": total}}}
+    records = [legacy(usage, usage), legacy(usage, doubled)]
+    if variant == "decrease":
+        records.append(legacy(usage, usage))
+    elif variant == "mismatch":
+        records = [legacy(usage, doubled)]
+    elif variant == "dual_mismatch":
+        records.append(_raw_token("one"))
+    elif variant == "conflicting_id":
+        records = [_raw_token("one"), _raw_token("one", usage=doubled)]
+    path = tmp_path / "rollout.jsonl"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    if variant == "valid":
+        assert codex_retention._independent_rollout_usage(path, _ROOT_ID)["total_tokens"] == 28
+    else:
+        with pytest.raises(codex_retention.UsageAmbiguous):
+            codex_retention._independent_rollout_usage(path, _ROOT_ID)
+
+
+def test_backup_failure_blocks_all_deletion_and_reports_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    now = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    root = tmp_path / "codex"
+    root.mkdir()
+    db = tmp_path / "usage.db"
+    paths, _ = _make_capture(root, db, now=now)
+    plan = build_retention_plan(now=now, codex_dir=root, db_path=db)
+    calls = []
+    def fail_backup(_db: Path) -> None:
+        raise codex_retention.BackupError("synthetic backup failure")
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        assert "delete" not in command
+        return subprocess.CompletedProcess(command, 0, stdout=f"codex-cli {SAFE_CODEX_VERSION}", stderr="")
+    monkeypatch.setattr(codex_retention, "backup_usage_db", fail_backup)
+    original_apply = apply_retention_plan
+    def apply(plan: codex_retention.RetentionPlan, **kwargs: object) -> tuple[int, list[str]]:
+        return original_apply(plan, **kwargs, process_check=lambda: [], run=run, now=lambda: now)
+    monkeypatch.setattr(codex_retention, "apply_retention_plan", apply)
+    monkeypatch.setattr(codex_retention, "find_active_codex_processes", lambda: [])
+    monkeypatch.setattr(codex_retention, "build_retention_plan", lambda **kwargs: plan)
+    assert codex_retention.main(["--apply", "--json", "--codex-dir", str(root), "--db", str(db),
+                                 "--codex-cli", "codex", "--codex-version", SAFE_CODEX_VERSION]) == 1
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert result["status"] == "backup_failed"
+    assert result["deleted_trees"] == 0
+    assert all(path.exists() for path in paths)
+    assert len(calls) == 1
+
+
+def test_empty_or_changed_plan_does_not_take_backup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    root = tmp_path / "codex"
+    root.mkdir()
+    db = tmp_path / "usage.db"
+    paths, _ = _make_capture(root, db, now=now)
+    plan = build_retention_plan(now=now, codex_dir=root, db_path=db)
+    monkeypatch.setattr(codex_retention, "backup_usage_db", lambda *_args: pytest.fail("unexpected backup"))
+    empty = codex_retention.RetentionPlan(cutoff=plan.cutoff)
+    assert apply_retention_plan(empty, db_path=db) == (0, [])
+    paths[0].write_text("changed")
+    run = lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout=f"codex-cli {SAFE_CODEX_VERSION}", stderr="")
+    deleted, errors = apply_retention_plan(plan, codex_dir=root, db_path=db, process_check=lambda: [], run=run,
+                                          codex_executable="codex", expected_codex_version=SAFE_CODEX_VERSION, now=lambda: now)
+    assert deleted == 0 and errors
+
+
+def test_apply_rejects_outside_home_even_if_fresh_plan_returns_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import replace
+    now = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    root = tmp_path / "codex"
+    root.mkdir()
+    db = tmp_path / "usage.db"
+    paths, _ = _make_capture(root, db, now=now)
+    plan = build_retention_plan(now=now, codex_dir=root, db_path=db)
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text("keep")
+    tree = replace(plan.trees[0], sources=(replace(plan.trees[0].sources[0], path=outside),))
+    monkeypatch.setattr(codex_retention, "_tree_still_eligible", lambda *_args, **kwargs: tree)
+    monkeypatch.setattr(codex_retention, "backup_usage_db", lambda *_args: pytest.fail("unexpected backup"))
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert "delete" not in command
+        return subprocess.CompletedProcess(command, 0, stdout=f"codex-cli {SAFE_CODEX_VERSION}", stderr="")
+    deleted, errors = apply_retention_plan(plan, codex_dir=root, db_path=db, process_check=lambda: [], run=run,
+                                          codex_executable="codex", expected_codex_version=SAFE_CODEX_VERSION, now=lambda: now)
+    assert deleted == 0 and "outside" in errors[0]
+    assert outside.exists() and all(path.exists() for path in paths)
+
+
+def _u(inp: int, out: int) -> dict:
+    return {"input_tokens": inp, "cached_input_tokens": 0, "cache_write_input_tokens": 0,
+            "output_tokens": out, "reasoning_output_tokens": 0, "total_tokens": inp + out}
+
+
+def _tc(total: dict | None, last: dict | None) -> dict:
+    info = None if total is None else {"total_token_usage": total, "last_token_usage": last}
+    return {"type": "event_msg", "payload": {"type": "token_count", "info": info}}
+
+
+def _verify(tmp_path: Path, records: list[dict]) -> dict:
+    from scripts.codex_retention import _independent_rollout_usage
+
+    path = tmp_path / "rollout.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    return _independent_rollout_usage(path, "t1")
+
+
+def test_real_pattern_records_carry_both_thread_and_turn_totals(tmp_path: Path) -> None:
+    def rec(rid: str, usage: dict, cumulative: dict) -> dict:
+        return {"type": "token_usage_record", "payload": {
+            "thread_id": "t1", "turn_id": "turn1", "response_id": rid, "usage": usage,
+            "thread_token_usage": cumulative, "turn_token_usage": cumulative}}
+
+    totals = _verify(tmp_path, [rec("a", _u(10, 1), _u(10, 1)), rec("b", _u(20, 2), _u(30, 3))])
+    assert totals["total_tokens"] == 33
+    with pytest.raises(ValueError):  # a total below the summed responses is still rejected
+        _verify(tmp_path, [rec("a", _u(10, 1), _u(10, 1)), rec("b", _u(20, 2), _u(20, 2))])
+
+
+def test_real_pattern_repeated_token_count_and_null_info_counted_once(tmp_path: Path) -> None:
+    zeroed_last = _u(0, 0) | {"total_tokens": 7}
+    totals = _verify(tmp_path, [
+        _tc(_u(10, 1), _u(10, 1)),
+        _tc(None, None),
+        _tc(_u(10, 1), _u(10, 1)),
+        _tc(_u(10, 1), zeroed_last),
+        _tc(_u(25, 3), _u(15, 2)),
+    ])
+    assert totals["total_tokens"] == 28
+
+
+def test_real_pattern_modern_responses_may_exceed_legacy_events_only(tmp_path: Path) -> None:
+    def rec(rid: str, usage: dict) -> dict:
+        return {"type": "token_usage_record", "payload": {"thread_id": "t1", "response_id": rid, "usage": usage}}
+
+    totals = _verify(tmp_path, [rec("a", _u(10, 1)), rec("b", _u(5, 1)), _tc(_u(10, 1), _u(10, 1))])
+    assert totals["total_tokens"] == 17
+    with pytest.raises(ValueError):  # legacy events exceed responses: unexplained
+        _verify(tmp_path, [rec("a", _u(10, 1)), _tc(_u(10, 1), _u(10, 1)), _tc(_u(20, 2), _u(10, 1))])
+
+
+def test_genuine_legacy_contradictions_still_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):  # cumulative above summed last usage (forked/gap)
+        _verify(tmp_path, [_tc(_u(10, 1), _u(10, 1)), _tc(_u(50, 5), _u(10, 1))])
+    with pytest.raises(ValueError):  # counter decreases
+        _verify(tmp_path, [_tc(_u(20, 2), _u(20, 2)), _tc(_u(10, 1), _u(0, 0))])

@@ -31,6 +31,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from src.usage_store import LEGACY_DB_RELATIVE_PATH, resolve_db_path
 
 RETENTION_RELATIVE_PATH = Path("scripts/codex_retention.py")
+BACKUP_RELATIVE_PATH = Path("scripts/backup_usage_db.py")
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
 LAUNCH_AGENT_LABEL = "com.zerodoxxx.ai-usage-dashboard.codex-retention"
 LAUNCH_AGENT_FILENAME = f"{LAUNCH_AGENT_LABEL}.plist"
@@ -161,6 +162,10 @@ def _copy_runtime(source_root: Path, staging: Path) -> None:
         raise InstallError("Retention runtime package is missing")
 
     sources = [(entrypoint, RETENTION_RELATIVE_PATH)]
+    backup_module = source_root / BACKUP_RELATIVE_PATH
+    if backup_module.is_symlink() or not backup_module.is_file():
+        raise InstallError("Backup module is missing")
+    sources.append((backup_module, BACKUP_RELATIVE_PATH))
     for item in sorted(source_package.rglob("*")):
         if item.is_symlink() or not item.is_file():
             continue

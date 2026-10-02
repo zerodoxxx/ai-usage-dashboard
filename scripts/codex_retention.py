@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import logging
 import os
 import re
 import shutil
@@ -29,7 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.parsers.codex import extract_codex_session_for_capture
+from scripts.backup_usage_db import BackupError, backup_usage_db
 from src.usage_store import LEGACY_DB_RELATIVE_PATH, read_usage_sessions, resolve_db_path
 
 DEFAULT_DAYS = 15
@@ -426,18 +425,148 @@ def _revision_matches(source: TranscriptSource, revision: dict[str, int]) -> boo
     )
 
 
-def _captured_source_matches(source: TranscriptSource, metadata: Any) -> bool:
-    if not isinstance(metadata, dict) or metadata.get("capture_source_hash") != source.source_hash:
-        return False
-    try:
-        revision = {
-            "capture_mtime_ns": int(metadata["capture_mtime_ns"]),
-            "capture_ctime_ns": int(metadata["capture_ctime_ns"]),
-            "capture_size": int(metadata["capture_size"]),
-        }
-    except (KeyError, TypeError, ValueError, OverflowError):
-        return False
-    return _revision_matches(source, revision)
+class UsageAmbiguous(ValueError):
+    """Raw transcript counters cannot independently prove captured usage."""
+
+
+def _raw_usage(value: Any) -> dict[str, int]:
+    """Read counters strictly, without capture-parser coercion or scaling."""
+    if not isinstance(value, dict) or not {"input_tokens", "output_tokens", "total_tokens"}.issubset(value):
+        raise UsageAmbiguous("incomplete usage")
+    usage = {}
+    for name in _TOKEN_DIMENSIONS:
+        raw_name = "cache_write_input_tokens" if name == "cache_write_tokens" else name
+        item = value.get(raw_name, 0)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise UsageAmbiguous("invalid counter")
+        usage[name] = item
+    if usage["cached_input_tokens"] > usage["input_tokens"]:
+        raise UsageAmbiguous("cache exceeds input")
+    usage["uncached_input_tokens"] = usage["input_tokens"] - usage["cached_input_tokens"]
+    if usage["reasoning_output_tokens"] > usage["output_tokens"]:
+        raise UsageAmbiguous("reasoning exceeds output")
+    base_total = usage["input_tokens"] + usage["output_tokens"]
+    if usage["total_tokens"] not in {base_total, base_total + usage["cache_write_tokens"]}:
+        raise UsageAmbiguous("token total contradicts input and output")
+    return usage
+
+
+def _independent_rollout_usage(path: Path, thread_id: str) -> dict[str, int]:
+    """Reconcile raw response sums with scoped totals; uncertainty keeps files.
+
+    Modern responses and legacy token-count messages are separate streams.
+    If both occur, each must independently reconcile and agree. Thread totals
+    must cover the entire stream; turn totals are checked within explicit turns.
+    """
+    modern = {name: 0 for name in _TOKEN_DIMENSIONS}
+    legacy = dict(modern)
+    turns: dict[str, dict[str, int]] = {}
+    turn_totals: dict[str, dict[str, int]] = {}
+    responses: dict[str, dict] = {}
+    thread_total = None
+    legacy_total = None
+    scope = None
+    active_turn = None
+    modern_count = legacy_count = 0
+
+    def add(target: dict[str, int], usage: dict[str, int]) -> None:
+        for name in _TOKEN_DIMENSIONS:
+            target[name] += usage[name]
+
+    def check_total(current: dict[str, int], previous: dict[str, int] | None,
+                    summed: dict[str, int]) -> None:
+        if previous is not None and any(current[name] < previous[name] for name in _TOKEN_DIMENSIONS):
+            raise UsageAmbiguous("counter decreased")
+        if current != summed:
+            raise UsageAmbiguous("cumulative usage differs from response sum")
+
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise UsageAmbiguous("invalid record")
+            kind = record.get("type")
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                raise UsageAmbiguous("invalid payload")
+            if kind == "turn_context":
+                active_turn = payload.get("turn_id")
+            elif kind == "token_usage_record":
+                if payload.get("thread_id") and str(payload["thread_id"]).casefold() != thread_id.casefold():
+                    raise UsageAmbiguous("wrong thread")
+                response_id = payload.get("response_id")
+                if not response_id:
+                    raise UsageAmbiguous("response identity missing")
+                response_key = str(response_id)
+                if response_key in responses:
+                    if responses[response_key] != payload:
+                        raise UsageAmbiguous("conflicting response records")
+                    continue
+                responses[response_key] = payload
+                usage = _raw_usage(payload.get("usage"))
+                add(modern, usage)
+                modern_count += 1
+                turn_id = payload.get("turn_id") or active_turn
+                if turn_id:
+                    turn_id = str(turn_id)
+                    add(turns.setdefault(turn_id, {name: 0 for name in _TOKEN_DIMENSIONS}), usage)
+                present = frozenset(
+                    record_scope
+                    for key, record_scope in (("thread_token_usage", "thread"), ("turn_token_usage", "turn"))
+                    if payload.get(key) is not None
+                )
+                if present:
+                    # Real Codex records carry BOTH counters on every response.
+                    # Streams that switch between scope sets stay ambiguous.
+                    if scope is not None and scope != present:
+                        raise UsageAmbiguous("mixed thread and turn totals")
+                    scope = present
+                if "thread" in present:
+                    current = _raw_usage(payload["thread_token_usage"])
+                    check_total(current, thread_total, modern)
+                    thread_total = current
+                if "turn" in present:
+                    if not turn_id:
+                        raise UsageAmbiguous("turn identity missing")
+                    current = _raw_usage(payload["turn_token_usage"])
+                    check_total(current, turn_totals.get(turn_id), turns[turn_id])
+                    turn_totals[turn_id] = current
+            elif kind == "event_msg" and payload.get("type") == "token_count":
+                info = payload.get("info")
+                if info is None:
+                    continue  # rate-limit-only token_count event carries no usage
+                if not isinstance(info, dict):
+                    raise UsageAmbiguous("token count info missing")
+                if info.get("total_token_usage") is not None and legacy_total is not None:
+                    # Codex re-emits token_count events (sometimes with a
+                    # zeroed last_token_usage); an unchanged cumulative total
+                    # means no new usage, so it is never counted again.
+                    if _raw_usage(info["total_token_usage"]) == legacy_total:
+                        continue
+                last = _raw_usage(info.get("last_token_usage"))
+                add(legacy, last)
+                legacy_count += 1
+                if info.get("total_token_usage") is not None:
+                    if scope == frozenset({"turn"}):
+                        raise UsageAmbiguous("mixed thread and turn totals")
+                    current = _raw_usage(info["total_token_usage"])
+                    check_total(current, legacy_total, legacy)
+                    legacy_total = current
+    if not modern_count and not legacy_count:
+        raise UsageAmbiguous("no response usage")
+    if thread_total is not None and thread_total != modern:
+        raise UsageAmbiguous("stale thread total")
+    if legacy_total is not None and legacy_total != legacy:
+        raise UsageAmbiguous("stale legacy total")
+    if scope is not None and "turn" in scope and (turns != turn_totals or sum(value["total_tokens"] for value in turns.values()) != modern["total_tokens"]):
+        raise UsageAmbiguous("incomplete turn totals")
+    if modern_count and legacy_count and any(legacy[name] > modern[name] for name in _TOKEN_DIMENSIONS):
+        # Per-response records may legitimately outnumber legacy token_count
+        # events (some responses never emit one). The reverse is unexplained.
+        raise UsageAmbiguous("response streams disagree")
+    return modern if modern_count else legacy
 
 
 def _session_activity(session: Any) -> datetime | None:
@@ -519,6 +648,7 @@ def build_retention_plan(
             capture_missing = False
             source_mismatch_count = 0
             usage_mismatch_count = 0
+            usage_ambiguous_count = 0
             no_usage = False
             for thread_id in component:
                 thread = threads[thread_id]
@@ -572,28 +702,16 @@ def build_retention_plan(
                     if revision is None or not _revision_matches(source, revision):
                         source_mismatch_count += 1
                         continue
-                    parser_logger = logging.getLogger("src.parsers.codex")
-                    parser_was_disabled = parser_logger.disabled
-                    parser_logger.disabled = True
                     try:
-                        rollout_session = extract_codex_session_for_capture(
-                            source.path,
-                            str(thread["id"]),
-                            codex_dir=codex_root,
-                        )
-                    except Exception:
-                        rollout_session = None
-                    finally:
-                        parser_logger.disabled = parser_was_disabled
-                    if (
-                        rollout_session is None
-                        or str(rollout_session.id).casefold() != thread_id
-                        or not _captured_source_matches(source, rollout_session.metadata)
-                    ):
+                        raw_totals = _independent_rollout_usage(source.path, str(thread["id"]))
+                    except (OSError, ValueError, UnicodeError):
+                        usage_ambiguous_count += 1
+                        continue
+                    if _source_for_path(source.path, codex_root) != source:
                         source_mismatch_count += 1
                         continue
                     for name in _TOKEN_DIMENSIONS:
-                        rollout_totals[name] += int(getattr(rollout_session.usage, name, 0) or 0)
+                        rollout_totals[name] += raw_totals[name]
                     parsed_source_count += 1
                     sources[str(source.path)] = source
                     activity_values.append(datetime.fromtimestamp(
@@ -611,6 +729,9 @@ def build_retention_plan(
                 continue
             if source_mismatch_count:
                 plan.skip("transcript_not_exactly_captured", source_mismatch_count)
+                continue
+            if usage_ambiguous_count:
+                plan.skip("usage_ambiguous", usage_ambiguous_count)
                 continue
             if usage_mismatch_count:
                 plan.skip("sqlite_usage_below_rollout_totals", usage_mismatch_count)
@@ -728,10 +849,18 @@ def apply_retention_plan(
     """Delete eligible trees through Codex after closed-state and race checks."""
     if plan.error:
         return 0, [plan.error]
+    if not plan.trees:
+        return 0, []
     try:
-        _validated_database_snapshot(db_path)
+        resolved_db_path, _ = _validated_database_snapshot(db_path)
+        codex_root = _safe_codex_root(codex_dir)
     except RetentionDatabaseError as exc:
         return 0, [str(exc)]
+    except (OSError, ValueError) as exc:
+        return 0, [str(exc)]
+    child_env = os.environ.copy()
+    child_env["CODEX_HOME"] = str(codex_root)
+    child_env["CODEX_SQLITE_HOME"] = str(codex_root)
     try:
         active = process_check()
     except RuntimeError as exc:
@@ -750,6 +879,7 @@ def apply_retention_plan(
             capture_output=True,
             text=True,
             timeout=10,
+            env=child_env,
         )
     except (OSError, subprocess.SubprocessError):
         return 0, ["Could not verify the Codex CLI version; no conversations were deleted"]
@@ -760,6 +890,7 @@ def apply_retention_plan(
 
     deleted = 0
     errors: list[str] = []
+    backup_taken = False
     for tree in plan.trees:
         try:
             active = process_check()
@@ -773,13 +904,34 @@ def apply_retention_plan(
         fresh_tree = _tree_still_eligible(
             tree.root_id,
             days=days,
-            codex_dir=codex_dir,
-            db_path=db_path,
+            codex_dir=codex_root,
+            db_path=resolved_db_path,
             now=fresh_now,
         )
         if fresh_tree is None:
             errors.append("an eligible conversation tree changed or is no longer eligible; skipped")
             continue
+        if not fresh_tree.sources or any(
+            _source_for_path(source.path, codex_root) != source
+            for source in fresh_tree.sources
+        ):
+            errors.append("target rollout is outside the verified Codex home or changed; skipped")
+            continue
+        if not backup_taken:
+            try:
+                backup_usage_db(resolved_db_path)
+            except BackupError:
+                return 0, ["backup_failed"]
+            backup_taken = True
+            # Backup can take time; verify sources and database again before
+            # crossing the deletion boundary.
+            fresh_tree = _tree_still_eligible(
+                tree.root_id, days=days, codex_dir=codex_root,
+                db_path=resolved_db_path, now=now().astimezone(timezone.utc),
+            )
+            if fresh_tree is None:
+                errors.append("an eligible conversation tree changed during backup; skipped")
+                continue
         try:
             active = process_check()
         except RuntimeError as exc:
@@ -788,6 +940,12 @@ def apply_retention_plan(
         if active:
             errors.append("Codex started during retention; remaining conversations were skipped")
             break
+        if not fresh_tree.sources or any(
+            _source_for_path(source.path, codex_root) != source
+            for source in fresh_tree.sources
+        ):
+            errors.append("target rollout is outside the verified Codex home or changed; skipped")
+            continue
         try:
             result = run(
                 [executable, "--no-daemon", "delete", fresh_tree.root_id, "--force"],
@@ -795,6 +953,7 @@ def apply_retention_plan(
                 capture_output=True,
                 text=True,
                 timeout=120,
+                env=child_env,
             )
         except (OSError, subprocess.SubprocessError):
             errors.append("Codex deletion failed; remaining work stopped")
@@ -961,7 +1120,7 @@ def main(argv: list[str] | None = None) -> int:
         expected_codex_version=args.codex_version,
     )
     result_record = {
-        "status": "complete" if not errors else "stopped_safely",
+        "status": "backup_failed" if "backup_failed" in errors else ("complete" if not errors else "stopped_safely"),
         "eligible_trees": len(plan.trees),
         "eligible_threads": plan.thread_count,
         "transcripts": plan.transcript_count,
