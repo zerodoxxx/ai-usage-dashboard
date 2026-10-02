@@ -1,0 +1,223 @@
+"""Tests for Codex completion-hook routing and its safe CLI protocol."""
+
+from __future__ import annotations
+
+import io
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+import src.parsers.codex as codex_parser
+import scripts.codex_usage_writer as writer
+from src.parsers.contracts import TokenUsage, UsageEvent, UsageSession
+from src.usage_store import is_provider_capture_enabled, read_usage_sessions
+
+
+def _session(session_id: str = "thread-1") -> UsageSession:
+    return UsageSession(
+        id=session_id,
+        tool="codex",
+        provider="codex",
+        model="gpt-5-codex",
+        start_time=datetime(2026, 9, 23, 12, 0, tzinfo=timezone.utc),
+        usage=TokenUsage(input_tokens=80, cached_input_tokens=20, output_tokens=30, total_tokens=110),
+        events=[
+            UsageEvent(
+                timestamp=datetime(2026, 9, 23, 12, 1, tzinfo=timezone.utc),
+                model="gpt-5-codex",
+                usage=TokenUsage(input_tokens=80, cached_input_tokens=20, output_tokens=30, total_tokens=110),
+            )
+        ],
+    )
+
+
+def test_stop_uses_main_session_transcript_and_writes_compact_usage(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def extract(**kwargs):
+        calls.append(kwargs)
+        return _session(kwargs["session_id"])
+
+    monkeypatch.setattr(codex_parser, "extract_codex_session_for_capture", extract)
+    db_path = tmp_path / "usage.db"
+    result = writer.process_hook_payload(
+        {
+            "hook_event_name": "Stop",
+            "session_id": "main-thread",
+            "transcript_path": "/private/codex/rollout-main.jsonl",
+            "model": "gpt-5-codex",
+        },
+        db_path=db_path,
+        codex_dir=tmp_path / "codex",
+    )
+
+    assert result == 110
+    assert calls == [{
+        "transcript_path": "/private/codex/rollout-main.jsonl",
+        "session_id": "main-thread",
+        "model": "gpt-5-codex",
+        "codex_dir": tmp_path / "codex",
+    }]
+    loaded = read_usage_sessions("codex", db_path)
+    assert len(loaded) == 1
+    assert loaded[0].id == "main-thread"
+    assert loaded[0].usage.total_tokens == 110
+
+
+def test_subagent_stop_targets_agent_transcript_and_never_parent_model(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def extract(**kwargs):
+        calls.append(kwargs)
+        return _session(kwargs["session_id"])
+
+    monkeypatch.setattr(codex_parser, "extract_codex_session_for_capture", extract)
+    db_path = tmp_path / "usage.db"
+    result = writer.process_hook_payload(
+        {
+            "hook_event_name": "SubagentStop",
+            "session_id": "parent-thread",
+            "agent_id": "child-agent-id",
+            "agent_transcript_path": "/private/codex/agent-child.jsonl",
+            "model": "parent-model-must-not-be-used",
+        },
+        db_path=db_path,
+    )
+
+    assert result == 110
+    assert calls == [{
+        "transcript_path": "/private/codex/agent-child.jsonl",
+        "session_id": "child-agent-id",
+        "model": None,
+        "codex_dir": None,
+    }]
+    assert [session.id for session in read_usage_sessions("codex", db_path)] == [
+        "child-agent-id"
+    ]
+
+
+def test_no_usage_is_a_successful_skip_and_does_not_create_database(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(codex_parser, "extract_codex_session_for_capture", lambda **_: None)
+    db_path = tmp_path / "usage.db"
+
+    result = writer.process_hook_payload(
+        {
+            "hook_event_name": "SessionEnd",
+            "session_id": "empty-thread",
+            "transcript_path": "/private/codex/empty.jsonl",
+        },
+        db_path=db_path,
+    )
+
+    assert result is None
+    assert not db_path.exists()
+    assert writer.process_hook_payload({}, db_path=db_path) is None
+
+
+def test_hook_errors_are_nonblocking_json_and_do_not_echo_private_payload(
+    monkeypatch,
+) -> None:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    monkeypatch.setattr(writer.sys, "stdin", io.StringIO('{"secret":"private text"'))
+    monkeypatch.setattr(writer.sys, "stdout", stdout)
+    monkeypatch.setattr(writer.sys, "stderr", stderr)
+
+    result = writer.main([])
+
+    assert result == 0
+    assert stdout.getvalue() == "{}\n"
+    assert "JSONDecodeError" in stderr.getvalue()
+    assert "private text" not in stderr.getvalue()
+
+
+def test_backfill_enables_database_mode_only_after_import_succeeds(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    db_path = tmp_path / "usage.db"
+    monkeypatch.setattr(
+        codex_parser,
+        "extract_all_codex_sessions_for_capture",
+        lambda **_: [_session("backfilled-thread")],
+    )
+
+    assert writer.backfill_codex_usage(db_path=db_path, codex_dir=codex_dir) == 1
+    assert is_provider_capture_enabled("codex", db_path)
+    assert [session.id for session in read_usage_sessions("codex", db_path)] == [
+        "backfilled-thread"
+    ]
+
+
+def test_backfill_failure_does_not_activate_database_mode(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    db_path = tmp_path / "usage.db"
+    monkeypatch.setattr(
+        codex_parser,
+        "extract_all_codex_sessions_for_capture",
+        lambda **_: [_session("backfilled-thread")],
+    )
+    monkeypatch.setattr(
+        writer,
+        "write_usage_sessions",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("failed")),
+    )
+
+    try:
+        writer.backfill_codex_usage(db_path=db_path, codex_dir=codex_dir)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("backfill write failure should propagate")
+
+    assert not is_provider_capture_enabled("codex", db_path)
+
+
+def test_backfill_is_a_noop_after_capture_has_been_activated(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    db_path = tmp_path / "usage.db"
+    monkeypatch.setattr(
+        codex_parser,
+        "extract_all_codex_sessions_for_capture",
+        lambda **_: [_session("backfilled-thread")],
+    )
+    writer.backfill_codex_usage(db_path=db_path, codex_dir=codex_dir)
+
+    assert writer.backfill_codex_usage(db_path=db_path, codex_dir=codex_dir) is None
+    assert [session.id for session in read_usage_sessions("codex", db_path)] == [
+        "backfilled-thread"
+    ]
+
+
+def test_status_output_has_only_aggregate_data(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "usage.db"
+    writer.write_usage_sessions("codex", [_session("private-thread-id")], db_path)
+    stdout = io.StringIO()
+    monkeypatch.setattr(writer.sys, "stdout", stdout)
+
+    assert writer.main(["--status", "--db", str(db_path)]) == 0
+    status = json.loads(stdout.getvalue())
+    assert status["database_exists"] is True
+    assert status["providers"]["codex"]["sessions"] == 1
+    assert status["providers"]["codex"]["events"] == 1
+    assert "private-thread-id" not in stdout.getvalue()
+    assert "usage test" not in stdout.getvalue()

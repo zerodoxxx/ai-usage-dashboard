@@ -37,7 +37,13 @@ Each file contains lines with token usage records:
 }
 ```
 
-Codex also maintains a SQLite database at `~/.codex/state_5.sqlite` with a `threads` table indexing all sessions and their cumulative token totals.
+Codex also maintains `~/.codex/state_5.sqlite` for thread metadata and cumulative totals. Codex does not provide a built-in export of usage to an arbitrary SQLite database. This dashboard uses Codex's supported `Stop`, `SubagentStop`, and `Interrupt` hooks to publish usage into the shared dashboard database. The hook parses only the current transcript named in its payload, along with matching thread metadata; it does not scan conversation history on each dashboard refresh.
+
+The shared database is the existing `~/.gemini/antigravity-cli/token_usage.db`. After the hook is installed and trusted, run `python scripts/codex_usage_writer.py --backfill` once to import existing Codex history. Once that succeeds, dashboard reads for Codex come from SQLite; before capture is enabled, the parser continues to read the local rollout files. The database records a provider key (`codex` or `antigravity`) and model for each row, and prefixes stored session IDs with the provider, so matching native IDs remain distinct. Set `AI_USAGE_DB_PATH` to use a different location. Setup and schema details are in [Shared usage database](docs/SHARED_USAGE_DB.md).
+
+Hook changes may not hot-reload into an already-open Codex Desktop session. In a normal terminal Codex session, use `/hooks` to inspect and trust the exact installed definitions, then reopen Codex Desktop or start a fresh session before relying on captures.
+
+The `Interrupt` hook has a short time limit and may not finish parsing a large transcript. A later `Stop` or a backfill can capture completed work; a turn that remains interrupted can have partial usage until its transcript is complete.
 
 **Key distinction:** `cached_input_tokens` are tokens served from OpenAI's prompt cache (much cheaper). `uncached_input_tokens = input_tokens - cached_input_tokens`.
 
@@ -50,7 +56,7 @@ AGY stores conversation state differently. It uses:
 - **Conversation summaries DB** (`conversation_summaries.db`) — session titles, step counts, timestamps
 - **Brain transcripts** (`brain/<session-uuid>/.system_generated/logs/transcript.jsonl`) — step-by-step text records
 
-Because transcript-based AGY sessions don't store raw token counts locally (quota is tracked server-side by Google), **their token counts are estimated** using a standard heuristic. When the optional `token_usage.db` is present, its exact local token records are marked reported instead:
+Because transcript-based AGY sessions don't store raw token counts locally (quota is tracked server-side by Google), **their token counts are estimated** using a standard heuristic. When `token_usage.db` contains exact local token records, those records are marked reported instead:
 
 ```
 input_tokens  ≈ total_input_chars  // 4
@@ -59,11 +65,11 @@ output_tokens ≈ (output_chars + thinking_chars) // 4
 
 For multi-turn sessions (where prompt caching is very effective), a **45% cache hit rate** is assumed for input tokens. This is a conservative estimate based on typical coding session patterns. Single-turn sessions assume **0% cache** (no prior context to reuse). Both rules live in `src/parsers/agy.py` as `_AGY_CACHE_HIT_RATE_MULTI_TURN` with a rationale comment.
 
-Unlike Codex/Claude — which report exact per-call API counts — transcript-based AGY sessions are marked estimated in the API (`estimated: true`, `token_source: "estimated"`); `token_usage.db` sessions carry explicit reported provenance. A model containing both sources is marked `mixed`. The dashboard renders approximate rows with a `~` prefix and a provenance badge, plus a footnote under the per-model table.
+Transcript-based AGY sessions are marked estimated in the API (`estimated: true`, `token_source: "estimated"`); `token_usage.db` sessions carry explicit reported provenance. The database is also Codex's shared usage store, with rows separated by provider and model. A model containing both estimated and reported AGY sources is marked `mixed`. The dashboard renders approximate rows with a `~` prefix and a provenance badge, plus a footnote under the per-model table.
 
 ### 3. Claude Code (`~/.claude/`)
 
-Claude Code stores one JSONL transcript per session below `~/.claude/projects` (including delegated sessions under `subagents/`). Assistant records include the model, timestamp, and API usage fields. The adapter reads base input, cache reads, cache writes, output, and optional reasoning tokens, and deduplicates repeated records that share the same message ID. Per-message events are retained internally so rolling time ranges include only calls that occurred inside the selected window.
+Claude Code stores one JSONL transcript per session below `~/.claude/projects` (including delegated sessions under `subagents/`). Assistant records include the model, timestamp, and API usage fields. The adapter reads base input, cache reads, cache writes, output, and optional reasoning tokens, and deduplicates repeated records that share the same message ID. Per-message events are retained internally so rolling time ranges include only calls that occurred inside the selected window. The dashboard continues to read those transcripts directly; its Codex hook setup does not install a Claude writer. A Claude publisher can use the same database through the `claude-code` provider contract described in [Shared usage database](docs/SHARED_USAGE_DB.md).
 
 Active model is read from `~/.gemini/antigravity-cli/settings.json`.
 
@@ -72,47 +78,40 @@ Active model is read from `~/.gemini/antigravity-cli/settings.json`.
 ## How the Parser Pipeline Works
 
 ```
-disk files
-    │
-    ├── ~/.codex/state_5.sqlite         ─────┐
-    ├── ~/.codex/sessions/**/rollout-*.jsonl  │──▶ src/parsers/codex.py
-    │                                         │       ↓ per-model breakdown
-    ├── ~/.gemini/antigravity-cli/            │       ↓ timeline (by date)
-    │   ├── settings.json               ─────┤──▶ src/parsers/agy.py
-    │   ├── conversation_summaries.db         │       ↓ token estimates
-    │   ├── conversations/*.db                │       ↓ cost calculations
-    │   └── brain/**/transcript.jsonl   ─────┘
-    │
-    └──────────────────────────────────────────▶ src/parsers/aggregator.py
-                                                        ↓ model dedup
-                                                        ↓ merged timeline
-                                                        ↓ combined sessions
-                                                        │
-                                                 src/app.py (FastAPI)
-                                                        │
-                                                        GET /api/usage?tool=all&time_range=all
-                                                        │
-                                                 src/templates/index.html
-                                                 src/static/js/dashboard.js
-                                                        │
-                                                 Browser Dashboard
+Codex rollout logs ── one-time --backfill ──┐
+Codex Stop / SubagentStop / Interrupt hooks ─┴──▶ ~/.gemini/antigravity-cli/token_usage.db
+                                                       │ provider + model + namespaced session ID
+                                                       ├──▶ src/parsers/codex.py (read after capture enabled)
+                                                       └──▶ src/parsers/agy.py (Antigravity provider rows)
+
+Codex rollout logs ───────────────────────────────▶ codex parser fallback (before capture is enabled)
+AGY transcripts + summaries ─────────────────────▶ AGY parser (estimates when exact rows are absent)
+Claude Code transcripts ──────────────────────────▶ Claude parser
+                                                       │
+                                                       ▼
+                                            src/parsers/aggregator.py
+                                              model, timeline, cost,
+                                              sessions, analytics
+                                                       │
+                                                       ▼
+                                      src/app.py → Browser Dashboard
 ```
 
 ---
 
 ## Performance: Refresh and Parse Caching
 
-Codex and Claude Code each keep a process-local cache of parsed transcript files, capped at 1,024 entries per parser. Entries are keyed by resolved file path and a filesystem stat signature. An unchanged file can reuse its parsed result during the current server process; cache entries do not persist across restarts. A changed file is parsed in full, rather than incrementally, and unsuccessful or unstable reads are not cached.
+Before Codex capture is enabled, its rollout parser and the Claude Code parser each keep a process-local cache of parsed transcript files, capped at 1,024 entries per parser. Entries are keyed by resolved file path and a filesystem stat signature. An unchanged file can reuse its parsed result during the current server process; cache entries do not persist across restarts. A changed file is parsed in full, and unsuccessful or unstable reads are not cached. After the one-time Codex backfill enables capture, Codex usage is read from the shared SQLite database instead of rescanning its rollout history.
 
 AGY does not use this parsed-file cache. It scans transcript files on each usage refresh, and reads `token_usage.db` events with one ordered query grouped by session instead of one query per session.
 
-The launch script checks that parser modules import and built-in providers are registered; it does not read provider histories. The first usage request performs the initial calculation. Later requests avoid reparsing unchanged Codex and Claude Code files, but still discover and stat files, scan AGY transcripts, and rebuild aggregates. When the dashboard requests all tools, the Codex, Claude Code, and AGY parsers run concurrently.
+The launch script checks that parser modules import and built-in providers are registered; it does not read provider histories. With Codex capture enabled, the first usage request no longer needs to calculate Codex totals from the full rollout history. The dashboard still reads AGY and Claude data and rebuilds aggregates for the selected time range. When all tools are requested, the Codex, Claude Code, and AGY parsers run concurrently.
 
-Refresh time still depends on the amount of source data and which files have changed.
+Before Codex capture is enabled, refresh time still depends on source size and changed files. A local benchmark before the SQLite capture change measured about 6.73 seconds cold and 2.66 seconds warm (2.53× faster with parsed-file caching; pricing-network time excluded). Those figures describe the earlier file-backed path; the database-only path has not yet been benchmarked.
 
 ## How Time Windows Stay Accurate
 
-Each parsed session retains internal per-call usage events. Codex events come from incremental token usage records. AGY transcripts do not expose token counts directly, so the parser estimates the session total and allocates it across model-response events according to their character weights. The API strips these internal records from its response, but the aggregator uses them when applying `month`, `30d`, `7d`, and `24h` windows.
+Each parsed session retains internal per-call usage events. Codex events come from imported rollout records in SQLite after capture is enabled, or directly from rollout files before that; hooks publish a replacement snapshot for the current session rather than adding cumulative totals as new calls. AGY transcripts do not expose token counts directly, so the parser estimates the session total and allocates it across model-response events according to their character weights. The API strips these internal records from its response, but the aggregator uses them when applying `month`, `30d`, `7d`, and `24h` windows.
 
 Segments sharing the same tool and session ID are merged before aggregation, and model totals are built from each event's model rather than a single session-level label. A session that genuinely used multiple models is exposed as `mixed`. Metadata-only AGY conversations and user-only transcripts do not create synthetic API calls, tokens, or cost.
 
@@ -188,7 +187,9 @@ Claude 5-minute and 1-hour writes are retained separately and priced at 1.25× a
 | `src/pricing.py` | Provider catalog, LiteLLM refresh/cache, and cost calculator |
 | `src/parsers/contracts.py` | Provider-neutral token, event, session, and cost contracts |
 | `src/parsers/source_registry.py` | Provider adapter registry with canonical-key and alias lookup |
-| `src/parsers/codex.py` | Reads Codex rollout JSONL + SQLite, returns structured metrics dict |
+| `src/usage_store.py` | Shared provider-aware SQLite storage and normalized session reads/writes |
+| `scripts/codex_usage_writer.py` | Codex completion-hook publisher and explicit one-time backfill |
+| `src/parsers/codex.py` | Reads Codex from the shared SQLite store after capture, with rollout-file fallback |
 | `src/parsers/agy.py` | Reads AGY transcripts + DBs, estimates tokens, returns structured metrics dict |
 | `src/parsers/claude.py` | Reads Claude Code session JSONL and normalizes API usage |
 | `src/parsers/aggregator.py` | Runs registered adapters, prices normalized sessions, slices time windows, and derives analytics |

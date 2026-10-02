@@ -11,7 +11,7 @@ A local real-time dashboard that visualizes token usage and API inference costs 
 - 🔽 **Tool filter dropdown**: All Tools, OpenAI Codex, Claude Code, AGY (Google Antigravity)
 - 🗓️ **Time filter dropdown**: All time, This month, Past 30 days, Past 7 days, Past 24h, Custom range
 - 📊 **Analytics snapshot**: API calls, averages, peak spend day, top-cost sessions, period comparison, and a 30-day cost projection from the selected filter's daily average
-- ⚡ **Fresh live polling**: source files are reparsed for each refresh, with parallel all-tool parsing
+- ⚡ **Codex SQLite capture**: after a one-time history import, dashboard reads usage from the shared store and completion hooks keep it current
 - 🔎 **Session search** — filter across titles, models, and session IDs
 - ⚠️ **Cost provenance** — mixed, estimated, reported, and unpriced usage is surfaced explicitly
 
@@ -51,9 +51,16 @@ AI_USAGE_TIMEZONE=America/New_York python run.py
 
 | Tool | Where Data Comes From |
 |:-----|:---------------------|
-| **Codex** | `~/.codex/state_5.sqlite` + `~/.codex/sessions/**/rollout-*.jsonl` |
+| **Codex** | Shared `token_usage.db` after backfill and trusted hooks; `~/.codex/state_5.sqlite` and rollout logs supply metadata and fallback usage before capture is enabled |
 | **Claude Code** | `~/.claude/projects/**/*.jsonl` assistant usage records |
-| **AGY** | `~/.gemini/antigravity-cli/brain/**/transcript.jsonl` + `conversation_summaries.db` |
+| **AGY** | `~/.gemini/antigravity-cli/token_usage.db` + transcripts and `conversation_summaries.db` |
+
+The shared database has separate provider and model columns, and namespaced
+session IDs, so Codex records do not mix with Antigravity records. Its default
+path is the existing Antigravity database; set `AI_USAGE_DB_PATH` to override
+it. Claude Code can write to the same store through the shared provider API
+once its writer is configured. See [the shared usage database guide](docs/SHARED_USAGE_DB.md)
+for Codex setup, backfill, and the writer contract.
 
 ## Run Tests
 
@@ -80,7 +87,7 @@ src/
 ├── app.py             # FastAPI server
 ├── pricing.py         # Provider-aware pricing catalog
 ├── parsers/
-│   ├── codex.py       # Codex JSONL + SQLite parser
+│   ├── codex.py       # Codex shared-store reader with rollout-log fallback
 │   ├── claude.py      # Claude Code session JSONL parser
 │   ├── agy.py         # AGY transcript + DB parser
 │   ├── contracts.py   # Normalized usage contracts

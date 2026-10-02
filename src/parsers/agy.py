@@ -232,19 +232,35 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                 conn = sqlite3.connect(str(token_db_path))
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
+            session_columns = {
+                str(column[1])
+                for column in cursor.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            has_provider_column = "provider" in session_columns
             cursor.execute("SELECT * FROM sessions")
             session_rows = cursor.fetchall()
+            if has_provider_column:
+                # token_usage.db is shared by several providers. A row without
+                # an explicit AGY provider must not be interpreted using the
+                # AGY-specific cache-write and cost semantics below.
+                session_rows = [
+                    row for row in session_rows
+                    if str(row["provider"] or "").strip().casefold() == "antigravity"
+                ]
             session_rows_remaining: dict[Any, int] = defaultdict(int)
             for session_row in session_rows:
                 session_rows_remaining[session_row["session_id"]] += 1
             events_by_session: dict[Any, list[sqlite3.Row]] = defaultdict(list)
             if session_rows:
+                provider_clause = (
+                    " WHERE provider = 'antigravity'"
+                    if has_provider_column
+                    else ""
+                )
                 event_cursor = conn.execute(
-                    """
-                    SELECT * FROM token_events
-                    WHERE session_id IN (SELECT session_id FROM sessions)
-                    ORDER BY session_id, step_index
-                    """
+                    "SELECT * FROM token_events "
+                    "WHERE session_id IN (SELECT session_id FROM sessions"
+                    f"{provider_clause}) ORDER BY session_id, step_index"
                 )
                 for event_row in event_cursor:
                     events_by_session[event_row["session_id"]].append(event_row)
