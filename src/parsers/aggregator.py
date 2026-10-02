@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import math
 import logging
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict, defaultdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from statistics import median
+from threading import RLock
 from typing import Any, Mapping, Iterator
 
 from ..pricing import (
@@ -21,12 +21,14 @@ from ..pricing import (
 from ..timezones import local_timezone, timezone_name
 from .contracts import CostEstimate, TokenUsage, UsageEvent, UsageSession
 from .source_registry import SOURCE_REGISTRY, SourceRegistry, normalize_source_key
-from .store_source import antigravity_store_source, claude_store_source, codex_store_source
+from .store_source import StoreUsageSource, antigravity_store_source, claude_store_source, codex_store_source
 
 _CANONICAL_MODELS: dict[str, str] = {k.lower(): k for k in MODEL_PRICING}
 _TIME_RANGES = {"all", "month", "30d", "7d", "24h", "custom"}
 _WEEKDAY_LABELS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-_PARSER_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="usage-parser")
+_SESSION_CACHE: OrderedDict[tuple[Any, ...], list[dict[str, Any]]] = OrderedDict()
+_SESSION_CACHE_LOCK = RLock()
+_SESSION_CACHE_LIMIT = 4
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_SOURCE_REGISTRY = SOURCE_REGISTRY
 # The dashboard reads only the shared SQLite usage store; it never parses
@@ -186,6 +188,7 @@ def _strip_usage_events(session: dict[str, Any]) -> dict[str, Any]:
     """Return a response-safe session without internal per-call records."""
     public_session = dict(session)
     public_session.pop("usage_events", None)
+    public_session.pop("_usage_bounds", None)
     return public_session
 
 
@@ -243,6 +246,12 @@ def _event_cost(
     cache_write: int = 0,
 ) -> dict[str, float]:
     """Use reported/estimated event cost, or price tokens without fallback."""
+    memo = event.get("_priced_cost")
+    if memo is not None:
+        catalog, version, cost_time, cost = memo
+        event_time = event.get("timestamp") or session.get("created_at") or session.get("start_time")
+        if catalog is PRICING_CATALOG and version == catalog.version and (cost_time is None or cost_time == (event_time,)):
+            return cost
     if event.get("reported_cost_usd") is not None:
         actual = float(event.get("reported_cost_usd") or 0.0)
         baseline = float(event.get("cost_uncached_usd") or actual)
@@ -718,6 +727,9 @@ def _filter_sessions_between(
     filtered: list[dict[str, Any]] = []
     for session in sessions:
         if not isinstance(session, dict):
+            continue
+        bounds = session.get("_usage_bounds")
+        if bounds is not None and (bounds[1] < start or bounds[0] > end or (not include_end and bounds[0] == end)):
             continue
         sliced = _slice_session(session, start, end, include_end)
         if sliced is not None:
@@ -1858,6 +1870,9 @@ def _build_heatmap_daily(
             _add_model_metadata(model_index, model_key, model_tool)
 
     for session_index, session in enumerate(sessions):
+        bounds = session.get("_usage_bounds")
+        if bounds is not None and (bounds[1].astimezone(local_tz).date() < start_day or bounds[0].astimezone(local_tz).date() > end_day):
+            continue
         session_key = f"{session.get('tool', '')}:{session.get('id', f'session-{session_index}')}"
         model_tool = str(session.get("tool") or (tool if tool != "all" else "")).strip()
         event_rows: list[tuple[dict[str, Any], datetime]] = []
@@ -2367,6 +2382,47 @@ def _merge_usage_sessions(sessions: list[UsageSession]) -> list[UsageSession]:
                 event.model = session.model
     return [merged[key] for key in order]
 
+def _memoize_serialized_costs(session: UsageSession, serialized: dict[str, Any]) -> None:
+    """Reuse freshly calculated event costs in every aggregate pass.
+
+    Reported values still follow _event_cost's baseline/savings rules. For
+    time-dependent prices, retain the timestamp context: placing an undated
+    event at a different fallback time can legitimately change its tier.
+    """
+    local_tz = local_timezone()
+    fallback = _session_timestamp(serialized, local_tz)
+    timestamps = []
+    for event, row in zip(session.events, serialized.get("usage_events", [])):
+        model = str(row.get("model") or serialized.get("model") or "")
+        provider = _model_provider(model, str(serialized.get("provider") or serialized.get("tool") or "") or None)
+        resolution = PRICING_CATALOG.resolve(model, provider)
+        event_time = row.get("timestamp") or serialized.get("created_at") or serialized.get("start_time")
+        priced_time = event.timestamp or session.created_at or session.start_time or session.end_time or session.activity_at
+        priced_time = priced_time.isoformat() if priced_time is not None else None
+        time_dependent = resolution.pricing_tier is not None
+        if (row.get("reported_cost_usd") is None
+                and serialized.get("reported_cost_usd") is None
+                and event.cost is not None
+                and (not time_dependent or priced_time == event_time)):
+            cost = {key: float(row.get(key) or 0.0) for key in ("cost_cached_usd", "cost_uncached_usd", "savings_usd")}
+            cost["reported"] = False
+        else:
+            uncached, cached, writes, output, _reasoning, _total = _event_metrics(row)
+            cost = _event_cost(serialized, row, uncached, cached, output, writes)
+        # A session-only reported allocation depends on sliced session totals;
+        # leave that rare context-dependent fallback uncached.
+        if row.get("reported_cost_usd") is not None or serialized.get("reported_cost_usd") is None:
+            row["_priced_cost"] = (PRICING_CATALOG, PRICING_CATALOG.version,
+                                   (event_time,) if time_dependent else None, cost)
+        timestamp = _event_timestamp(row, local_tz) or fallback
+        if timestamp is not None:
+            timestamps.append(timestamp)
+    if fallback is not None:
+        timestamps.append(fallback)
+    if timestamps:
+        serialized["_usage_bounds"] = (min(timestamps), max(timestamps))
+
+
 def _serialize_extracted_session(session: UsageSession) -> dict[str, Any]:
     """Convert a normalized session into the dashboard's stable JSON shape.
 
@@ -2394,6 +2450,7 @@ def _serialize_extracted_session(session: UsageSession) -> dict[str, Any]:
     serialized["cost_source"] = session.cost.source if session.cost is not None else "unavailable"
     if session.cost is not None:
         serialized["pricing_status"] = session.cost.source
+        _memoize_serialized_costs(session, serialized)
         return serialized
 
     usage = session.usage
@@ -2417,6 +2474,7 @@ def _serialize_extracted_session(session: UsageSession) -> dict[str, Any]:
     serialized["cost_uncached_usd"] = resolved.get("cost_uncached_usd") or 0.0
     serialized["savings_usd"] = resolved.get("savings_usd") or 0.0
     serialized["total_cost_usd"] = serialized["cost_cached_usd"]
+    _memoize_serialized_costs(session, serialized)
     return serialized
 
 
@@ -2440,6 +2498,102 @@ def _source_roots(
     return roots
 
 
+def _store_signature(sources) -> tuple[Any, ...] | None:
+    """Resolve store paths at request time, including writes still in the WAL."""
+    from src.usage_store import resolve_db_path
+
+    signatures = []
+    for source in sources:
+        # Arbitrary registered adapters can change without a database write.
+        if type(source) is not StoreUsageSource:
+            return None
+        path = resolve_db_path(source.usage_db_path).resolve()
+        stats = []
+        for candidate in (path, Path(str(path) + "-wal")):
+            try:
+                stat = candidate.stat()
+                stats.append((stat.st_mtime_ns, stat.st_size))
+            except FileNotFoundError:
+                stats.append(None)
+            except OSError:
+                return None
+        signatures.append((source, str(path), *stats))
+    return tuple(signatures)
+
+
+def usage_cache_key(
+    tool: str = "all", time_range: str = "all", start: str | None = None, end: str | None = None,
+) -> tuple[Any, ...] | None:
+    """Identity for HTTP responses; all windows advance at least every minute."""
+    from ..usage_store import read_store_health
+
+    normalized_range = _normalize_time_range(time_range)
+    if normalized_range == "custom":
+        _parse_custom_range(start, end)
+    normalized_tool = normalize_source_key(tool or "all")
+    if normalized_tool == "all":
+        sources = DEFAULT_SOURCE_REGISTRY.list_sources()
+    else:
+        source = DEFAULT_SOURCE_REGISTRY.lookup(normalized_tool)
+        if source is None:
+            raise ValueError(f"Unsupported tool: {tool!r}.")
+        sources = (source,)
+        normalized_tool = normalize_source_key(source.key)
+    signature = _store_signature(sources)
+    if signature is None:
+        return None
+    health = read_store_health()
+    if not health["database_exists"] or not health["readable"]:
+        return None
+    # Store health describes the whole database even for a filtered response.
+    health_path = Path(health["path"])
+    try:
+        health_stats = []
+        for candidate in (health_path, Path(str(health_path) + "-wal")):
+            try:
+                stat = candidate.stat()
+                health_stats.append((stat.st_mtime_ns, stat.st_size))
+            except FileNotFoundError:
+                health_stats.append(None)
+    except OSError:
+        return None
+    signature = (*signature, (health["path"], *health_stats))
+    tz = local_timezone()
+    # Even all/custom responses include a moving analytics window or a current
+    # heatmap. This also handles local midnight and month rollover.
+    minute = int(datetime.now(timezone.utc).timestamp() // 60)
+    return (signature, PRICING_CATALOG, PRICING_CATALOG.version, normalized_tool,
+            normalized_range, start, end, timezone_name(tz), minute)
+
+
+def _read_priced_sessions(sources, roots) -> list[dict[str, Any]]:
+    extracted_sessions: list[UsageSession] = []
+    # SQLite reads are faster sequentially on the real store (564ms vs 684ms
+    # threaded); avoid thread contention and preserve source ordering.
+    for source in sources:
+        extracted = source.extract_sessions(roots.get(normalize_source_key(source.key)))
+        for session in extracted:
+            if not isinstance(session, UsageSession):
+                raise TypeError(
+                    "Usage sources must return UsageSession instances; "
+                    f"received {type(session).__name__}."
+                )
+            extracted_sessions.append(session)
+
+    merged_sessions = _merge_usage_sessions(extracted_sessions)
+    used_models: set[tuple[str | None, str]] = set()
+    for session in [*extracted_sessions, *merged_sessions]:
+        tool_or_provider = str(session.provider or session.tool or "") or None
+        if session.model:
+            used_models.add((_model_provider(str(session.model), tool_or_provider), str(session.model)))
+        for event in session.events:
+            model = event.model or session.model
+            if model:
+                used_models.add((_model_provider(str(model), tool_or_provider), str(model)))
+    apply_used_model_rates(used_models)
+    return [_serialize_extracted_session(session) for session in merged_sessions]
+
+
 def get_tool_usage(
     tool: str = "all",
     codex_dir: str | Path | None = None,
@@ -2460,6 +2614,8 @@ def get_tool_usage(
     (YYYY-MM-DD); the optional ``end`` date is inclusive and defaults to the
     current instant in the dashboard timezone.
     """
+    from ..usage_store import get_usage_store_status, read_store_health
+
     time_range_normalized = _normalize_time_range(time_range)
     if time_range_normalized == "custom":
         # Validate early so callers get a 400 before expensive parsing.
@@ -2481,51 +2637,51 @@ def get_tool_usage(
         result_tool = normalize_source_key(source.key)
 
     roots = _source_roots(codex_dir, agy_dir, claude_dir, source_dirs, active_registry)
-    futures = [
-        _PARSER_EXECUTOR.submit(
-            source.extract_sessions,
-            roots.get(normalize_source_key(source.key)),
-        )
-        for source in sources
-    ]
+    health = read_store_health()
+    signature = _store_signature(sources) if health["readable"] else None
+    if signature is None:
+        sessions = _read_priced_sessions(sources, roots)
+    else:
+        with _SESSION_CACHE_LOCK:
+            key = (signature, PRICING_CATALOG, PRICING_CATALOG.version, timezone_name(local_timezone()))
+            sessions = _SESSION_CACHE.get(key)
+            if sessions is None:
+                sessions = _read_priced_sessions(sources, roots)
+                # Discovery can update pricing. Cache under the resulting
+                # revision, but never cache a read spanning a database write.
+                if _store_signature(sources) == signature:
+                    key = (signature, PRICING_CATALOG, PRICING_CATALOG.version, timezone_name(local_timezone()))
+                    _SESSION_CACHE[key] = sessions
+                    _SESSION_CACHE.move_to_end(key)
+                    while len(_SESSION_CACHE) > _SESSION_CACHE_LIMIT:
+                        _SESSION_CACHE.popitem(last=False)
+            else:
+                _SESSION_CACHE.move_to_end(key)
 
-    extracted_sessions: list[UsageSession] = []
-    for future in futures:
-        extracted = future.result()
-        for session in extracted:
-            if not isinstance(session, UsageSession):
-                raise TypeError(
-                    "Usage sources must return UsageSession instances; "
-                    f"received {type(session).__name__}."
-                )
-            extracted_sessions.append(session)
-
-    merged_sessions = _merge_usage_sessions(extracted_sessions)
-    used_models: set[tuple[str | None, str]] = set()
-    for session in [*extracted_sessions, *merged_sessions]:
-        tool_or_provider = str(session.provider or session.tool or "") or None
-        if session.model:
-            used_models.add((
-                _model_provider(str(session.model), tool_or_provider),
-                str(session.model),
-            ))
-        for event in session.events:
-            model = event.model or session.model
-            if model:
-                used_models.add((
-                    _model_provider(str(model), tool_or_provider),
-                    str(model),
-                ))
-    apply_used_model_rates(used_models)
-
-    sessions = [
-        _serialize_extracted_session(session)
-        for session in merged_sessions
-    ]
-
-    return _filter_usage_data(
+    result = _filter_usage_data(
         {"tool": result_tool, "sessions": sessions},
         time_range_normalized,
         start=start,
         end=end,
     )
+    store = read_store_health()
+    store["providers"] = {}
+    if store["readable"]:
+        status = get_usage_store_status(store["path"])
+        if status.get("read_error"):
+            # The store may have become unreadable between the two probes.
+            store = read_store_health(store["path"])
+            store["readable"] = False
+            store["error"] = store["error"] or "Couldn't read provider capture status"
+            store["providers"] = {}
+        else:
+            store["providers"] = {
+                provider: {
+                    "last_write_at": details.get("last_write_at"),
+                    "sessions": details["sessions"],
+                }
+                for provider, details in status["providers"].items()
+                if provider in {"codex", "claude-code", "antigravity"}
+            }
+    result["store"] = store
+    return result

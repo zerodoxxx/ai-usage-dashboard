@@ -278,6 +278,7 @@
       state.allSessions = Array.isArray(data.sessions) ? data.sessions : [];
 
       // Update UI components
+      updateStoreHealth(data.store);
       updateMeter(data.summary || {}, data.analytics || {}, request, ctx);
       const rangeLabel = describeRangeLabel(request.timeRange, request.start, request.end);
       const timezoneSuffix = data.timezone ? ` (${data.timezone})` : '';
@@ -326,6 +327,10 @@
       if (window.DashboardReceipt && typeof window.DashboardReceipt.update === 'function') {
         try {
           window.DashboardReceipt.update(data, ctx);
+          if (elements.storeHealthBanner && !elements.storeHealthBanner.hidden) {
+            const receipt = document.getElementById('receipt');
+            if (receipt) receipt.hidden = true;
+          }
         } catch (featureErr) {
           console.error('Failed to update receipt:', featureErr);
         }
@@ -372,6 +377,39 @@
 
   /* -------------------------------------------------- meter and readout */
 
+  function updateStoreHealth(store) {
+    const { toolDotHtml, toolLabel, relativeTime } = window.DashboardUtils;
+    const now = Date.now();
+    if (elements.captureStatus) {
+      elements.captureStatus.replaceChildren();
+      Object.entries((store && store.providers) || {}).forEach(([provider, details]) => {
+        if (!(details.sessions > 0)) return;
+        const timestamp = details.last_write_at;
+        const stale = timestamp && now - Date.parse(timestamp) > 24 * 60 * 60 * 1000;
+        const chip = document.createElement('li');
+        chip.className = `capture-status__chip${stale ? ' is-stale' : ''}`;
+        chip.innerHTML = toolDotHtml(provider);
+        const text = document.createElement('span');
+        const age = relativeTime(timestamp, now);
+        text.textContent = stale
+          ? `${toolLabel(provider)}: no capture in ${age.replace(/ ago$/, '')}`
+          : `${toolLabel(provider)} ${age}`;
+        chip.appendChild(text);
+        chip.title = timestamp || 'Capture time unavailable';
+        if (stale) chip.title += '. Run python scripts/doctor.py to check the hooks.';
+        elements.captureStatus.appendChild(chip);
+      });
+      elements.captureStatus.hidden = !elements.captureStatus.children.length;
+    }
+    const banner = elements.storeHealthBanner;
+    if (!banner) return;
+    const unavailable = Boolean(store && (!store.database_exists || !store.readable));
+    banner.hidden = !unavailable;
+    banner.textContent = !unavailable ? '' : !store.database_exists
+      ? `No usage database at ${store.path}. Install the capture hooks (see Setup in the README), then refresh.`
+      : `Couldn't read the usage database at ${store.path}: ${store.error}. Run python scripts/doctor.py, then refresh.`;
+  }
+
   function projectionSubtext(basis) {
     const text = typeof basis === 'string' ? basis.trim() : '';
     if (text && /\s/.test(text)) return text;
@@ -408,6 +446,8 @@
     const unpricedCount = num(totals.unpriced_model_count);
     const burn = num(details.projected_30d_usd ?? details.monthly_projection_usd);
     const hasUsage = totalTokens > 0 || callCount > 0;
+    const storeUnavailable = elements.storeHealthBanner && !elements.storeHealthBanner.hidden;
+    const emptyText = storeUnavailable ? '' : NO_USAGE;
 
     if (elements.unpricedSummaryBanner) {
       const hasUnpriced = unpricedCount > 0;
@@ -438,7 +478,7 @@
 
     if (elements.cardSpendSubtext) {
       const lines = ['What this usage would cost at pay-as-you-go API rates.'];
-      if (!hasUsage) {
+      if (!hasUsage && !storeUnavailable) {
         lines.push(`${NO_USAGE}.`);
       } else if (savings > 0.005 && uncachedCost > 0) {
         lines.push(`Without caching ${formatUsd(uncachedCost)}. Caching saved ${formatUsd(savings)}.`);
@@ -467,7 +507,7 @@
       elements.readoutTokens,
       elements.cardTokensSubtext,
       formatCompactSig(totalTokens),
-      totalTokens > 0 ? `${cacheHitRate.toFixed(1)}% read from cache` : NO_USAGE,
+      totalTokens > 0 ? `${cacheHitRate.toFixed(1)}% read from cache` : emptyText,
       false,
     );
 
@@ -480,7 +520,7 @@
         false,
       );
     } else {
-      setReadoutRow(elements.readoutRate, elements.cardRateSubtext, EMPTY_VALUE, NO_USAGE, true);
+      setReadoutRow(elements.readoutRate, elements.cardRateSubtext, EMPTY_VALUE, emptyText, true);
     }
 
     setReadoutRow(
@@ -811,6 +851,8 @@
     elements.refreshBtn = document.getElementById('refresh-btn');
     elements.themeToggle = document.getElementById('theme-toggle');
     elements.lastSyncedBadge = document.getElementById('last-synced-badge');
+    elements.captureStatus = document.getElementById('capture-status');
+    elements.storeHealthBanner = document.getElementById('store-health-banner');
 
     elements.meterLabel = document.getElementById('meter-label');
     elements.cardSpendSubtext = document.getElementById('card-spend-subtext');

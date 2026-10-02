@@ -196,9 +196,23 @@
     }, 4000);
   }
 
+  /** Capture age is recalculated by the renderer, without a ticking timer. */
+  function relativeTime(isoString, now = Date.now()) {
+    const timestamp = isoString ? Date.parse(isoString) : NaN;
+    if (!Number.isFinite(timestamp)) return 'capture time unavailable';
+    const minutes = Math.floor(Math.max(0, now - timestamp) / 60000);
+    if (minutes < 1) return 'just now';
+    if (minutes < 60) return `${minutes} min ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours} h ago`;
+    const days = Math.floor(hours / 24);
+    return `${days} ${days === 1 ? 'day' : 'days'} ago`;
+  }
+
   window.DashboardUtils = {
     formatCompactNumber,
     formatDateTime,
+    relativeTime,
     providerBadge,
     toolKey,
     toolLabel,

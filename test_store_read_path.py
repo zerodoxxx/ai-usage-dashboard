@@ -103,6 +103,7 @@ USAGE_RESPONSE_KEYS = {
     "time_range",
     "analytics",
     "pricing",
+    "store",
 }
 
 
