@@ -69,7 +69,7 @@ Transcript-based AGY sessions are marked estimated in the API (`estimated: true`
 
 ### 3. Claude Code (`~/.claude/`)
 
-Claude Code stores one JSONL transcript per session below `~/.claude/projects` (including delegated sessions under `subagents/`). Assistant records include the model, timestamp, and API usage fields. The adapter reads base input, cache reads, cache writes, output, and optional reasoning tokens, and deduplicates repeated records that share the same message ID. Per-message events are retained internally so rolling time ranges include only calls that occurred inside the selected window. The dashboard continues to read those transcripts directly; its Codex hook setup does not install a Claude writer. A Claude publisher can use the same database through the `claude-code` provider contract described in [Shared usage database](docs/SHARED_USAGE_DB.md).
+Claude Code stores one JSONL transcript per session below `~/.claude/projects` (including delegated sessions under `subagents/`). Assistant records include the model, timestamp, and API usage fields. The adapter reads base input, cache reads, cache writes, output, and optional reasoning tokens, and deduplicates repeated records that share the same message ID. Per-message events are retained internally so rolling time ranges include only calls that occurred inside the selected window. The dashboard continues to read those transcripts directly; a Claude writer and backfill also publish into the shared database through the `claude-code` provider contract described in [Shared usage database](docs/SHARED_USAGE_DB.md).
 
 Active model is read from `~/.gemini/antigravity-cli/settings.json`.
 

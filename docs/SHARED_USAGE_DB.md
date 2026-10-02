@@ -111,11 +111,47 @@ hooks are configured or trusted; verify those separately with `/hooks` in the
 Codex CLI. A hook run that persists usage reports its token total on stderr; a
 run that finds no stable transcript usage reports a successful skip.
 
-## Claude Code integration
+## Claude Code capture
 
-Claude Code should use provider `claude-code` and the same
-`write_usage_sessions` API. It can publish from its completion hook using the
-usage data Claude exposes there. Keep event-level timestamps, model IDs, cache
-read/write counts, reported costs when available, and cost provenance. If its
-hook receives cumulative session totals, convert them to one complete snapshot
-before writing; do not append cumulative values as new call events.
+Claude Code writes provider `claude-code` (alias `claude`). The publisher
+`scripts/claude_usage_writer.py` runs as a `Stop`, `SubagentStop`, and
+`SessionEnd` hook. The hook payload only names a transcript, so the script
+parses that transcript with the existing `src/parsers/claude.py` logic
+(response-ID de-duplication, cache-write splits, estimated cost) and writes one
+complete session snapshot. Re-running on the same transcript replaces the
+session's events and never double counts. `SubagentStop` captures the agent's
+own transcript as a separate session; `SessionEnd` also sweeps the session's
+`subagents/` directory. A response ID that the DB already attributes to another
+session (a resumed transcript copying earlier history) is not counted twice.
+Each snapshot records the transcript's stat revision, so an overlapping hook
+that parsed an older file cannot overwrite a newer snapshot. The hook is
+asynchronous, always exits 0, writes nothing to stdout, and reports skips and
+errors on stderr.
+
+Install, inspect, or remove the hooks (this edits `~/.claude/settings.json`,
+writes a timestamped `settings.json.<time>.bak` first, and preserves every
+other setting and hook):
+
+```sh
+python scripts/install_claude_usage_hooks.py --dry-run
+python scripts/install_claude_usage_hooks.py
+python scripts/install_claude_usage_hooks.py --uninstall
+```
+
+The installer copies the publisher and `src/` into a content-addressed folder
+under `~/.claude/usage-publisher/releases/`, so switching git branches cannot
+break a running hook. Re-run it after changing the publisher or parser.
+
+Import existing history (every `~/.claude/projects/**/*.jsonl`, subagent
+transcripts included, de-duplicated across transcripts). It is safe to repeat;
+rerunning refreshes snapshots without changing counts for unchanged
+transcripts:
+
+```sh
+python scripts/claude_usage_writer.py --backfill
+python scripts/claude_usage_writer.py --status
+```
+
+Backfill marks `claude-code` capture enabled in `usage_capture_state` (use
+`--no-enable-capture` to skip). Pass `--claude-dir` or `--db` to target other
+locations; tests always do.

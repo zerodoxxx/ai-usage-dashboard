@@ -1352,10 +1352,48 @@ def write_usage_sessions(
             connection.close()
 
 
+def find_event_owners(
+    provider: str,
+    event_ids: Iterable[str],
+    db_path: str | Path | None = None,
+) -> dict[str, str]:
+    """Map stored event IDs to the (native) session ID that currently owns them.
+
+    Read-only and additive. Writers use it to avoid counting the same provider
+    response under a second session, such as when a resumed transcript copies
+    earlier history. An absent or unreadable database yields an empty mapping.
+    """
+    canonical = _canonical_provider(provider)
+    wanted = sorted({str(value) for value in event_ids if value})
+    path = resolve_db_path(db_path)
+    if not wanted or not path.is_file():
+        return {}
+    owners: dict[str, str] = {}
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _connect_read_only(path)
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start:start + 500]
+            marks = ",".join("?" for _ in chunk)
+            for row in connection.execute(
+                "SELECT event_id, session_id FROM token_events "
+                f"WHERE provider = ? AND event_id IN ({marks})",
+                (canonical, *chunk),
+            ):
+                owners.setdefault(str(row["event_id"]), _original_id(canonical, str(row["session_id"])))
+    except sqlite3.Error:
+        return {}
+    finally:
+        if connection is not None:
+            connection.close()
+    return owners
+
+
 __all__ = [
     "DB_PATH_ENV_VAR",
     "DEFAULT_DB_RELATIVE_PATH",
     "ensure_schema",
+    "find_event_owners",
     "get_usage_store_status",
     "is_provider_capture_enabled",
     "mark_provider_capture_enabled",
