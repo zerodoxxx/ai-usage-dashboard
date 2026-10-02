@@ -4,15 +4,17 @@
 Uses the sqlite3 backup API, so content still sitting in the source's WAL is
 included. The copy is written to a temporary file next to the target, verified
 (per-provider session/event counts and token sums, plus ``PRAGMA
-integrity_check``), and only then moved into place. The source is opened
-read-only and is never modified or removed.
+integrity_check``), and only then moved into place. Existing targets are backed up before forced
+replacement. After success the source is archived, unless --keep-source is set.
 """
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import os
 import sqlite3
+import shutil
 import sys
 from pathlib import Path
 from urllib.parse import quote
@@ -21,7 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.usage_store import DEFAULT_DB_RELATIVE_PATH, LEGACY_DB_RELATIVE_PATH  # noqa: E402
+from src.usage_store import LEGACY_DB_RELATIVE_PATH, resolve_db_path  # noqa: E402
 
 LEGACY_PROVIDER = "antigravity"  # rows predating the provider column
 
@@ -110,7 +112,8 @@ def format_table(
 
 
 def migrate(
-    source: Path, target: Path, *, force: bool = False, dry_run: bool = False
+    source: Path, target: Path, *, force: bool = False, dry_run: bool = False,
+    keep_source: bool = False
 ) -> tuple[dict, dict | None]:
     """Copy and verify. Returns (source_summary, target_summary or None)."""
     source = Path(source).expanduser()
@@ -125,6 +128,13 @@ def migrate(
     source_summary = _summarize_path(source)
     if dry_run:
         return source_summary, None
+
+    now = datetime.now(timezone.utc)
+    archived_source = source.with_name(f"{source.name}.migrated-{now:%Y-%m-%d}")
+    if not keep_source and any(
+        Path(str(archived_source) + suffix).exists() for suffix in ("", "-wal", "-shm")
+    ):
+        raise MigrationError(f"source archive already exists: {archived_source}")
 
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.migrating-{os.getpid()}")
@@ -148,10 +158,39 @@ def migrate(
         if not _integrity_ok(temporary):
             raise MigrationError("verification failed: PRAGMA integrity_check is not ok")
 
-        if force:
+        if target.exists() and not force:
+            raise MigrationError(f"target appeared during migration: {target}")
+        if force and target.exists():
+            backup = target.with_name(f"{target.name}.{now:%Y%m%dT%H%M%S%fZ}.bak")
+            # The SQLite backup API preserves committed data still in the WAL.
+            old = None
+            saved = None
+            try:
+                old = _open_read_only(target)
+                saved = sqlite3.connect(backup)
+                old.backup(saved)
+            except sqlite3.DatabaseError:
+                # Preserve even a non-SQLite target, but never discard a live WAL.
+                if Path(str(target) + "-wal").exists():
+                    raise MigrationError("cannot back up target with an unreadable WAL")
+                if saved is not None:
+                    saved.close()
+                    saved = None
+                shutil.copy2(target, backup)
+            finally:
+                if saved is not None:
+                    saved.close()
+                if old is not None:
+                    old.close()
             for suffix in ("-wal", "-shm"):
                 Path(str(target) + suffix).unlink(missing_ok=True)
         os.replace(temporary, target)
+        if not keep_source:
+            source.rename(archived_source)
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(str(source) + suffix)
+                if sidecar.exists():
+                    sidecar.rename(Path(str(archived_source) + suffix))
     finally:
         for suffix in ("", "-wal", "-shm", "-journal"):
             Path(str(temporary) + suffix).unlink(missing_ok=True)
@@ -162,24 +201,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--source", type=Path, default=Path.home() / LEGACY_DB_RELATIVE_PATH,
                         help="database to copy (default: the legacy Antigravity path)")
-    parser.add_argument("--target", type=Path, default=Path.home() / DEFAULT_DB_RELATIVE_PATH,
-                        help="destination (default: ~/.local/share/ai-usage/usage.db)")
-    parser.add_argument("--force", action="store_true", help="replace an existing target")
+    parser.add_argument("--target", type=Path, default=resolve_db_path(),
+                        help="destination (default: AI_USAGE_DB_PATH or ~/.local/share/ai-usage/usage.db)")
+    parser.add_argument("--force", action="store_true", help="back up and replace an existing target")
     parser.add_argument("--dry-run", action="store_true",
                         help="show the source summary only; write nothing")
+    parser.add_argument("--keep-source", action="store_true",
+                        help="leave the source at its original path after a verified copy")
     args = parser.parse_args(argv)
     try:
         source_summary, target_summary = migrate(
-            args.source, args.target, force=args.force, dry_run=args.dry_run
+            args.source, args.target, force=args.force, dry_run=args.dry_run,
+            keep_source=args.keep_source
         )
-    except (MigrationError, sqlite3.Error) as error:
+    except (MigrationError, sqlite3.Error, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     print(format_table(source_summary, target_summary))
     if args.dry_run:
         print(f"\ndry run: would copy {args.source} -> {args.target}")
     else:
-        print(f"\ncopied and verified: {args.source} -> {args.target} (source left untouched)")
+        disposition = "source left untouched" if args.keep_source else "source archived"
+        print(f"\ncopied and verified: {args.source} -> {args.target} ({disposition})")
     return 0
 
 
