@@ -164,11 +164,16 @@ def _to_iso_string(ts: int | float | str | None) -> str:
     return s
 
 
-def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
+def parse_agy_usage(
+    agy_dir: str | Path | None = None,
+    db_path: str | Path | None = None,
+) -> dict[str, Any]:
     """Parse Antigravity (AGY) tool usage metrics from transcripts and summaries DB.
 
     Args:
         agy_dir: Base directory for AGY data. Defaults to ~/.gemini/antigravity-cli.
+        db_path: Shared usage database. Defaults to resolve_db_path() (honors
+            AI_USAGE_DB_PATH); only provider='antigravity' rows are read.
 
     Returns:
         Dictionary with keys:
@@ -218,8 +223,10 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
         except Exception as e:
             logger.debug("Failed to read settings.json from %s: %s", settings_file, e)
 
-    # 1b. Load from token_usage.db if available
-    token_db_path = base_dir / "token_usage.db"
+    # 1b. Load from the shared usage database if available
+    from ..usage_store import resolve_db_path  # lazy: usage_store imports parsers
+
+    token_db_path = resolve_db_path(db_path)
     db_sessions: dict[str, dict[str, Any]] = {}
     db_session_ids: set[str] = set()
     if token_db_path.exists():
@@ -240,7 +247,7 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
             cursor.execute("SELECT * FROM sessions")
             session_rows = cursor.fetchall()
             if has_provider_column:
-                # token_usage.db is shared by several providers. A row without
+                # The shared usage database is shared by several providers. A row without
                 # an explicit AGY provider must not be interpreted using the
                 # AGY-specific cache-write and cost semantics below.
                 session_rows = [
@@ -346,7 +353,7 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                 release_consumed_event_rows(sid)
             cursor.close()
         except Exception as e:
-            logger.warning("Error reading token_usage.db: %s", e)
+            logger.warning("Error reading usage database: %s", e)
         finally:
             if conn is not None:
                 try:
@@ -790,7 +797,7 @@ def _legacy_sessions_to_contract(
             session.metadata["estimated"] = False
             session.metadata["token_source"] = "reported"
             if session.cost is not None:
-                # token_usage.db stores the local estimator's result, not a
+                # The usage database stores the local estimator's result, not a
                 # provider-reported bill. Keep the exact token provenance,
                 # but let the shared aggregator reprice costs per call using
                 # the active catalog and each event timestamp.

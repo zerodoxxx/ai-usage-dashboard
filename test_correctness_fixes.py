@@ -59,7 +59,7 @@ def _create_agy_metadata_db(root: Path) -> None:
 
 
 def _create_agy_zero_token_db(root: Path) -> None:
-    connection = sqlite3.connect(root / "token_usage.db")
+    connection = sqlite3.connect(root / "usage.db")
     try:
         connection.executescript(
             """
@@ -98,7 +98,7 @@ def test_agy_zero_usage_database_row_does_not_fabricate_usage(tmp_path: Path) ->
 
 
 def test_agy_database_cache_writes_are_not_additive_input(tmp_path: Path) -> None:
-    connection = sqlite3.connect(tmp_path / "token_usage.db")
+    connection = sqlite3.connect(tmp_path / "usage.db")
     try:
         connection.executescript(
             """
@@ -142,7 +142,7 @@ def test_agy_token_events_are_batch_read_and_keep_per_session_order(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    connection = sqlite3.connect(tmp_path / "token_usage.db")
+    connection = sqlite3.connect(tmp_path / "usage.db")
     try:
         connection.executescript(
             """
@@ -1374,3 +1374,44 @@ def test_timezone_name_from_system_strips_leading_colon(monkeypatch) -> None:
     monkeypatch.setenv("AI_USAGE_TIMEZONE", ":UTC")
     assert _timezone_name_from_system() == "UTC"
     assert local_timezone_name() == "UTC"
+
+
+def test_agy_legacy_parser_ignores_other_providers_in_shared_db(tmp_path: Path) -> None:
+    db = tmp_path / "usage.db"
+    connection = sqlite3.connect(db)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE sessions (
+                session_id TEXT, provider TEXT, title TEXT, model TEXT, input_tokens INTEGER,
+                cached_input_tokens INTEGER, output_tokens INTEGER,
+                reasoning_output_tokens INTEGER, total_tokens INTEGER,
+                cache_write_tokens INTEGER, cost_usd REAL, call_count INTEGER,
+                timestamp TEXT, updated_at TEXT
+            );
+            CREATE TABLE token_events (
+                session_id TEXT, provider TEXT, step_index INTEGER, timestamp TEXT, model TEXT,
+                input_tokens INTEGER, cached_input_tokens INTEGER,
+                output_tokens INTEGER, cache_write_tokens INTEGER,
+                reasoning_output_tokens INTEGER, total_tokens INTEGER, cost_usd REAL
+            );
+            INSERT INTO sessions VALUES
+                ('agy-1', 'antigravity', 'Agy', 'Gemini 3.8 Flash (High)', 100, 0, 10, 0, 110, 0, 0.1, 1,
+                 '2026-09-18T10:00:00+00:00', '2026-09-18T10:00:00+00:00'),
+                ('codex-1', 'codex', 'Codex', 'gpt-5', 500, 0, 50, 0, 550, 0, 0.5, 1,
+                 '2026-09-18T10:00:00+00:00', '2026-09-18T10:00:00+00:00');
+            INSERT INTO token_events VALUES
+                ('agy-1', 'antigravity', 0, '2026-09-18T10:00:00+00:00', 'Gemini 3.8 Flash (High)',
+                 100, 0, 10, 0, 0, 110, 0.1),
+                ('codex-1', 'codex', 0, '2026-09-18T10:00:00+00:00', 'gpt-5',
+                 500, 0, 50, 0, 0, 550, 0.5);
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = parse_agy_usage(tmp_path)
+
+    ids = {s["id"] for s in result["sessions"]}
+    assert ids == {"agy-1"}

@@ -147,7 +147,7 @@ def test_agy_legacy_database_without_provider_column_keeps_old_totals(tmp_path: 
     finally:
         connection.close()
 
-    result = parse_agy_usage(tmp_path)
+    result = parse_agy_usage(tmp_path, db_path=tmp_path / "token_usage.db")
 
     assert result["summary"]["total_tokens"] == 110
     assert result["summary"]["total_input"] == 100
@@ -167,7 +167,7 @@ def test_shared_database_keeps_agy_codex_and_claude_provider_rows_separate(tmp_p
     for row in rows:
         write_usage_sessions(row.provider or row.tool, [row], db_path=db_path)
 
-    agy = parse_agy_usage(agy_root)
+    agy = parse_agy_usage(agy_root, db_path=db_path)
     codex = CodexSource(usage_db_path=db_path).extract_sessions(agy_root / "separate-codex-root")
 
     assert [(row["tool"], row["total_tokens"]) for row in agy["sessions"]] == [
