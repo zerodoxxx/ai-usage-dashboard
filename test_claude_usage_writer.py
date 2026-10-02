@@ -227,7 +227,7 @@ def test_cli_hook_swallows_store_errors(tmp_path: Path, monkeypatch, capsys) -> 
     def boom(*_a, **_k):
         raise RuntimeError("database exploded")
 
-    monkeypatch.setattr(writer, "write_usage_sessions", boom)
+    monkeypatch.setattr(writer, "write_owned_usage_sessions", boom)
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"hook_event_name": "Stop", "transcript_path": str(transcript)})))
     assert writer.main(["--db", str(tmp_path / "usage.db")]) == 0
     captured = capsys.readouterr()
@@ -243,3 +243,65 @@ def test_cli_backfill_and_status(tmp_path: Path, capsys) -> None:
     assert writer.main(["--status", "--db", str(db)]) == 0
     assert PROVIDER in capsys.readouterr().out
     assert writer.main(["--backfill", "--db", str(db), "--claude-dir", str(tmp_path / "nope")]) == 1
+
+
+@pytest.mark.parametrize("hook_first", [False, True])
+def test_same_id_backfill_and_hook_preserve_file_revisions(tmp_path, hook_first):
+    claude = tmp_path / "claude"
+    a = _write_transcript(claude / "projects/p/a.jsonl", [
+        _assistant("resumed", "a-response", "2026-09-01T10:00:00Z", out=20),
+    ])
+    _write_transcript(claude / "projects/p/b.jsonl", [
+        _assistant("resumed", "b-response", "2026-09-01T11:00:00Z", out=10),
+    ])
+    db = tmp_path / "usage.db"
+    payload = {"hook_event_name": "Stop", "transcript_path": str(a)}
+    if hook_first:
+        writer.process_hook_payload(payload, db_path=db)
+    writer.backfill_claude_usage(db_path=db, claude_dir=claude, enable_capture=False)
+    writer.process_hook_payload(payload, db_path=db)
+    (session,) = read_usage_sessions(PROVIDER, db)
+    assert session.usage.total_tokens == 290
+    assert len(session.metadata["capture_sources"]) == 2
+    assert len({e.metadata["capture_source_hash"] for e in session.events}) == 2
+
+
+def test_same_id_copied_response_backfill_then_hooks_preserve_provenance(tmp_path):
+    claude = tmp_path / "claude"
+    paths = [_write_transcript(claude / f"projects/p/{name}.jsonl", [
+        _assistant("resumed", "shared", "2026-09-01T10:00:00Z", out=10),
+    ]) for name in ("a", "b")]
+    db = tmp_path / "usage.db"
+    writer.backfill_claude_usage(db_path=db, claude_dir=claude, enable_capture=False)
+    for path in paths:
+        writer.process_hook_payload({"hook_event_name": "Stop", "transcript_path": str(path)}, db_path=db)
+    (session,) = read_usage_sessions(PROVIDER, db)
+    assert session.usage.total_tokens == 140
+    assert len(session.metadata["capture_sources"]) == 2
+    assert len(session.events[0].metadata["capture_source_hashes"]) == 2
+
+
+def test_concurrent_hooks_claim_copied_response_atomically(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from src.usage_store import ensure_schema
+
+    db = tmp_path / "usage.db"
+    ensure_schema(db)
+    paths = [_write_transcript(tmp_path / f"projects/p/{name}.jsonl", [
+        _assistant(name, "shared", "2026-09-01T10:00:00Z", out=10),
+    ]) for name in ("a", "b")]
+    barrier = Barrier(2)
+    original_parse = writer._parse_stable
+    def parse(path):
+        parsed = original_parse(path)
+        barrier.wait(timeout=5)
+        return parsed
+
+    monkeypatch.setattr(writer, "_parse_stable", parse)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda path: writer.process_hook_payload(
+            {"hook_event_name": "Stop", "transcript_path": str(path)}, db_path=db,
+        ), paths))
+    assert sum(s.usage.total_tokens for s in read_usage_sessions(PROVIDER, db)) == 140
+    assert sorted(value or 0 for value in results) == [0, 140]

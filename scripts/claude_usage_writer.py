@@ -24,6 +24,7 @@ import os
 import sys
 import time
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -34,10 +35,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.usage_store import (  # noqa: E402
-    find_event_owners,
     get_usage_store_status,
     mark_provider_capture_enabled,
-    write_usage_sessions,
+    write_owned_usage_sessions,
 )
 
 PROVIDER = "claude-code"
@@ -126,47 +126,18 @@ def _parse_stable(path: Path):
 
 
 def _with_capture_metadata(session, meta: dict[str, Any] | None):
+    session = deepcopy(session)
     if not meta:
         return session
     metadata = dict(session.metadata or {})
     metadata.update(meta)
+    source = meta["capture_source_hash"]
+    metadata["capture_sources"] = {
+        source: {key: value for key, value in meta.items() if key != "capture_source_hash"},
+    }
+    for event in session.events:
+        event.metadata["capture_source_hash"] = source
     return replace(session, metadata=metadata)
-
-
-def _drop_foreign_events(sessions: list, db_path: str | Path | None) -> list:
-    """Remove events the DB already attributes to a session outside this batch.
-
-    A resumed or forked transcript copies earlier responses. Each response ID
-    must be counted under exactly one session, so the existing owner keeps it.
-    """
-    from src.parsers.claude import _refresh_session_prices, _sum_event_usage
-
-    batch_ids = {str(session.id) for session in sessions}
-    owners = find_event_owners(
-        PROVIDER,
-        (event.event_id for session in sessions for event in session.events if event.event_id),
-        db_path=db_path,
-    )
-    if not owners:
-        return sessions
-    result = []
-    for session in sessions:
-        kept = [
-            event for event in session.events
-            if event.event_id is None
-            or owners.get(event.event_id) in (None, str(session.id))
-            or owners[event.event_id] in batch_ids
-        ]
-        if not kept:
-            continue
-        if len(kept) != len(session.events):
-            session = replace(
-                session, events=kept, usage=_sum_event_usage(kept),
-                cost=None, call_count=len(kept),
-            )
-            _refresh_session_prices(session)
-        result.append(session)
-    return result
 
 
 def process_hook_payload(
@@ -188,11 +159,8 @@ def process_hook_payload(
             continue
         session, meta = parsed
         sessions.append(_with_capture_metadata(session, meta))
-    sessions = _drop_foreign_events(sessions, db_path)
-    if not sessions:
-        return None
-    written = write_usage_sessions(PROVIDER, sessions, db_path=db_path)
-    return sum(session.usage.total_tokens for session in sessions) if written else None
+    written = write_owned_usage_sessions(PROVIDER, sessions, db_path=db_path)
+    return sum(session.usage.total_tokens for session in written) if written else None
 
 
 def _merge_same_id(sessions: list) -> list:
@@ -207,21 +175,17 @@ def _merge_same_id(sessions: list) -> list:
         if len(group) == 1:
             merged.append(group[0])
             continue
-        seen: set[str] = set()
-        events = []
-        for session in group:
-            for event in session.events:
-                if event.event_id is not None:
-                    if event.event_id in seen:
-                        continue
-                    seen.add(event.event_id)
-                events.append(event)
+        events = [event for session in group for event in session.events]
         events.sort(key=lambda event: (event.timestamp is None, str(event.timestamp)))
         primary = group[0]
-        metadata = {
-            key: value for key, value in (primary.metadata or {}).items()
-            if not key.startswith("capture_")
-        }
+        metadata = dict(primary.metadata or {})
+        sources = {}
+        for session in group:
+            sources.update(session.metadata.get("capture_sources", {}))
+        metadata["capture_sources"] = sources
+        metadata["capture_quality"] = "merged-fragments"
+        for key in ("capture_source_hash", "capture_mtime_ns", "capture_ctime_ns", "capture_size"):
+            metadata.pop(key, None)
         combined = replace(
             primary, events=events, usage=_sum_event_usage(events), cost=None,
             call_count=len(events), metadata=metadata,
@@ -242,29 +206,18 @@ def backfill_claude_usage(
     if not base.is_dir():
         raise FileNotFoundError("Claude history directory is unavailable")
 
-    from src.parsers.claude import ClaudeCodeSource, _parse_session_file, _session_files
+    from src.parsers.claude import _parse_session_file, _session_files
 
     files = _session_files(base)
-    # Revisions are taken before parsing so a transcript growing mid-backfill
-    # is recorded as older than its next hook snapshot.
+    # Capture revisions before parsing; a hook for an appended file wins later.
     revisions = {path: _capture_file_metadata(path) for path in files}
-    # extract_sessions applies the parser's cross-transcript de-duplication.
-    sessions = ClaudeCodeSource().extract_sessions(base)
-
-    files_by_id: dict[str, list[Path]] = defaultdict(list)
-    for path in files:
-        parsed = _parse_session_file(path)  # parse-cache hit after extract_sessions
-        if parsed is not None:
-            files_by_id[str(parsed.id)].append(path)
-
-    prepared = []
-    for session in sessions:
-        paths = files_by_id.get(str(session.id), [])
-        meta = revisions.get(paths[0]) if len(paths) == 1 else None
-        prepared.append(_with_capture_metadata(session, meta))
-    prepared = _drop_foreign_events(_merge_same_id(prepared), db_path)
-
-    write_usage_sessions(PROVIDER, prepared, db_path=db_path)
+    prepared = [
+        _with_capture_metadata(session, revisions[path])
+        for path in files
+        if (session := _parse_session_file(path)) is not None
+    ]
+    # Preserve raw per-file responses until the store unions their provenance.
+    prepared = write_owned_usage_sessions(PROVIDER, _merge_same_id(prepared), db_path=db_path)
     if enable_capture:
         mark_provider_capture_enabled(PROVIDER, db_path=db_path)
     return len(prepared), sum(len(session.events) for session in prepared)

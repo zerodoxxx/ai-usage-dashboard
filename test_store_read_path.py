@@ -425,3 +425,47 @@ def test_embedded_cache_write_rows_are_not_double_counted(monkeypatch) -> None:
     expected = calculate_cost_strict("gemini-2.5-pro", 700, 300, 50, provider="antigravity")
     assert expected["cost_cached_usd"] is not None
     assert summary["total_cost_usd"] == round(expected["cost_cached_usd"], 6)
+
+
+
+def test_antigravity_store_defaults_to_estimated_token_provenance(monkeypatch):
+    import sqlite3
+    from src.usage_store import resolve_db_path
+
+    session = _make_session(
+        "antigravity", "agy-tracker", "Tracker", "gemini-2.5-pro",
+        input_tokens=100, cached_tokens=20, output_tokens=20,
+    )
+    write_usage_sessions("antigravity", [session])
+    with sqlite3.connect(resolve_db_path()) as connection:
+        connection.execute("UPDATE sessions SET metadata_json='{}'")
+    monkeypatch.setattr(app_module, "refresh_pricing", lambda: None)
+    with TestClient(app_module.app) as client:
+        response = client.get("/api/usage?tool=agy")
+    assert response.status_code == 200
+    payload = response.json()
+    for row in [*payload["sessions"], *payload["models"]]:
+        assert row["estimated"] is True
+        assert row["token_source"] == "estimated"
+    # Explicit metadata must still be respected.
+    with sqlite3.connect(resolve_db_path()) as connection:
+        connection.execute('UPDATE sessions SET metadata_json=?', (
+            json.dumps({"estimated": False, "token_source": "reported"}),
+        ))
+    with TestClient(app_module.app) as client:
+        payload = client.get("/api/usage?tool=agy").json()
+    assert payload["sessions"][0]["estimated"] is False
+    assert payload["sessions"][0]["token_source"] == "reported"
+
+
+def test_providerless_legacy_antigravity_api_preserves_embedded_total(monkeypatch):
+    from test_usage_store import _legacy_db
+    from src.usage_store import resolve_db_path
+
+    _legacy_db(resolve_db_path())
+    monkeypatch.setattr(app_module, "refresh_pricing", lambda: None)
+    with TestClient(app_module.app) as client:
+        response = client.get("/api/usage?tool=agy")
+    assert response.status_code == 200
+    assert response.json()["summary"]["total_tokens"] == 120
+    assert response.json()["summary"]["cache_write"] == 0

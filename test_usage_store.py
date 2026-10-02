@@ -195,7 +195,11 @@ def test_env_override_and_providerless_legacy_reads_are_read_only(
     monkeypatch.setenv(DB_PATH_ENV_VAR, str(path))
 
     assert resolve_db_path() == path
-    assert len(read_usage_sessions("antigravity")) == 1
+    (session,) = read_usage_sessions("antigravity")
+    assert session.usage.total_tokens == 120
+    assert session.events[0].usage.total_tokens == 120
+    assert session.usage.cache_write_tokens == 0
+    assert session.events[0].usage.cache_write_tokens == 0
     assert read_usage_sessions("codex") == []
     with sqlite3.connect(path) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(sessions)")}
@@ -256,14 +260,17 @@ def test_provider_namespaces_and_token_cost_timing_metadata_round_trip(tmp_path:
     codex = _session("codex", "shared-id", input_tokens=120, output_tokens=40, cost_source="reported")
     codex.events[0].timestamp = None
     claude = _session("claude-code", "shared-id", input_tokens=200, output_tokens=80)
+    agy = _session("antigravity", "shared-id", input_tokens=150, output_tokens=30)
 
     write_usage_sessions("codex", [codex], path)
     write_usage_sessions("claude-code", [claude], path)
+    write_usage_sessions("antigravity", [agy], path)
 
     read_codex = read_usage_sessions("codex", path)
     read_claude = read_usage_sessions("claude-code", path)
     assert [session.id for session in read_codex] == ["shared-id"]
     assert [session.id for session in read_claude] == ["shared-id"]
+    assert [session.id for session in read_usage_sessions("agy", path)] == ["shared-id"]
     assert read_usage_sessions("claude", path) == read_claude
     assert read_codex[0].usage.input_tokens == 120
     assert read_codex[0].usage.cached_input_tokens == 20
@@ -296,14 +303,125 @@ def test_provider_namespaces_and_token_cost_timing_metadata_round_trip(tmp_path:
             "SELECT session_id, provider, usage_semantics_version, cache_write_mode "
             "FROM sessions ORDER BY provider"
         ).fetchall()
+        event_identifiers = connection.execute(
+            "SELECT session_id, provider FROM token_events ORDER BY provider"
+        ).fetchall()
         raw_metadata = connection.execute(
             "SELECT metadata_json FROM sessions WHERE provider = 'codex'"
         ).fetchone()[0]
     assert identifiers == [
+        ("shared-id", "antigravity", 2, "additive"),
         ("claude-code:shared-id", "claude-code", 2, "additive"),
         ("codex:shared-id", "codex", 2, "additive"),
     ]
+    assert event_identifiers == [(row[0], row[1]) for row in identifiers]
     assert "must not be stored" not in raw_metadata
+
+
+def test_existing_legacy_antigravity_session_upserts_in_place(tmp_path: Path) -> None:
+    path = tmp_path / "usage.db"
+    _legacy_db(path)
+    original = read_usage_sessions("antigravity", path)[0]
+    updated = _session("antigravity", original.id, input_tokens=300, output_tokens=90)
+
+    assert write_usage_sessions("agy", [updated], path) == 1
+    assert write_usage_sessions("antigravity", [updated], path) == 1
+    (stored,) = read_usage_sessions("antigravity", path)
+    assert stored.id == original.id == "agy-old"
+    assert stored.usage == updated.usage
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT session_id, total_tokens FROM sessions").fetchall() == [
+            ("agy-old", updated.usage.total_tokens),
+        ]
+        assert connection.execute("SELECT session_id FROM token_events").fetchall() == [("agy-old",)]
+
+
+@pytest.mark.parametrize("raw_exists", [False, True])
+@pytest.mark.parametrize("incoming_id", ["agy-id", "antigravity:agy-id"])
+def test_prefixed_antigravity_snapshot_folds_on_write(
+    tmp_path: Path, raw_exists: bool, incoming_id: str,
+) -> None:
+    path = tmp_path / "usage.db"
+    old = _session("antigravity", "agy-id", input_tokens=100, event_count=2)
+    write_usage_sessions("antigravity", [old], path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE sessions SET session_id = 'antigravity:agy-id'")
+        connection.execute("UPDATE token_events SET session_id = 'antigravity:agy-id'")
+    assert [session.id for session in read_usage_sessions("antigravity", path)] == ["agy-id"]
+    if raw_exists:
+        # Seed both forms as left by the previous namespacing scheme.
+        with sqlite3.connect(path) as connection:
+            columns = [row[1] for row in connection.execute("PRAGMA table_info(sessions)")]
+            selection = ", ".join("'agy-id'" if name == "session_id" else name for name in columns)
+            connection.execute(f"INSERT INTO sessions SELECT {selection} FROM sessions WHERE session_id = 'antigravity:agy-id'")
+            columns = [row[1] for row in connection.execute("PRAGMA table_info(token_events)") if row[1] != "id"]
+            selection = ", ".join("'agy-id'" if name == "session_id" else name for name in columns)
+            connection.execute(
+                f"INSERT INTO token_events ({', '.join(columns)}) SELECT {selection} "
+                "FROM token_events WHERE session_id = 'antigravity:agy-id'"
+            )
+    updated = _session("antigravity", incoming_id, input_tokens=400, output_tokens=90)
+    assert write_usage_sessions("antigravity", [updated], path) == 1
+    (stored,) = read_usage_sessions("antigravity", path)
+    assert stored.id == "agy-id"
+    assert stored.usage == updated.usage
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT session_id FROM sessions").fetchall() == [("agy-id",)]
+        assert connection.execute("SELECT session_id FROM token_events").fetchall() == [("agy-id",)]
+
+
+def test_prefixed_antigravity_ownership_and_stale_snapshot_preserve_raw_owner(tmp_path: Path) -> None:
+    from src.usage_store import find_event_owners, write_owned_usage_sessions
+
+    path = tmp_path / "usage.db"
+    newest = _session("antigravity", "agy-id", input_tokens=300, mtime=200)
+    write_usage_sessions("antigravity", [newest], path)
+    mark_provider_capture_enabled("antigravity", path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE sessions SET session_id = 'antigravity:agy-id'")
+        connection.execute("UPDATE token_events SET session_id = 'antigravity:agy-id'")
+    assert find_event_owners("antigravity", ["response-0"], path) == {"response-0": "agy-id"}
+    stale = _session("antigravity", "agy-id", input_tokens=100, mtime=100)
+    assert write_owned_usage_sessions("antigravity", [stale], path) == []
+    (stored,) = read_usage_sessions("antigravity", path)
+    assert stored.id == "agy-id"
+    assert stored.usage == newest.usage
+    assert stored.events[0].usage == newest.events[0].usage
+    newer = _session("antigravity", "agy-id", input_tokens=400, mtime=300)
+    assert len(write_owned_usage_sessions("antigravity", [newer], path)) == 1
+    assert read_usage_sessions("antigravity", path)[0].usage == newer.usage
+    assert is_provider_capture_enabled("antigravity", path)
+    assert find_event_owners("antigravity", ["response-0"], path) == {"response-0": "agy-id"}
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT session_id FROM sessions").fetchall() == [("agy-id",)]
+        assert connection.execute("SELECT session_id FROM token_events").fetchall() == [("agy-id",)]
+        assert connection.execute("SELECT provider FROM usage_capture_state").fetchall() == [("antigravity",)]
+
+
+@pytest.mark.parametrize("raw_exists", [False, True])
+def test_antigravity_id_fold_rolls_back_with_failed_write(tmp_path: Path, raw_exists: bool) -> None:
+    path = tmp_path / "usage.db"
+    original = _session("antigravity", "agy-id")
+    write_usage_sessions("antigravity", [original], path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE sessions SET session_id = 'antigravity:agy-id'")
+        connection.execute("UPDATE token_events SET session_id = 'antigravity:agy-id'")
+        if raw_exists:
+            connection.execute(
+                "INSERT INTO sessions(session_id,timestamp,date,model,updated_at) VALUES(?,?,?,?,?)",
+                ("agy-id", "2026-09-21", "2026-09-21", "gemini", "2026-09-21"),
+            )
+        connection.execute(
+            "CREATE TRIGGER fail_event BEFORE INSERT ON token_events "
+            "BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END"
+        )
+        before_sessions = connection.execute("SELECT * FROM sessions ORDER BY session_id").fetchall()
+        before_events = connection.execute("SELECT * FROM token_events ORDER BY id").fetchall()
+    with pytest.raises(sqlite3.IntegrityError, match="synthetic failure"):
+        write_usage_sessions("antigravity", [_session("antigravity", "agy-id", input_tokens=400)], path)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT * FROM sessions ORDER BY session_id").fetchall() == before_sessions
+        assert connection.execute("SELECT * FROM token_events ORDER BY id").fetchall() == before_events
 
 
 def test_snapshot_replay_is_idempotent_and_replacement_removes_stale_tail(
@@ -670,3 +788,183 @@ def test_writer_creates_missing_parent_but_reader_does_not(tmp_path: Path) -> No
     assert not path.parent.exists()
     ensure_schema(path)
     assert path.is_file()
+
+
+@pytest.mark.parametrize("provider", ["codex", "claude-code"])
+@pytest.mark.parametrize("identity", ["event_id", "message_id", "request_id"])
+def test_shared_fragment_response_keeps_union_and_provenance(tmp_path, provider, identity):
+    from copy import deepcopy
+
+    db = tmp_path / "usage.db"
+    a = _session(provider, input_tokens=5, output_tokens=2, mtime=100, source_hash="source-a")
+    b = deepcopy(a)
+    b.metadata.update(capture_source_hash="source-b")
+    for session in (a, b):
+        if identity != "event_id":
+            session.events[0].metadata[identity] = "shared-response"
+            session.events[0].event_id = None
+    write_usage_sessions(provider, [a, b], db)
+    write_usage_sessions(provider, [a], db)
+    (stored,) = read_usage_sessions(provider, db)
+    assert stored.usage.total_tokens == 14
+    assert stored.call_count == 1
+    assert len(stored.events) == 1
+    assert set(stored.events[0].metadata["capture_source_hashes"]) == {"source-a", "source-b"}
+    assert set(stored.metadata["capture_sources"]) == {"source-a", "source-b"}
+    # Removing the response from one source must preserve the other's copy.
+    a.events = []
+    a.usage = TokenUsage()
+    a.metadata["capture_mtime_ns"] = 200
+    write_usage_sessions(provider, [a], db)
+    (stored,) = read_usage_sessions(provider, db)
+    assert stored.usage.total_tokens == 14
+    assert stored.events[0].metadata["capture_source_hashes"] == ["source-b"]
+    b.events = []
+    b.usage = TokenUsage()
+    b.metadata["capture_mtime_ns"] = 200
+    write_usage_sessions(provider, [b], db)
+    assert read_usage_sessions(provider, db)[0].usage.total_tokens == 0
+
+
+def test_store_health_distinguishes_missing_unreadable_and_empty(tmp_path):
+    import src.usage_store as store
+
+    db = tmp_path / "usage.db"
+    assert store.read_store_health(db) == {
+        "database_exists": False, "readable": False, "error": None, "path": str(db),
+    }
+    assert store.get_usage_store_status(db)["schema_version"] is None
+    assert not db.exists()
+    db.write_bytes(b"not sqlite")
+    health = store.read_store_health(db)
+    assert health["database_exists"] and not health["readable"] and health["error"]
+    assert read_usage_sessions("codex", db) == []
+    db.unlink()
+    ensure_schema(db)
+    assert store.read_store_health(db) == {
+        "database_exists": True, "readable": True, "error": None, "path": str(db),
+    }
+    assert read_usage_sessions("codex", db) == []
+    write_usage_sessions("codex", [_session()], db)
+    status = store.get_usage_store_status(db)
+    assert status["database_exists"] is True
+    assert status["path"] == str(db)
+    assert status["schema_version"] == store.SCHEMA_VERSION
+    with sqlite3.connect(db) as connection:
+        last_write = connection.execute("SELECT MAX(updated_at) FROM sessions").fetchone()[0]
+    assert status["providers"]["codex"]["last_write_at"] == last_write
+    assert status["providers"]["codex"]["sessions"] == 1
+    assert status["providers"]["codex"]["events"] == 1
+
+
+def test_read_projects_only_needed_columns_and_decodes_metadata_once(tmp_path, monkeypatch):
+    import src.usage_store as store
+
+    db = tmp_path / "usage.db"
+    write_usage_sessions("codex", [_session()], db)
+    with sqlite3.connect(db) as connection:
+        connection.execute("ALTER TABLE sessions ADD COLUMN unused_blob BLOB")
+        connection.execute("ALTER TABLE token_events ADD COLUMN unused_blob BLOB")
+    queries = []
+    original_connect = store._connect_read_only
+    original_decode = store._decode_metadata
+    decoded = []
+
+    def connect(path):
+        connection = original_connect(path)
+        connection.set_trace_callback(queries.append)
+        return connection
+
+    def decode(value):
+        decoded.append(value)
+        return original_decode(value)
+
+    monkeypatch.setattr(store, "_connect_read_only", connect)
+    monkeypatch.setattr(store, "_decode_metadata", decode)
+    assert len(read_usage_sessions("codex", db)) == 1
+    assert len(decoded) == 2
+    selects = [q for q in queries if q.startswith("SELECT")]
+    assert all("*" not in q and "unused_blob" not in q for q in selects)
+
+
+def test_owned_writer_resolves_and_writes_under_one_transaction(tmp_path, monkeypatch):
+    import src.usage_store as store
+
+    db = tmp_path / "usage.db"
+    ensure_schema(db)
+    connections = []
+    original_owned = store._owned_snapshot
+    original_upsert = store._upsert_session
+
+    def owned(connection, provider, session):
+        assert connection.in_transaction
+        connections.append(connection)
+        return original_owned(connection, provider, session)
+
+    def upsert(connection, provider, session):
+        assert connection.in_transaction
+        assert connection is connections[-1]
+        return original_upsert(connection, provider, session)
+
+    monkeypatch.setattr(store, "_owned_snapshot", owned)
+    monkeypatch.setattr(store, "_upsert_session", upsert)
+    a = _session("claude-code", "owner-a")
+    b = _session("claude-code", "owner-b", event_count=2)
+    b.events[1].event_id = "unique-b"
+    written = store.write_owned_usage_sessions("claude-code", [a, b], db)
+    assert len(written) == 2
+    sessions = read_usage_sessions("claude-code", db)
+    assert sum(len(session.events) for session in sessions) == 2
+    owner_b = next(session for session in sessions if session.id == "owner-b")
+    assert [event.event_id for event in owner_b.events] == ["unique-b"]
+    assert owner_b.usage.total_tokens == b.events[1].usage.total_tokens
+    assert owner_b.cost.total_usd == b.events[1].cost.total_usd
+
+
+def test_stale_shared_backfill_keeps_newer_response_revision(tmp_path):
+    from copy import deepcopy
+
+    db = tmp_path / "usage.db"
+    latest = _session(mtime=300, input_tokens=50, source_hash="source-a")
+    write_usage_sessions("codex", [latest], db)
+    old_a = _session(mtime=100, input_tokens=10, source_hash="source-a")
+    b = deepcopy(old_a)
+    b.metadata["capture_source_hash"] = "source-b"
+    for session in (old_a, b):
+        session.events[0].metadata["capture_source_hash"] = session.metadata["capture_source_hash"]
+    merged = UsageSession(
+        id=latest.id, tool="codex", events=[*old_a.events, *b.events],
+        metadata={"capture_sources": {
+            "source-a": {"capture_mtime_ns": 100, "capture_ctime_ns": 101, "capture_size": 102},
+            "source-b": {"capture_mtime_ns": 100, "capture_ctime_ns": 101, "capture_size": 102},
+        }},
+    )
+    write_usage_sessions("codex", [merged], db)
+    (stored,) = read_usage_sessions("codex", db)
+    assert stored.usage.total_tokens == latest.usage.total_tokens
+    assert set(stored.events[0].metadata["capture_source_hashes"]) == {"source-a", "source-b"}
+
+
+def test_write_deadline_bounds_busy_wait_and_raises(tmp_path, monkeypatch):
+    from src import usage_store as store
+    import sqlite3
+    import time
+
+    db = tmp_path / "usage.db"
+    ensure_schema(db)
+    # Expired deadline fails before touching the database.
+    with pytest.raises(store.UsageStoreDeadlineExceeded):
+        write_usage_sessions("codex", [_session()], db, deadline=time.monotonic() - 1)
+    # A lock held by another connection is waited on only until the deadline.
+    blocker = sqlite3.connect(db)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        started = time.monotonic()
+        with pytest.raises(store.UsageStoreDeadlineExceeded):
+            write_usage_sessions("codex", [_session()], db, deadline=started + 0.3)
+        assert time.monotonic() - started < 1.5
+    finally:
+        blocker.rollback()
+        blocker.close()
+    # Without contention a deadline does not interfere.
+    assert write_usage_sessions("codex", [_session()], db, deadline=time.monotonic() + 5) == 1

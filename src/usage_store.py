@@ -2,8 +2,8 @@
 
 The store lives in a tool-neutral SQLite file (``~/.local/share/ai-usage/usage.db``). It keeps
 only normalized usage records and dashboard metadata; transcript bodies are
-never stored here. Provider IDs are namespaced in SQLite so two tools can use
-the same native session ID without colliding.
+never stored here. Codex and Claude IDs are namespaced in SQLite; Antigravity
+keeps native IDs for compatibility with its external tracker.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import os
 import sqlite3
 import time
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -83,6 +84,9 @@ _SESSION_METADATA_KEYS = frozenset({
 })
 _EVENT_METADATA_KEYS = frozenset({
     "capture_source_hash",
+    "capture_source_hashes",
+    "message_id",
+    "request_id",
     "tps_duration_seconds",
     "tps_output_tokens",
     "tps_trustworthy",
@@ -115,7 +119,7 @@ def _namespaced_id(provider: str, session_id: str) -> str:
     prefix = f"{provider}:"
     if native_id.startswith(prefix):
         native_id = native_id[len(prefix):]
-    return f"{prefix}{native_id}"
+    return native_id if provider == "antigravity" else f"{prefix}{native_id}"
 
 
 def _original_id(provider: str, stored_id: str) -> str:
@@ -181,6 +185,25 @@ def _money(value: Any) -> float:
         return 0.0
 
 
+class UsageStoreDeadlineExceeded(TimeoutError):
+    """The caller's monotonic deadline passed before a store operation finished."""
+
+
+def _remaining_ms(deadline: float | None) -> int:
+    """Return the busy-timeout budget in ms, or raise once the deadline passed."""
+    if deadline is None:
+        return _BUSY_TIMEOUT_MS
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise UsageStoreDeadlineExceeded("usage store deadline exceeded")
+    return max(1, min(_BUSY_TIMEOUT_MS, int(remaining * 1000)))
+
+
+def _bound_busy_timeout(connection: sqlite3.Connection, deadline: float | None) -> None:
+    if deadline is not None:
+        connection.execute(f"PRAGMA busy_timeout = {_remaining_ms(deadline)}")
+
+
 def _connect_read_only(path: Path) -> sqlite3.Connection:
     uri = f"file:{quote(str(path.resolve()), safe='/')}?mode=ro"
     connection = sqlite3.connect(uri, uri=True, timeout=_BUSY_TIMEOUT_MS / 1000)
@@ -190,11 +213,12 @@ def _connect_read_only(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def _connect_read_write(path: Path) -> sqlite3.Connection:
+def _connect_read_write(path: Path, deadline: float | None = None) -> sqlite3.Connection:
+    busy_ms = _remaining_ms(deadline)  # Checked before touching the filesystem.
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(str(path), timeout=_BUSY_TIMEOUT_MS / 1000)
+    connection = sqlite3.connect(str(path), timeout=busy_ms / 1000)
     connection.row_factory = sqlite3.Row
-    connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+    connection.execute(f"PRAGMA busy_timeout = {busy_ms}")
     return connection
 
 
@@ -311,7 +335,7 @@ def _recreate_views(connection: sqlite3.Connection) -> None:
     )
 
 
-def ensure_schema(db_path: str | Path | None = None) -> None:
+def ensure_schema(db_path: str | Path | None = None, *, deadline: float | None = None) -> None:
     """Create or migrate the shared database without rewriting old usage rows.
 
     Existing AGY rows receive additive defaults (provider ``antigravity``,
@@ -322,7 +346,7 @@ def ensure_schema(db_path: str | Path | None = None) -> None:
     for attempt in range(_WRITE_ATTEMPTS):
         connection: sqlite3.Connection | None = None
         try:
-            connection = _connect_read_write(path)
+            connection = _connect_read_write(path, deadline)
             current_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             session_columns = _table_columns(connection, "sessions")
             event_columns = _table_columns(connection, "token_events")
@@ -342,7 +366,9 @@ def ensure_schema(db_path: str | Path | None = None) -> None:
                 return
 
             # This pragma persists, so keep it out of the per-event write path.
+            _bound_busy_timeout(connection, deadline)
             connection.execute("PRAGMA journal_mode = WAL")
+            _bound_busy_timeout(connection, deadline)
             connection.execute("BEGIN IMMEDIATE")
             _create_legacy_tables(connection)
             _add_missing_columns(connection, "sessions", _SESSION_ADDITIONS)
@@ -371,6 +397,7 @@ def ensure_schema(db_path: str | Path | None = None) -> None:
             )
             _recreate_views(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            _bound_busy_timeout(connection, deadline)
             connection.commit()
             return
         except sqlite3.OperationalError as exc:
@@ -379,7 +406,10 @@ def ensure_schema(db_path: str | Path | None = None) -> None:
             locked = "locked" in str(exc).casefold() or "busy" in str(exc).casefold()
             if not locked or attempt + 1 >= _WRITE_ATTEMPTS:
                 raise
-            time.sleep(0.05 * (2 ** attempt))
+            delay = 0.05 * (2 ** attempt)
+            if deadline is not None and time.monotonic() + delay >= deadline:
+                raise UsageStoreDeadlineExceeded("usage store deadline exceeded") from exc
+            time.sleep(delay)
         except Exception:
             if connection is not None and connection.in_transaction:
                 connection.rollback()
@@ -389,8 +419,11 @@ def ensure_schema(db_path: str | Path | None = None) -> None:
                 connection.close()
 
 
-def _cost_from_row(row: sqlite3.Row, prefix: str = "") -> CostEstimate | None:
-    keys = set(row.keys())
+def _cost_from_row(
+    row: sqlite3.Row, prefix: str = "", *, keys: set[str] | None = None,
+) -> CostEstimate | None:
+    if keys is None:
+        keys = set(row.keys())
     cost_key = f"{prefix}cost_usd"
     if cost_key not in keys:
         return None
@@ -430,7 +463,11 @@ def _usage_from_row_fields(row: sqlite3.Row, keys: set[str]) -> dict[str, int]:
     def value(name: str) -> int:
         return row[name] if name in keys else 0
 
-    embedded = "cache_write_mode" in keys and row["cache_write_mode"] == "embedded_in_input"
+    embedded = (
+        row["cache_write_mode"] == "embedded_in_input"
+        if "cache_write_mode" in keys
+        else "provider" not in keys or row["provider"] == "antigravity"
+    )
     return {
         "input_tokens": value("input_tokens"),
         "cached_input_tokens": value("cached_input_tokens"),
@@ -441,6 +478,27 @@ def _usage_from_row_fields(row: sqlite3.Row, keys: set[str]) -> dict[str, int]:
         "cache_write_5m_tokens": 0 if embedded else value("cache_write_5m_tokens"),
         "cache_write_1h_tokens": 0 if embedded else value("cache_write_1h_tokens"),
     }
+
+
+_READ_USAGE_COLUMNS = frozenset({
+    "session_id", "provider", "model", "timestamp", "input_tokens",
+    "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens",
+    "cache_write_mode", "cache_write_tokens", "cache_write_5m_tokens", "cache_write_1h_tokens",
+    "cost_usd", "cost_source", "reported_cost_usd", "cost_cached_estimate_usd",
+    "cost_uncached_usd", "savings_usd", "cost_currency", "metadata_json",
+})
+_READ_SESSION_COLUMNS = _READ_USAGE_COLUMNS | {
+    "title", "created_at", "start_time", "end_time", "updated_at", "activity_at",
+    "reasoning_effort", "call_count",
+}
+_READ_EVENT_COLUMNS = _READ_USAGE_COLUMNS | {"timestamp_missing", "event_id"}
+
+
+def _token_provenance(metadata: dict[str, Any], provider: str) -> dict[str, Any]:
+    estimated = provider == "antigravity"
+    metadata.setdefault("estimated", metadata.get("token_source", "estimated" if estimated else "reported") == "estimated")
+    metadata.setdefault("token_source", "estimated" if metadata["estimated"] else "reported")
+    return metadata
 
 
 def read_usage_sessions(
@@ -465,15 +523,17 @@ def read_usage_sessions(
         session_columns = _table_columns(connection, "sessions")
         if "session_id" not in session_columns or "model" not in session_columns:
             return []
+        row_keys = session_columns & _READ_SESSION_COLUMNS
+        selection = ", ".join(sorted(row_keys))
         has_provider = "provider" in session_columns
         if has_provider:
             session_rows = connection.execute(
-                "SELECT * FROM sessions WHERE provider = ? ORDER BY timestamp, session_id",
+                f"SELECT {selection} FROM sessions WHERE provider = ? ORDER BY timestamp, session_id",
                 (canonical,),
             ).fetchall()
         elif canonical == "antigravity":
             session_rows = connection.execute(
-                "SELECT * FROM sessions ORDER BY timestamp, session_id"
+                f"SELECT {selection} FROM sessions ORDER BY timestamp, session_id"
             ).fetchall()
         else:
             return []
@@ -483,6 +543,8 @@ def read_usage_sessions(
 
         events_by_session: dict[str, list[sqlite3.Row]] = {}
         event_columns = _table_columns(connection, "token_events")
+        keys = event_columns & _READ_EVENT_COLUMNS
+        event_selection = ", ".join(f"e.{name}" for name in sorted(keys))
         if "session_id" in event_columns:
             ids = [str(row["session_id"]) for row in session_rows]
             event_provider_clause = " AND e.provider = ?" if "provider" in event_columns else ""
@@ -493,7 +555,7 @@ def read_usage_sessions(
                     (canonical,) if "provider" in event_columns else ()
                 )
                 event_rows = connection.execute(
-                    "SELECT e.* FROM token_events AS e "
+                    f"SELECT {event_selection} FROM token_events AS e "
                     f"WHERE e.session_id IN ({placeholders}){event_provider_clause} "
                     "ORDER BY e.session_id, e.step_index",
                     parameters,
@@ -503,11 +565,9 @@ def read_usage_sessions(
 
         sessions: list[UsageSession] = []
         for row in session_rows:
-            row_keys = set(row.keys())
             stored_id = str(row["session_id"] or "")
             raw_events: list[UsageEvent] = []
             for event_row in events_by_session.get(stored_id, []):
-                keys = set(event_row.keys())
                 event_usage = TokenUsage(
                     **_usage_from_row_fields(event_row, keys),
                     preserve_total=True,
@@ -520,7 +580,7 @@ def read_usage_sessions(
                     ),
                     usage=event_usage,
                     model=event_row["model"] if "model" in keys else row["model"],
-                    cost=_cost_from_row(event_row),
+                    cost=_cost_from_row(event_row, keys=keys),
                     event_id=event_row["event_id"] if "event_id" in keys else None,
                     metadata=_decode_metadata(event_row["metadata_json"] if "metadata_json" in keys else None),
                 ))
@@ -542,8 +602,10 @@ def read_usage_sessions(
                 reasoning_effort=row["reasoning_effort"] if "reasoning_effort" in row_keys else None,
                 usage=usage,
                 events=raw_events,
-                cost=_cost_from_row(row),
-                metadata=_decode_metadata(row["metadata_json"] if "metadata_json" in row_keys else None),
+                cost=_cost_from_row(row, keys=row_keys),
+                metadata=_token_provenance(
+                    _decode_metadata(row["metadata_json"] if "metadata_json" in row_keys else None), canonical,
+                ),
                 call_count=row["call_count"] if "call_count" in row_keys else len(raw_events),
             ))
         return sessions
@@ -591,13 +653,14 @@ def is_provider_capture_enabled(
 def mark_provider_capture_enabled(
     provider: str,
     db_path: str | Path | None = None,
+    *, deadline: float | None = None,
 ) -> None:
     """Mark a provider's full usage backfill complete, enabling DB-only reads."""
     canonical = _canonical_provider(provider)
     path = resolve_db_path(db_path)
-    ensure_schema(path)
+    ensure_schema(path, deadline=deadline)
     now = datetime.now(timezone.utc).isoformat()
-    connection = _connect_read_write(path)
+    connection = _connect_read_write(path, deadline)
     try:
         with connection:
             connection.execute(
@@ -617,16 +680,45 @@ def mark_provider_capture_enabled(
         connection.close()
 
 
+def read_store_health(db_path: str | Path | None = None) -> dict[str, Any]:
+    """Distinguish an absent store from an unreadable or empty SQLite database.
+
+    This probe never creates or migrates the database. ``readable`` describes
+    SQLite access, including a valid empty database with no usage tables yet.
+    """
+    path = resolve_db_path(db_path)
+    health: dict[str, Any] = {
+        "database_exists": path.is_file(), "readable": False, "error": None, "path": str(path),
+    }
+    if not health["database_exists"]:
+        return health
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _connect_read_only(path)
+        connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
+        health["readable"] = True
+    except (sqlite3.Error, OSError) as exc:
+        health["error"] = str(exc)
+    finally:
+        if connection is not None:
+            connection.close()
+    return health
+
+
 def get_usage_store_status(db_path: str | Path | None = None) -> dict[str, Any]:
     """Return safe aggregate database diagnostics, without session identities."""
     path = resolve_db_path(db_path)
-    if not path.is_file():
-        return {"database_exists": False, "providers": {}}
+    status: dict[str, Any] = {
+        "database_exists": path.is_file(), "path": str(path), "schema_version": None, "providers": {},
+    }
+    if not status["database_exists"]:
+        return status
 
     connection: sqlite3.Connection | None = None
     try:
         connection = _connect_read_only(path)
         connection.execute("BEGIN")
+        status["schema_version"] = int(connection.execute("PRAGMA user_version").fetchone()[0])
         tables = {
             str(row[0])
             for row in connection.execute(
@@ -634,14 +726,15 @@ def get_usage_store_status(db_path: str | Path | None = None) -> dict[str, Any]:
             )
         }
         if "sessions" not in tables:
-            return {"database_exists": True, "providers": {}}
+            return status
 
         session_columns = _table_columns(connection, "sessions")
         provider_expression = "provider" if "provider" in session_columns else "'antigravity'"
         total_expression = "SUM(total_tokens)" if "total_tokens" in session_columns else "0"
+        last_write_expression = "MAX(updated_at)" if "updated_at" in session_columns else "NULL"
         aggregates = connection.execute(
             f"SELECT {provider_expression} AS provider, COUNT(*) AS sessions, "
-            f"COALESCE({total_expression}, 0) AS total_tokens "
+            f"COALESCE({total_expression}, 0) AS total_tokens, {last_write_expression} AS last_write_at "
             f"FROM sessions GROUP BY {provider_expression}"
         ).fetchall()
         providers: dict[str, dict[str, Any]] = {
@@ -649,6 +742,7 @@ def get_usage_store_status(db_path: str | Path | None = None) -> dict[str, Any]:
                 "sessions": int(row["sessions"] or 0),
                 "events": 0,
                 "total_tokens": int(row["total_tokens"] or 0),
+                "last_write_at": row["last_write_at"],
                 "capture_enabled": False,
                 "backfill_completed_at": None,
             }
@@ -678,6 +772,7 @@ def get_usage_store_status(db_path: str | Path | None = None) -> dict[str, Any]:
                         "sessions": 0,
                         "events": 0,
                         "total_tokens": 0,
+                        "last_write_at": None,
                         "capture_enabled": False,
                         "backfill_completed_at": None,
                     },
@@ -694,6 +789,7 @@ def get_usage_store_status(db_path: str | Path | None = None) -> dict[str, Any]:
                         "sessions": 0,
                         "events": 0,
                         "total_tokens": 0,
+                        "last_write_at": None,
                         "capture_enabled": False,
                         "backfill_completed_at": None,
                     },
@@ -701,12 +797,11 @@ def get_usage_store_status(db_path: str | Path | None = None) -> dict[str, Any]:
                 providers[provider]["capture_enabled"] = bool(row["enabled"])
                 providers[provider]["backfill_completed_at"] = row["backfill_completed_at"]
 
-        return {
-            "database_exists": True,
-            "providers": dict(sorted(providers.items())),
-        }
+        status["providers"] = dict(sorted(providers.items()))
+        return status
     except sqlite3.Error:
-        return {"database_exists": True, "providers": {}, "read_error": True}
+        status["read_error"] = True
+        return status
     finally:
         if connection is not None:
             connection.close()
@@ -753,8 +848,9 @@ def _event_cost(
 
 
 def _event_id(provider: str, session_id: str, index: int, event: UsageEvent) -> str:
-    if event.event_id:
-        return str(event.event_id)
+    identity = _response_identity(event)
+    if identity is not None:
+        return identity
     material = "|".join((
         provider,
         session_id,
@@ -916,6 +1012,77 @@ def _revision_tuple(value: dict[str, int] | None) -> tuple[int, int, int] | None
     )
 
 
+def _response_identity(event: UsageEvent) -> str | None:
+    for value in (event.event_id, event.metadata.get("message_id"), event.metadata.get("request_id")):
+        if value:
+            return str(value)
+    return None
+
+
+def _event_sources(event: UsageEvent) -> set[str]:
+    values = event.metadata.get("capture_source_hashes", [])
+    values = values if isinstance(values, list) else []
+    sources = {source for value in values if (source := _source_hash(value)) is not None}
+    if source := _source_hash(event.metadata.get("capture_source_hash")):
+        sources.add(source)
+    return sources
+
+
+def _set_event_sources(event: UsageEvent, sources: set[str]) -> None:
+    event.metadata = dict(event.metadata or {})
+    if not sources:
+        event.metadata.pop("capture_source_hash", None)
+        event.metadata.pop("capture_source_hashes", None)
+        return
+    if sources:
+        event.metadata["capture_source_hashes"] = sorted(sources)
+        if event.metadata.get("capture_source_hash") not in sources:
+            event.metadata["capture_source_hash"] = min(sources)
+
+
+def _deduplicate_responses(
+    events: list[UsageEvent],
+    revisions: dict[str, dict[str, int]] | None = None,
+) -> list[UsageEvent]:
+    """Count each response once while retaining every transcript that contains it.
+
+    ``revisions`` (source hash -> stat revision) breaks timestamp ties in favor
+    of the event captured from the newest transcript revision.
+    """
+    def rank(event: UsageEvent) -> tuple[int, int, int]:
+        found = [
+            r for source in _event_sources(event)
+            if (r := _revision_tuple((revisions or {}).get(source))) is not None
+        ]
+        return max(found) if found else (-1, -1, -1)
+
+    result: list[UsageEvent] = []
+    positions: dict[str, int] = {}
+    for event in events:
+        identity = _response_identity(event)
+        if identity is None or identity not in positions:
+            if identity is not None:
+                positions[identity] = len(result)
+            _set_event_sources(event, _event_sources(event))
+            result.append(event)
+            continue
+        index = positions[identity]
+        previous = result[index]
+        sources = _event_sources(previous) | _event_sources(event)
+        # Prefer the final response revision, including corrections at the same timestamp.
+        if previous.timestamp is not None and (
+            event.timestamp is None or previous.timestamp > event.timestamp
+        ):
+            winner = previous
+        elif previous.timestamp == event.timestamp and revisions and rank(previous) > rank(event):
+            winner = previous
+        else:
+            winner = event
+        _set_event_sources(winner, sources)
+        result[index] = winner
+    return result
+
+
 def _prepare_capture_session(session: UsageSession) -> UsageSession:
     """Clone a session and annotate events with its transcript source identity."""
     prepared = deepcopy(session)
@@ -933,6 +1100,12 @@ def _prepare_capture_session(session: UsageSession) -> UsageSession:
         elif metadata.get("capture_quality") is None:
             metadata["capture_quality"] = "merged-fragments"
     prepared.metadata = metadata
+    events = _deduplicate_responses(prepared.events)
+    if len(events) != len(prepared.events):
+        prepared.usage = _sum_event_usage(events)
+        prepared.cost = _sum_event_cost(events, prepared.cost)
+        prepared.call_count = len(events)
+    prepared.events = events
     return prepared
 
 
@@ -1075,11 +1248,11 @@ def _merge_capture_snapshots(
         return None
     if len(incoming_sources) > 1:
         missing_source = any(
-            _source_hash(event.metadata.get("capture_source_hash")) not in incoming_sources
+            not _event_sources(event).intersection(incoming_sources)
             for event in incoming.events
         )
         if missing_source:
-            raise ValueError("merged Codex events must identify their source transcript")
+            raise ValueError("merged events must identify their source transcript")
 
     old_session = _stored_session(connection, provider, stored_id)
     if old_session is None:
@@ -1094,28 +1267,26 @@ def _merge_capture_snapshots(
     if not accepted_sources:
         return None
 
-    old_event_sources = {
-        id(event): _source_hash(event.metadata.get("capture_source_hash"))
-        for event in old_session.events
-    }
-    if len(stored_sources) == 1:
-        fallback_source = next(iter(stored_sources))
-        old_event_sources = {
-            key: value or fallback_source for key, value in old_event_sources.items()
-        }
-    events = [
-        event
-        for event in old_session.events
-        if old_event_sources[id(event)] not in accepted_sources
-    ]
-    for event in incoming.events:
-        event_source = _source_hash(event.metadata.get("capture_source_hash"))
-        if event_source is None and len(incoming_sources) == 1:
-            event_source = next(iter(incoming_sources))
-            event.metadata = dict(event.metadata or {})
-            event.metadata["capture_source_hash"] = event_source
-        if event_source in accepted_sources:
+    events = []
+    for event in old_session.events:
+        event_sources = _event_sources(event)
+        if not event_sources and len(stored_sources) == 1:
+            event_sources = set(stored_sources)
+        remaining = event_sources - accepted_sources.keys()
+        if remaining or not event_sources:
+            _set_event_sources(event, remaining)
             events.append(event)
+    for event in incoming.events:
+        event_sources = _event_sources(event)
+        if not event_sources and len(incoming_sources) == 1:
+            event_sources = set(incoming_sources)
+        accepted = event_sources.intersection(accepted_sources)
+        if accepted:
+            _set_event_sources(event, accepted)
+            events.append(event)
+    sources = dict(stored_sources)
+    sources.update(accepted_sources)
+    events = _deduplicate_responses(events, sources)
     events.sort(
         key=lambda event: (
             event.timestamp is None,
@@ -1124,8 +1295,6 @@ def _merge_capture_snapshots(
         )
     )
 
-    sources = dict(stored_sources)
-    sources.update(accepted_sources)
     metadata = dict(old_session.metadata or {})
     metadata.update(incoming_metadata)
     metadata["capture_sources"] = sources
@@ -1162,6 +1331,33 @@ def _merge_capture_snapshots(
         metadata=metadata,
         call_count=len(events) if events else max(incoming.call_count, old_session.call_count),
     )
+
+
+def _fold_antigravity_id(connection: sqlite3.Connection, session_id: str) -> None:
+    """Fold the old prefixed snapshot while holding the writer's transaction."""
+    native_id = _namespaced_id("antigravity", session_id)
+    prefixed_id = f"antigravity:{native_id}"
+    raw_exists = connection.execute(
+        "SELECT 1 FROM sessions WHERE session_id = ?", (native_id,),
+    ).fetchone() is not None
+    if raw_exists:
+        connection.execute(
+            "DELETE FROM token_events WHERE provider = 'antigravity' AND session_id = ?",
+            (prefixed_id,),
+        )
+        connection.execute(
+            "DELETE FROM sessions WHERE provider = 'antigravity' AND session_id = ?",
+            (prefixed_id,),
+        )
+    else:
+        connection.execute(
+            "UPDATE sessions SET session_id = ? WHERE provider = 'antigravity' AND session_id = ?",
+            (native_id, prefixed_id),
+        )
+        connection.execute(
+            "UPDATE token_events SET session_id = ? WHERE provider = 'antigravity' AND session_id = ?",
+            (native_id, prefixed_id),
+        )
 
 
 def _upsert_session(connection: sqlite3.Connection, provider: str, session: UsageSession) -> bool:
@@ -1297,11 +1493,69 @@ def _upsert_session(connection: sqlite3.Connection, provider: str, session: Usag
     return True
 
 
+def _owned_snapshot(
+    connection: sqlite3.Connection, provider: str, session: UsageSession,
+) -> UsageSession | None:
+    """Resolve response ownership while holding the snapshot writer's lock."""
+    wanted = sorted({identity for event in session.events if (identity := _response_identity(event))})
+    owners: dict[str, str] = {}
+    for offset in range(0, len(wanted), 500):
+        batch = wanted[offset:offset + 500]
+        marks = ",".join("?" for _ in batch)
+        for row in connection.execute(
+            f"SELECT event_id, session_id FROM token_events WHERE provider=? AND event_id IN ({marks})",
+            (provider, *batch),
+        ):
+            owners.setdefault(str(row["event_id"]), str(row["session_id"]))
+    stored_id = _namespaced_id(provider, session.id)
+    kept = [event for event in session.events if owners.get(_response_identity(event), stored_id) == stored_id]
+    if len(kept) == len(session.events):
+        return session
+    if not kept and connection.execute(
+        "SELECT 1 FROM sessions WHERE provider=? AND session_id=?", (provider, stored_id),
+    ).fetchone() is None:
+        return None
+    return replace(
+        session, events=kept, usage=_sum_event_usage(kept),
+        cost=_sum_event_cost(kept, None), call_count=len(kept),
+    )
+
+
 def write_usage_sessions(
+    provider: str, sessions: Iterable[UsageSession], db_path: str | Path | None = None,
+    *, deadline: float | None = None,
+) -> int:
+    """Atomically replace snapshots; preserve the existing writer API.
+
+    ``deadline`` is an optional ``time.monotonic()`` value. Busy waits are
+    bounded to the remaining time and ``UsageStoreDeadlineExceeded`` is raised
+    (without retrying) once it passes.
+    """
+    return len(_write_usage_sessions(provider, sessions, db_path, deadline=deadline))
+
+
+def write_owned_usage_sessions(
+    provider: str, sessions: Iterable[UsageSession], db_path: str | Path | None = None,
+    *, deadline: float | None = None,
+) -> list[UsageSession]:
+    """Claim response IDs and write snapshots in one BEGIN IMMEDIATE transaction.
+
+    Existing owners keep copied responses. Earlier snapshots in this batch
+    claim unowned responses before later snapshots can see them. Return the
+    accepted incoming snapshots after filtering, for capture counts.
+    """
+    return _write_usage_sessions(
+        provider, sessions, db_path, resolve_ownership=True, deadline=deadline,
+    )
+
+
+def _write_usage_sessions(
     provider: str,
     sessions: Iterable[UsageSession],
     db_path: str | Path | None = None,
-) -> int:
+    *, resolve_ownership: bool = False,
+    deadline: float | None = None,
+) -> list[UsageSession]:
     """Atomically upsert full session snapshots and replace their event rows.
 
     Replaying a snapshot is idempotent. Replacing its event list also removes
@@ -1310,7 +1564,7 @@ def write_usage_sessions(
     canonical = _canonical_provider(provider)
     prepared = list(sessions)
     if not prepared:
-        return 0
+        return []
     for session in prepared:
         session_provider = _canonical_provider(session.provider or session.tool)
         if session_provider != canonical:
@@ -1321,14 +1575,23 @@ def write_usage_sessions(
             raise ValueError("usage session id must be non-empty")
 
     path = resolve_db_path(db_path)
-    ensure_schema(path)
+    ensure_schema(path, deadline=deadline)
     for attempt in range(_WRITE_ATTEMPTS):
-        connection = _connect_read_write(path)
+        connection = _connect_read_write(path, deadline)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            written = 0
+            written = []
             for session in prepared:
-                written += int(_upsert_session(connection, canonical, session))
+                if canonical == "antigravity":
+                    _fold_antigravity_id(connection, session.id)
+                if resolve_ownership:
+                    session = _prepare_capture_session(session)
+                    session = _owned_snapshot(connection, canonical, session)
+                    if session is None:
+                        continue
+                if _upsert_session(connection, canonical, session):
+                    written.append(session)
+            _bound_busy_timeout(connection, deadline)
             connection.commit()
             return written
         except sqlite3.OperationalError as exc:
@@ -1337,7 +1600,11 @@ def write_usage_sessions(
             locked = "locked" in str(exc).casefold() or "busy" in str(exc).casefold()
             if not locked or attempt + 1 >= _WRITE_ATTEMPTS:
                 raise
-            time.sleep(0.05 * (2 ** attempt))
+            delay = 0.05 * (2 ** attempt)
+            if deadline is not None:
+                if time.monotonic() + delay >= deadline:
+                    raise UsageStoreDeadlineExceeded("usage store deadline exceeded") from exc
+            time.sleep(delay)
         except Exception:
             if connection.in_transaction:
                 connection.rollback()
@@ -1393,6 +1660,8 @@ __all__ = [
     "is_provider_capture_enabled",
     "mark_provider_capture_enabled",
     "read_usage_sessions",
+    "read_store_health",
     "resolve_db_path",
     "write_usage_sessions",
+    "write_owned_usage_sessions",
 ]
