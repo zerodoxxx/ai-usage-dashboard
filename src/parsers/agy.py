@@ -164,11 +164,16 @@ def _to_iso_string(ts: int | float | str | None) -> str:
     return s
 
 
-def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
+def parse_agy_usage(
+    agy_dir: str | Path | None = None,
+    db_path: str | Path | None = None,
+) -> dict[str, Any]:
     """Parse Antigravity (AGY) tool usage metrics from transcripts and summaries DB.
 
     Args:
         agy_dir: Base directory for AGY data. Defaults to ~/.gemini/antigravity-cli.
+        db_path: Shared usage database. Defaults to resolve_db_path() (honors
+            AI_USAGE_DB_PATH); only provider='antigravity' rows are read.
 
     Returns:
         Dictionary with keys:
@@ -218,8 +223,10 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
         except Exception as e:
             logger.debug("Failed to read settings.json from %s: %s", settings_file, e)
 
-    # 1b. Load from token_usage.db if available
-    token_db_path = base_dir / "token_usage.db"
+    # 1b. Load from the shared usage database if available
+    from ..usage_store import resolve_db_path  # lazy: usage_store imports parsers
+
+    token_db_path = resolve_db_path(db_path)
     db_sessions: dict[str, dict[str, Any]] = {}
     db_session_ids: set[str] = set()
     if token_db_path.exists():
@@ -232,12 +239,51 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                 conn = sqlite3.connect(str(token_db_path))
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
+            session_columns = {
+                str(column[1])
+                for column in cursor.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            has_provider_column = "provider" in session_columns
             cursor.execute("SELECT * FROM sessions")
-            for row in cursor.fetchall():
+            session_rows = cursor.fetchall()
+            if has_provider_column:
+                # The shared usage database is shared by several providers. A row without
+                # an explicit AGY provider must not be interpreted using the
+                # AGY-specific cache-write and cost semantics below.
+                session_rows = [
+                    row for row in session_rows
+                    if str(row["provider"] or "").strip().casefold() == "antigravity"
+                ]
+            session_rows_remaining: dict[Any, int] = defaultdict(int)
+            for session_row in session_rows:
+                session_rows_remaining[session_row["session_id"]] += 1
+            events_by_session: dict[Any, list[sqlite3.Row]] = defaultdict(list)
+            if session_rows:
+                provider_clause = (
+                    " WHERE provider = 'antigravity'"
+                    if has_provider_column
+                    else ""
+                )
+                event_cursor = conn.execute(
+                    "SELECT * FROM token_events "
+                    "WHERE session_id IN (SELECT session_id FROM sessions"
+                    f"{provider_clause}) ORDER BY session_id, step_index"
+                )
+                for event_row in event_cursor:
+                    events_by_session[event_row["session_id"]].append(event_row)
+
+            def release_consumed_event_rows(sid: Any) -> None:
+                remaining = session_rows_remaining[sid] - 1
+                if remaining:
+                    session_rows_remaining[sid] = remaining
+                else:
+                    session_rows_remaining.pop(sid, None)
+                    events_by_session.pop(sid, None)
+
+            for row in session_rows:
                 sid = row["session_id"]
-                ev_cursor = conn.execute("SELECT * FROM token_events WHERE session_id = ? ORDER BY step_index", (sid,))
                 events = []
-                for ev in ev_cursor.fetchall():
+                for ev in events_by_session.get(sid, ()):
                     events.append({
                         "timestamp": ev["timestamp"],
                         "model": ev["model"],
@@ -273,6 +319,7 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                     for event in events
                     for field in ("input_tokens", "cached_input_tokens", "output_tokens", "cache_write_tokens")
                 ):
+                    release_consumed_event_rows(sid)
                     continue
                 db_session_ids.add(sid)
                 observed_calls = int(row["call_count"] or 0)
@@ -303,9 +350,10 @@ def parse_agy_usage(agy_dir: str | Path | None = None) -> dict[str, Any]:
                     "usage_events": events,
                     "from_token_usage_db": True,
                 }
+                release_consumed_event_rows(sid)
             cursor.close()
         except Exception as e:
-            logger.warning("Error reading token_usage.db: %s", e)
+            logger.warning("Error reading usage database: %s", e)
         finally:
             if conn is not None:
                 try:
@@ -749,7 +797,7 @@ def _legacy_sessions_to_contract(
             session.metadata["estimated"] = False
             session.metadata["token_source"] = "reported"
             if session.cost is not None:
-                # token_usage.db stores the local estimator's result, not a
+                # The usage database stores the local estimator's result, not a
                 # provider-reported bill. Keep the exact token provenance,
                 # but let the shared aggregator reprice costs per call using
                 # the active catalog and each event timestamp.

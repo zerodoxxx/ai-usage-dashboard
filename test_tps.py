@@ -9,10 +9,9 @@ from pathlib import Path
 import pytest
 
 from src.parsers.aggregator import _build_usage_data, _filter_usage_data, get_tool_usage
-from src.parsers.agy import AntigravitySource
-from src.parsers.claude import ClaudeCodeSource, _parse_session_file
+from src.parsers.claude import _parse_session_file
 from src.parsers.codex import CodexSource, _parse_rollout_file
-from src.parsers.source_registry import SourceRegistry
+from tests_support import legacy_file_source_registry
 
 NOW = datetime(2026, 9, 30, 12, tzinfo=timezone.utc)
 TPS_FIELDS = {
@@ -162,7 +161,9 @@ def test_codex_modern_pairing_excludes_tool_execution_and_duplicate_status(tmp_p
     assert parsed["call_count"] == 2
     assert [e["metadata"]["tps_duration_seconds"] for e in parsed["usage_events"]] == [5, 5]
     assert [e["event_id"] for e in parsed["usage_events"]] == ["response-1", "response-2"]
-    result = get_tool_usage("codex", codex_dir=tmp_path)
+    result = get_tool_usage(
+        "codex", codex_dir=tmp_path, registry=legacy_file_source_registry()
+    )
     assert result["models"][0]["tps"] == 20
     assert result["models"][0]["tps_calls"] == 2
 
@@ -188,7 +189,9 @@ def test_codex_reconciled_usage_is_not_timed(tmp_path: Path) -> None:
         _item(0, "message", role="user"), _item(5, "message", role="assistant"),
         _token(5, _usage(), thread_token_usage=_usage(output=200, input_tokens=20)),
     ])
-    result = get_tool_usage("codex", codex_dir=tmp_path)
+    result = get_tool_usage(
+        "codex", codex_dir=tmp_path, registry=legacy_file_source_registry()
+    )
     assert result["models"][0]["output"] == 200
     _null_tps(result["models"][0])
 
@@ -198,7 +201,11 @@ def test_codex_cumulative_delta_with_missing_calls_is_not_timed(tmp_path: Path) 
         _item(0, "message", role="user"), _item(5, "message", role="assistant"),
         _status(5, _usage(), _usage(output=300, input_tokens=30)),
     ])
-    _null_tps(get_tool_usage("codex", codex_dir=tmp_path)["models"][0])
+    _null_tps(
+        get_tool_usage(
+            "codex", codex_dir=tmp_path, registry=legacy_file_source_registry()
+        )["models"][0]
+    )
 
 
 def test_codex_model_switch_and_missing_input(tmp_path: Path) -> None:
@@ -208,7 +215,12 @@ def test_codex_model_switch_and_missing_input(tmp_path: Path) -> None:
         {"type": "turn_context", "timestamp": _ts(6), "payload": {"model": "gpt-6-sol"}},
         _item(10, "message", role="assistant"), _token(10, _usage(), response_id="second"),
     ])
-    rows = {r["model"]: r for r in get_tool_usage("codex", codex_dir=tmp_path)["models"]}
+    rows = {
+        r["model"]: r
+        for r in get_tool_usage(
+            "codex", codex_dir=tmp_path, registry=legacy_file_source_registry()
+        )["models"]
+    }
     assert rows["gpt-6-luna"]["tps_calls"] == 1
     _null_tps(rows["gpt-6-sol"])
 
@@ -228,7 +240,9 @@ def test_claude_final_usage_and_last_block_timestamp(tmp_path: Path) -> None:
     assert event.metadata["tps_duration_seconds"] == 10
     assert event.metadata["tps_output_tokens"] == 200
     assert event.metadata["tps_trustworthy"]
-    row = get_tool_usage("claude-code", claude_dir=tmp_path)["models"][0]
+    row = get_tool_usage(
+        "claude-code", claude_dir=tmp_path, registry=legacy_file_source_registry()
+    )["models"][0]
     assert row["tps"] == 20
 
 
@@ -248,7 +262,9 @@ def test_claude_nearest_tool_result_ancestor_through_attachment(tmp_path: Path) 
 
 def test_claude_incomplete_response_is_not_timed(tmp_path: Path) -> None:
     _write(tmp_path / "session.jsonl", [_user(0), _assistant(5, complete=False)])
-    result = get_tool_usage("claude-code", claude_dir=tmp_path)
+    result = get_tool_usage(
+        "claude-code", claude_dir=tmp_path, registry=legacy_file_source_registry()
+    )
     assert result["models"][0]["output"] == 100
     _null_tps(result["models"][0])
 
@@ -256,7 +272,9 @@ def test_claude_incomplete_response_is_not_timed(tmp_path: Path) -> None:
 def test_claude_copied_message_id_uses_final_usage_once(tmp_path: Path) -> None:
     _write(tmp_path / "projects" / "test" / "first.jsonl", [_user(0), _assistant(2, 8, complete=False)])
     _write(tmp_path / "projects" / "test" / "second.jsonl", [_user(0), _assistant(10, 200)])
-    result = get_tool_usage("claude-code", claude_dir=tmp_path)
+    result = get_tool_usage(
+        "claude-code", claude_dir=tmp_path, registry=legacy_file_source_registry()
+    )
     assert result["summary"]["call_count"] == 1
     assert result["summary"]["output"] == 200
     assert result["models"][0]["tps_calls"] == 1
@@ -286,9 +304,7 @@ def test_tool_filter_and_agy_rows_are_unavailable(tmp_path: Path) -> None:
         {"created_at": _ts(0), "type": "USER_INPUT", "source": "USER", "content": "fixture input"},
         {"created_at": _ts(5), "type": "PLANNER_RESPONSE", "source": "MODEL", "content": "fixture output " * 50},
     ])
-    registry = SourceRegistry()
-    for source in (CodexSource(), ClaudeCodeSource(), AntigravitySource()):
-        registry.register(source)
+    registry = legacy_file_source_registry()
     roots = {"codex": codex_root, "claude-code": claude_root, "antigravity": agy_root}
     codex_only = get_tool_usage("codex", registry=registry, source_dirs=roots)
     assert len(codex_only["models"]) == 1

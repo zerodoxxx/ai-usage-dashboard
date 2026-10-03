@@ -26,6 +26,7 @@ from src.parsers.aggregator import (
     _time_range_cutoff,
     get_tool_usage,
 )
+from tests_support import legacy_file_source_registry
 
 
 def test_pricing() -> None:
@@ -493,7 +494,11 @@ def test_agy_estimated_provenance() -> None:
         assert by_id["sess-multi"].usage.cached_input_tokens == expected_cached
 
         # Aggregated API shape carries the estimated flag on sessions + models.
-        data = get_tool_usage("antigravity", agy_dir=root)
+        data = get_tool_usage(
+            "antigravity",
+            agy_dir=root,
+            registry=legacy_file_source_registry(),
+        )
         assert len(data["sessions"]) == 2
         for api_session in data["sessions"]:
             assert api_session["estimated"] is True, api_session

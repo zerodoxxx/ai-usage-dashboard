@@ -14,11 +14,13 @@ import os
 import re
 from collections import Counter
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from ..pricing import calculate_cost_strict
 from .contracts import CostEstimate, TokenUsage, UsageEvent, UsageSession, _timestamp
+from .file_cache import ParsedFileCache
 
 logger = logging.getLogger(__name__)
 def _pricing_provider(model: str) -> str:
@@ -152,7 +154,7 @@ def _sum_event_usage(events: list[UsageEvent]) -> TokenUsage:
     )
 
 
-def _parse_session_file(path: Path) -> UsageSession | None:
+def _parse_session_file_uncached(path: Path) -> tuple[UsageSession | None, bool]:
     events: list[UsageEvent] = []
     responses: dict[str, tuple[Any, dict[str, Any], int]] = {}
     ancestors: dict[str, tuple[Any, str, Any]] = {}
@@ -219,7 +221,7 @@ def _parse_session_file(path: Path) -> UsageSession | None:
                 responses[key] = (first_parent, record, line_number)
     except (OSError, UnicodeError) as exc:
         logger.debug("Unable to read Claude Code session %s: %s", path, exc)
-        return None
+        return None, False
 
     for key, (parent, record, ordinal) in responses.items():
         message = record.get("message")
@@ -282,7 +284,72 @@ def _parse_session_file(path: Path) -> UsageSession | None:
             call_count=len(events),
         )
 
-    return result
+    return result, True
+
+
+def _refresh_session_prices(session: UsageSession) -> None:
+    """Refresh estimated event and session costs from the current catalog."""
+    for event in session.events:
+        if event.cost is not None and (
+            event.cost.source == "reported" or event.cost.reported_usd is not None
+        ):
+            continue
+        model = event.model or session.model
+        usage = event.usage
+        resolved = calculate_cost_strict(
+            model,
+            usage.uncached_input_tokens,
+            usage.cached_input_tokens,
+            usage.output_tokens,
+            provider=_pricing_provider(model or ""),
+            cache_write_5m=usage.cache_write_5m_tokens,
+            cache_write_1h=usage.cache_write_1h_tokens,
+            timestamp=event.timestamp,
+        )
+        if resolved.get("status") == "known":
+            event.cost = CostEstimate(
+                cached_usd=resolved.get("cost_cached_usd") or 0.0,
+                uncached_usd=resolved.get("cost_uncached_usd") or 0.0,
+                savings_usd=resolved.get("savings_usd") or 0.0,
+                source="estimated",
+            )
+        else:
+            event.cost = None
+
+    if session.cost is not None and (
+        session.cost.source == "reported" or session.cost.reported_usd is not None
+    ):
+        return
+    if not session.events or any(event.cost is None for event in session.events):
+        session.cost = None
+        return
+
+    event_costs = [event.cost for event in session.events if event.cost is not None]
+    reported_costs = [cost for cost in event_costs if cost.reported_usd is not None]
+    all_reported = len(reported_costs) == len(event_costs)
+    has_reported = bool(reported_costs)
+    session.cost = CostEstimate(
+        cached_usd=sum((cost.total_usd for cost in event_costs), Decimal("0")),
+        uncached_usd=sum((cost.uncached_usd for cost in event_costs), Decimal("0")),
+        savings_usd=sum((cost.savings_usd for cost in event_costs), Decimal("0")),
+        reported_usd=(
+            sum((cost.reported_usd for cost in reported_costs if cost.reported_usd is not None), Decimal("0"))
+            if all_reported else None
+        ),
+        currency=event_costs[0].currency,
+        source="reported" if all_reported else "mixed" if has_reported else "estimated",
+    )
+
+
+_SESSION_PARSE_CACHE: ParsedFileCache[UsageSession | None] = ParsedFileCache(max_entries=1024)
+
+
+def _parse_session_file(path: Path) -> UsageSession | None:
+    """Parse a Claude transcript from the cache and refresh current pricing."""
+    session = _SESSION_PARSE_CACHE.parse(path, _parse_session_file_uncached)
+    if session is not None:
+        _refresh_session_prices(session)
+    return session
 
 
 def _session_files(base_dir: Path) -> list[Path]:
@@ -323,9 +390,11 @@ class ClaudeCodeSource:
             base_dir = Path(os.environ["CLAUDE_DIR"]).expanduser()
         else:
             base_dir = self.default_source_path
+        session_files = _session_files(base_dir)
+        _SESSION_PARSE_CACHE.retain_paths(session_files)
         sessions = [
             session
-            for path in _session_files(base_dir)
+            for path in session_files
             if (session := _parse_session_file(path)) is not None
         ]
         final_events: dict[str, UsageEvent] = {}

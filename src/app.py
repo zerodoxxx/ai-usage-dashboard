@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import re
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from threading import RLock
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response
+from starlette.concurrency import run_in_threadpool
 
-from src.parsers.aggregator import get_tool_usage
-from src.pricing import active_pricing_payload, refresh_pricing
+from src.parsers.aggregator import get_tool_usage, usage_cache_key
+from src.pricing import active_pricing_payload, pricing_metadata, refresh_pricing
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -26,6 +30,20 @@ NO_STORE_HEADERS = {
     "Pragma": "no-cache",
     "Expires": "0",
 }
+
+_USAGE_RESPONSE_CACHE: OrderedDict[tuple[Any, ...], bytes] = OrderedDict()
+_USAGE_RESPONSE_CACHE_LOCK = RLock()
+_USAGE_RESPONSE_CACHE_LIMIT = 16
+
+
+def _usage_response_key(request: Request) -> tuple[Any, ...] | None:
+    query = request.query_params
+    key = usage_cache_key(query.get("tool", "all"), query.get("time_range", "all"), query.get("start"), query.get("end"))
+    if key is None:
+        return None
+    # Provenance can change after a failed refresh even when rates do not.
+    return (*key, json.dumps(pricing_metadata(), sort_keys=True))
+
 
 app = FastAPI(
     title="AI Tools Usage & Cost Visualizer",
@@ -67,7 +85,37 @@ def version_static_assets(html: str) -> str:
 @app.middleware("http")
 async def disable_browser_cache(request: Request, call_next) -> Response:
     """Never let the browser reuse HTML, JS, or API payloads across loads."""
+    cache_key = None
+    if request.method == "GET" and request.url.path == "/api/usage":
+        # Refresh before looking up the key, just as the endpoint does. Network
+        # I/O belongs on a worker thread; hits only check the in-memory TTL.
+        await run_in_threadpool(refresh_pricing)
+        try:
+            cache_key = _usage_response_key(request)
+        except ValueError:
+            pass  # Let the endpoint return its existing validation response.
+        if cache_key is not None:
+            with _USAGE_RESPONSE_CACHE_LOCK:
+                body = _USAGE_RESPONSE_CACHE.get(cache_key)
+                if body is not None:
+                    _USAGE_RESPONSE_CACHE.move_to_end(cache_key)
+                    return Response(body, media_type="application/json", headers=dict(NO_STORE_HEADERS))
+
     response = await call_next(request)
+    if cache_key is not None and response.status_code == 200:
+        body = b"".join([chunk async for chunk in response.body_iterator])
+        final_key = _usage_response_key(request)
+        # Model discovery can change catalog revision/metadata. Store the bytes
+        # under that final pricing key only if the DB stayed unchanged.
+        store = json.loads(body).get("store", {})
+        if (final_key is not None and cache_key[0] == final_key[0]
+                and store.get("database_exists") and store.get("readable")):
+            with _USAGE_RESPONSE_CACHE_LOCK:
+                _USAGE_RESPONSE_CACHE[final_key] = body
+                _USAGE_RESPONSE_CACHE.move_to_end(final_key)
+                while len(_USAGE_RESPONSE_CACHE) > _USAGE_RESPONSE_CACHE_LIMIT:
+                    _USAGE_RESPONSE_CACHE.popitem(last=False)
+        response = Response(body, status_code=response.status_code, headers=dict(response.headers))
     for name, value in NO_STORE_HEADERS.items():
         response.headers[name] = value
     return response
@@ -107,7 +155,12 @@ def api_usage(
         # Refresh before parsing so provider adapters and their snapshots use
         # the same active rates as the pricing endpoint.
         refresh_pricing()
-        return get_tool_usage(tool, time_range=time_range, start=start, end=end)
+        usage = get_tool_usage(tool, time_range=time_range, start=start, end=end)
+        # The aggregator applies rates to models it discovers while parsing.
+        # Include that exact active catalog with the usage response so clients
+        # need one request and cost details stay aligned with the calculation.
+        usage["pricing"] = active_pricing_payload(refresh=False)
+        return usage
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

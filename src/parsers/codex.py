@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 import sqlite3
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .contracts import UsageSession
+from .file_cache import ParsedFileCache
 from ..pricing import calculate_cost_strict
 
 logger = logging.getLogger(__name__)
@@ -91,6 +94,21 @@ def _event_totals(events: list[dict[str, Any]]) -> dict[str, int]:
     """Sum normalized metrics across a list of usage events."""
     return {
         field: sum(_as_int(event.get(field)) for event in events)
+        for field in _USAGE_FIELDS
+    }
+
+
+def _advance_usage_total(
+    previous: dict[str, int],
+    usage: dict[str, int] | None,
+    cumulative: dict[str, int] | None,
+) -> dict[str, int]:
+    """Keep observed responses plus any history supplied by a scoped total."""
+    return {
+        field: max(
+            previous[field] + (usage[field] if usage else 0),
+            cumulative[field] if cumulative else 0,
+        )
         for field in _USAGE_FIELDS
     }
 
@@ -233,7 +251,11 @@ def _to_iso_string(ts: int | float | str | None) -> str:
     return str(ts).strip()
 
 
-def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
+def _parse_rollout_file_uncached(
+    file_path: Path,
+    *,
+    reject_malformed_tail: bool = False,
+) -> tuple[dict[str, Any], bool]:
     """Parse a single Codex rollout .jsonl file.
 
     Extracts incremental and cumulative token usage, timestamps, and call counts.
@@ -247,24 +269,48 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
     event_msg_fallback_events: list[dict[str, Any]] = []
     token_record_count = 0
     previous_event_msg_cumulative: dict[str, int] | None = None
-    last_cumulative: dict[str, int] | None = None
+    modern_total = dict.fromkeys(_USAGE_FIELDS, 0)
+    turn_totals: dict[str, dict[str, int]] = {}
+    unscoped_total = dict.fromkeys(_USAGE_FIELDS, 0)
+    has_thread_total = False
+    has_inherited_history = False
+    active_turn: str | None = None
     active_model: str | None = None
     modern_timing = _ResponseTiming()
     legacy_timing = _ResponseTiming()
     seen_response_ids: set[str] = set()
+    read_succeeded = True
+    malformed_record_seen = False
 
     try:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        decode_errors = "strict" if reject_malformed_tail else "ignore"
+        with open(file_path, "r", encoding="utf-8", errors=decode_errors) as f:
             for line in f:
                 line_str = line.strip()
                 if not line_str:
                     continue
-                if not any(key in line_str for key in ("token", "session_meta", "response_item", "turn_context")):
-                    continue
-                try:
-                    record = json.loads(line_str)
-                except Exception:
-                    continue
+                if reject_malformed_tail:
+                    try:
+                        record = json.loads(line_str)
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        # Capture snapshots must never replace a complete
+                        # persisted snapshot with totals parsed around a
+                        # truncated or corrupt JSONL record. Keep this sticky:
+                        # a later valid record does not repair missing usage.
+                        malformed_record_seen = True
+                        continue
+                    if not isinstance(record, dict):
+                        malformed_record_seen = True
+                        continue
+                    if not any(key in line_str for key in ("token", "session_meta", "response_item", "turn_context")):
+                        continue
+                else:
+                    if not any(key in line_str for key in ("token", "session_meta", "response_item", "turn_context")):
+                        continue
+                    try:
+                        record = json.loads(line_str)
+                    except Exception:
+                        continue
 
                 if not isinstance(record, dict):
                     continue
@@ -281,6 +327,7 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
                     payload = {}
 
                 if rec_type == "turn_context":
+                    active_turn = str(payload["turn_id"]) if payload.get("turn_id") else None
                     model_value = payload.get("model")
                     if model_value:
                         active_model = str(model_value).strip()
@@ -297,6 +344,12 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
                             timing.observe_output(ts, active_model or extracted_model)
 
                 if rec_type == "session_meta" and isinstance(payload, dict):
+                    # Forks and paginated continuations may retain cumulative
+                    # counters for history outside this file. Only its local
+                    # responses belong to this capture fragment.
+                    has_inherited_history = has_inherited_history or bool(
+                        payload.get("forked_from_id") or payload.get("history_base")
+                    )
                     prov = payload.get("provenance")
                     if isinstance(prov, dict):
                         extracted_model = prov.get("model")
@@ -323,10 +376,22 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
                             usage_event["event_id"] = str(response_id)
                         token_record_events.append(usage_event)
 
-                    thread_cum = payload.get("thread_token_usage") or payload.get("turn_token_usage")
-                    normalized_thread_cum = _normalize_usage(thread_cum)
-                    if normalized_thread_cum:
-                        last_cumulative = normalized_thread_cum
+                    normalized_usage = _normalize_usage(u)
+                    thread_total = _normalize_usage(payload.get("thread_token_usage"))
+                    has_thread_total = has_thread_total or thread_total is not None
+                    modern_total = _advance_usage_total(modern_total, normalized_usage, thread_total)
+                    turn_id = payload.get("turn_id") or active_turn
+                    if turn_id:
+                        turn_key = str(turn_id)
+                        turn_totals[turn_key] = _advance_usage_total(
+                            turn_totals.get(turn_key, dict.fromkeys(_USAGE_FIELDS, 0)),
+                            normalized_usage,
+                            _normalize_usage(payload.get("turn_token_usage")),
+                        )
+                    else:
+                        # Without a turn identity this counter cannot safely
+                        # describe the session. Distinct responses still add.
+                        unscoped_total = _advance_usage_total(unscoped_total, normalized_usage, None)
 
                 # Format 2: event_msg with payload.type == 'token_count'
                 elif rec_type == "event_msg" and payload.get("type") == "token_count":
@@ -349,39 +414,44 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
                                 trustworthy=event_delta == _normalize_usage(last_u),
                             )
                             event_msg_events.append(usage_event)
-                        last_cumulative = normalized_total
                     else:
                         usage_event = _build_usage_event(ts, last_u)
                         if usage_event:
                             legacy_timing.finish(usage_event)
                             event_msg_fallback_events.append(usage_event)
     except Exception as e:
+        read_succeeded = False
         logger.warning("Error reading rollout file %s: %s", file_path, e)
+    if reject_malformed_tail and malformed_record_seen:
+        read_succeeded = False
 
-    if last_cumulative:
-        input_tokens = last_cumulative["input_tokens"]
-        cached_input_tokens = last_cumulative["cached_input_tokens"]
-        output_tokens = last_cumulative["output_tokens"]
-        reasoning_output_tokens = last_cumulative["reasoning_output_tokens"]
-        cache_write_tokens = last_cumulative["cache_write_input_tokens"]
-        total_tokens = last_cumulative["total_tokens"]
-    else:
-        usage_events_for_totals = token_record_events or event_msg_fallback_events
-        input_tokens = sum(event["input_tokens"] for event in usage_events_for_totals)
-        cached_input_tokens = sum(event["cached_input_tokens"] for event in usage_events_for_totals)
-        output_tokens = sum(event["output_tokens"] for event in usage_events_for_totals)
-        reasoning_output_tokens = sum(event["reasoning_output_tokens"] for event in usage_events_for_totals)
-        cache_write_tokens = sum(event["cache_write_input_tokens"] for event in usage_events_for_totals)
-        total_tokens = sum(event["total_tokens"] for event in usage_events_for_totals)
+    if not has_thread_total:
+        modern_total = {
+            field: unscoped_total[field] + sum(turn[field] for turn in turn_totals.values())
+            for field in _USAGE_FIELDS
+        }
+    # These streams overlap: never add their totals. A legacy status can omit
+    # responses already present in the modern stream, even when emitted later.
+    # Cumulative counters may fill gaps, but cannot erase observed responses.
+    target_totals = {
+        field: max(modern_total[field], (previous_event_msg_cumulative or {}).get(field, 0))
+        for field in _USAGE_FIELDS
+    }
+    if has_inherited_history and token_record_events:
+        target_totals = _event_totals(token_record_events)
+    if not any(target_totals.values()):
+        target_totals = _event_totals(event_msg_fallback_events)
+    input_tokens = target_totals["input_tokens"]
+    cached_input_tokens = target_totals["cached_input_tokens"]
+    output_tokens = target_totals["output_tokens"]
+    reasoning_output_tokens = target_totals["reasoning_output_tokens"]
+    cache_write_tokens = target_totals["cache_write_input_tokens"]
+    total_tokens = target_totals["total_tokens"]
 
     # A rollout may contain both a token_usage_record and a token_count status
     # message for the same call. Prefer whichever event stream matches the
     # authoritative session total, then reconcile a partially-written stream.
-    target_totals = {
-        field: _as_int(value)
-        for field, value in last_cumulative.items()
-    } if last_cumulative else None
-    if target_totals:
+    if any(target_totals.values()):
         token_totals = _event_totals(token_record_events)
         message_totals = _event_totals(event_msg_events)
         if token_record_events and token_totals == target_totals:
@@ -389,7 +459,9 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
         elif event_msg_events and message_totals == target_totals:
             usage_events = event_msg_events
         else:
-            usage_events = event_msg_events or token_record_events or event_msg_fallback_events
+            # Preserve response identities when neither partial stream covers
+            # the target; a shorter legacy stream must not collapse responses.
+            usage_events = token_record_events or event_msg_events or event_msg_fallback_events
             usage_events = _reconcile_usage_events(usage_events, target_totals)
     else:
         usage_events = token_record_events or event_msg_fallback_events
@@ -423,17 +495,270 @@ def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
         "total_tokens": total_tokens,
         "start_time": first_timestamp,
         "end_time": last_timestamp,
-        "model": extracted_model,
+        # turn_context carries the model selected for the concrete turn. When
+        # it is present, prefer it over a session-level parent/default model.
+        "model": active_model or extracted_model,
         "usage_events": usage_events,
     }
-    return dict(result)
+    return dict(result), read_succeeded
 
 
-def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
+_ROLLOUT_PARSE_CACHE: ParsedFileCache[dict[str, Any]] = ParsedFileCache(max_entries=1024)
+
+
+def _parse_rollout_file(file_path: Path) -> dict[str, Any]:
+    """Parse a rollout file, reusing only stable successful reads."""
+    return _ROLLOUT_PARSE_CACHE.parse(file_path, _parse_rollout_file_uncached)
+
+
+def _codex_thread_session(
+    thread_id: str,
+    *,
+    title: Any = None,
+    model: Any = None,
+    reasoning_effort: Any = None,
+    tokens_used: Any = 0,
+    created_at: Any = None,
+    parsed: dict[str, Any] | None = None,
+    source_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Assemble the dashboard-compatible session for one Codex thread.
+
+    This is shared by the full-history parser and the post-turn capture hook so
+    both paths use the same cumulative-token fallback, timestamps, call events,
+    model selection, and pricing behavior.
+    """
+    t_id = str(thread_id or "")
+    raw_title = str(title or "").strip()
+    clean_title = next(
+        (line.strip() for line in raw_title.splitlines() if line.strip()),
+        f"Codex Session {t_id[:8]}",
+    )
+    selected_model = str(model or "").strip()
+    db_tokens = _as_int(tokens_used)
+    usage_events: list[dict[str, Any]] = []
+
+    if parsed is not None:
+        observed_model = str(parsed.get("model") or "").strip()
+        if observed_model:
+            selected_model = observed_model
+        call_count = _as_int(parsed.get("call_count"))
+        input_tokens = _as_int(parsed.get("input_tokens"))
+        cached_input = _as_int(parsed.get("cached_input_tokens"))
+        uncached_input = _as_int(parsed.get("uncached_input_tokens"))
+        output = _as_int(parsed.get("output_tokens"))
+        reasoning_output = _as_int(parsed.get("reasoning_output_tokens"))
+        cache_write_tokens = _as_int(parsed.get("cache_write_input_tokens"))
+        total_tokens = _as_int(parsed.get("total_tokens"))
+        start_time = parsed.get("start_time")
+        end_time = parsed.get("end_time")
+        usage_events = list(parsed.get("usage_events") or [])
+    else:
+        call_count = 1 if db_tokens > 0 else 0
+        input_tokens = int(db_tokens * 0.8)
+        cached_input = 0
+        uncached_input = input_tokens
+        output = max(0, db_tokens - input_tokens)
+        reasoning_output = 0
+        cache_write_tokens = 0
+        total_tokens = db_tokens
+        start_time = None
+        end_time = None
+
+    # The state database tracks a less detailed total. Keep its legacy fallback
+    # when a rollout is missing or did not retain token events.
+    if total_tokens == 0 and db_tokens > 0:
+        total_tokens = db_tokens
+        input_tokens = int(db_tokens * 0.8)
+        uncached_input = input_tokens
+        cached_input = 0
+        output = max(0, db_tokens - input_tokens)
+        cache_write_tokens = 0
+        call_count = max(1, call_count)
+
+    created_at_iso = _to_iso_string(created_at) or (start_time or "")
+    if not usage_events and total_tokens > 0:
+        usage_events = [{
+            "timestamp": created_at_iso,
+            "input_tokens": input_tokens,
+            "cached_input_tokens": cached_input,
+            "output_tokens": output,
+            "reasoning_output_tokens": reasoning_output,
+            "cache_write_input_tokens": cache_write_tokens,
+            "total_tokens": total_tokens,
+        }]
+
+    priced = calculate_cost_strict(
+        selected_model,
+        uncached_input,
+        cached_input,
+        output,
+        provider="codex",
+        cache_write=cache_write_tokens,
+        timestamp=created_at_iso or start_time,
+    )
+    cost = {
+        "cost_cached_usd": float(priced.get("cost_cached_usd") or 0.0),
+        "cost_uncached_usd": float(priced.get("cost_uncached_usd") or 0.0),
+        "savings_usd": float(priced.get("savings_usd") or 0.0),
+    }
+    total_input = uncached_input + cached_input + cache_write_tokens
+    cache_hit_rate = (
+        round(cached_input / (uncached_input + cached_input) * 100.0, 2)
+        if uncached_input + cached_input > 0 else 0.0
+    )
+
+    session = {
+        "id": t_id,
+        "title": clean_title,
+        "tool": "codex",
+        "model": selected_model,
+        "reasoning_effort": reasoning_effort,
+        "call_count": call_count,
+        "uncached_input": uncached_input,
+        "cached_input": cached_input,
+        "total_input": total_input,
+        "cache_write": cache_write_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "cache_write_input_tokens": cache_write_tokens,
+        "output": output,
+        "reasoning_output": reasoning_output,
+        "total_tokens": total_tokens,
+        "cache_hit_rate": cache_hit_rate,
+        "cost_cached_usd": cost["cost_cached_usd"],
+        "cost_uncached_usd": cost["cost_uncached_usd"],
+        "savings_usd": cost["savings_usd"],
+        "created_at": created_at_iso,
+        "start_time": start_time,
+        "end_time": end_time,
+        "usage_events": usage_events,
+    }
+    if source_path is not None:
+        session["metadata"] = {"rollout_path": str(source_path)}
+    return session
+
+
+def _strip_codex_storage_prefix(session_id: Any) -> str:
+    value = str(session_id or "")
+    return value[len("codex:"):] if value.startswith("codex:") else value
+
+
+def _canonical_path(value: Any) -> str | None:
+    if not value:
+        return None
+    try:
+        return str(Path(str(value)).expanduser().resolve())
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _capture_file_metadata(path: Path) -> dict[str, Any] | None:
+    """Build private, compact identity metadata for a captured source file."""
+    try:
+        resolved = path.expanduser().resolve()
+        stat = resolved.stat()
+    except (OSError, RuntimeError):
+        return None
+    return {
+        "capture_source_hash": hashlib.sha256(str(resolved).encode("utf-8")).hexdigest(),
+        "capture_mtime_ns": stat.st_mtime_ns,
+        "capture_ctime_ns": stat.st_ctime_ns,
+        "capture_size": stat.st_size,
+    }
+
+
+def _read_persisted_codex_sessions(
+    codex_dir: Path,
+    *,
+    requested_root: str | Path | None,
+    usage_db_path: str | Path | None,
+) -> list[UsageSession]:
+    """Read only Codex-owned rows from the shared usage database.
+
+    A custom Codex root does not implicitly consult the user's global shared
+    database. Tests and alternate installations can opt in with usage_db_path.
+    """
+    if usage_db_path is None:
+        default_root = Path.home() / ".codex"
+        try:
+            is_default_root = codex_dir.resolve() == default_root.resolve()
+        except (OSError, RuntimeError):
+            is_default_root = False
+        if requested_root is not None and not is_default_root:
+            return []
+    try:
+        from src.usage_store import read_usage_sessions
+
+        return [
+            session
+            for session in read_usage_sessions("codex", db_path=usage_db_path)
+            if isinstance(session, UsageSession)
+            and str(session.provider or session.tool).casefold() == "codex"
+        ]
+    except Exception as exc:
+        logger.warning("Error reading persisted Codex usage: %s", exc)
+        return []
+
+
+def _codex_capture_is_enabled(
+    codex_dir: Path,
+    *,
+    requested_root: str | Path | None,
+    usage_db_path: str | Path | None,
+) -> bool:
+    """Return whether Codex has completed the one-time shared-DB backfill."""
+    if usage_db_path is None:
+        default_root = Path.home() / ".codex"
+        try:
+            is_default_root = codex_dir.resolve() == default_root.resolve()
+        except (OSError, RuntimeError):
+            is_default_root = False
+        if requested_root is not None and not is_default_root:
+            return False
+    try:
+        from src.usage_store import is_provider_capture_enabled
+
+        return bool(is_provider_capture_enabled("codex", db_path=usage_db_path))
+    except (ImportError, AttributeError):
+        return False
+    except Exception as exc:
+        logger.warning("Error reading Codex capture state: %s", exc)
+        return False
+
+
+def _stored_session_to_legacy(session: UsageSession) -> dict[str, Any]:
+    raw = session.to_legacy_dict(include_events=True)
+    raw["id"] = _strip_codex_storage_prefix(session.id)
+    raw["tool"] = "codex"
+    raw["provider"] = "codex"
+    raw["cache_write"] = session.usage.cache_write_tokens
+    raw["cache_write_tokens"] = session.usage.cache_write_tokens
+    raw["cache_write_input_tokens"] = session.usage.cache_write_tokens
+    # The dashboard's legacy Codex event vocabulary uses this field for the
+    # provider's separate cache-write input component.
+    raw["usage_events"] = [
+        {
+            **event.to_legacy_dict(),
+            "cache_write_input_tokens": event.usage.cache_write_tokens,
+        }
+        for event in session.events
+    ]
+    return raw
+
+
+def parse_codex_usage(
+    codex_dir: str | Path | None = None,
+    *,
+    usage_db_path: str | Path | None = None,
+    include_persisted: bool = True,
+) -> dict[str, Any]:
     """Parse Codex usage metrics from state_5.sqlite and rollout-*.jsonl files.
 
     Args:
         codex_dir: Base directory for Codex data. Defaults to ~/.codex.
+        usage_db_path: Optional explicit shared usage database path. Custom
+            Codex roots never consult the global shared database implicitly.
+        include_persisted: Set to false for an explicit one-time local capture.
 
     Returns:
         Dictionary with keys:
@@ -443,7 +768,38 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
             - 'timeline': daily aggregated metrics list
             - 'sessions': individual session details list
     """
+    requested_root = codex_dir
     base_dir = Path(codex_dir).expanduser() if codex_dir else Path.home() / ".codex"
+    capture_enabled = (
+        _codex_capture_is_enabled(
+            base_dir,
+            requested_root=requested_root,
+            usage_db_path=usage_db_path,
+        )
+        if include_persisted else False
+    )
+    # Backfill commits all provider rows before setting the capture flag. Read
+    # the flag first so an activation observed here always precedes a complete
+    # database snapshot, never a partially-read pre-activation row set.
+    persisted_contracts = (
+        _read_persisted_codex_sessions(
+            base_dir,
+            requested_root=requested_root,
+            usage_db_path=usage_db_path,
+        )
+        if include_persisted else []
+    )
+    persisted_by_id = {
+        _strip_codex_storage_prefix(session.id).casefold(): session
+        for session in persisted_contracts
+    }
+    persisted_rollout_paths = {
+        _canonical_path(session.metadata.get(key))
+        for session in persisted_contracts
+        for key in ("rollout_path", "source_path")
+        if session.metadata.get(key)
+    }
+    persisted_rollout_paths.discard(None)
 
     empty_result: dict[str, Any] = {
         "tool": "codex",
@@ -468,15 +824,16 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
         "sessions": [],
     }
 
-    if not base_dir.exists():
+    if not base_dir.exists() and not persisted_contracts:
+        _ROLLOUT_PARSE_CACHE.retain_paths(())
         return empty_result
 
     # 1. Discover all rollout files on disk
     rollout_files_by_path: dict[str, Path] = {}
     rollout_files_by_id: dict[str, Path] = {}
 
-    for p in base_dir.glob("**/*rollout-*.jsonl"):
-        rollout_files_by_path[str(p)] = p
+    for p in (() if capture_enabled else base_dir.glob("**/*rollout-*.jsonl")):
+        rollout_files_by_path[str(p.resolve())] = p
         # Filename pattern: rollout-<date>-<thread_id>.jsonl
         fname = p.name
         # Match trailing UUID format if present
@@ -488,7 +845,7 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
     db_path = base_dir / "state_5.sqlite"
     threads_data: list[dict[str, Any]] = []
 
-    if db_path.exists():
+    if db_path.exists() and not capture_enabled:
         conn: sqlite3.Connection | None = None
         cursor: sqlite3.Cursor | None = None
         try:
@@ -522,177 +879,81 @@ def parse_codex_usage(codex_dir: str | Path | None = None) -> dict[str, Any]:
                 except Exception as e:
                     logger.debug("Failed to close connection: %s", e)
 
-    sessions: list[dict[str, Any]] = []
+    live_rollout_paths = set(rollout_files_by_path.values())
+    live_rollout_paths.update(
+        Path(str(thread.get("rollout_path"))).expanduser()
+        for thread in threads_data
+        if thread.get("rollout_path") and Path(str(thread["rollout_path"])).is_file()
+    )
+    _ROLLOUT_PARSE_CACHE.retain_paths(live_rollout_paths)
+
+    sessions: list[dict[str, Any]] = [
+        _stored_session_to_legacy(session)
+        for session in persisted_contracts
+    ]
     processed_rollout_paths: set[str] = set()
 
     # 3. Match DB threads with rollout data
     for t in threads_data:
         t_id = str(t.get("id") or "")
         db_rollout_path = str(t.get("rollout_path") or "")
-        raw_title = str(t.get("title") or "").strip()
-        # Clean title to first readable non-empty line
-        clean_title = next((line.strip() for line in raw_title.splitlines() if line.strip()), f"Codex Session {t_id[:8]}")
-        model = str(t.get("model") or "").strip()
-        reasoning_effort = t.get("reasoning_effort")
-        db_tokens = int(t.get("tokens_used") or 0)
-        created_at_raw = t.get("created_at")
-        usage_events: list[dict[str, Any]] = []
+        db_tokens = _as_int(t.get("tokens_used"))
 
         matched_rollout_path: Path | None = None
         if db_rollout_path and os.path.exists(db_rollout_path):
             matched_rollout_path = Path(db_rollout_path)
-        elif db_rollout_path in rollout_files_by_path:
-            matched_rollout_path = rollout_files_by_path[db_rollout_path]
+        elif _canonical_path(db_rollout_path) in rollout_files_by_path:
+            matched_rollout_path = rollout_files_by_path[_canonical_path(db_rollout_path)]
         elif t_id.lower() in rollout_files_by_id:
             matched_rollout_path = rollout_files_by_id[t_id.lower()]
 
+        canonical_rollout_path = _canonical_path(matched_rollout_path)
         if matched_rollout_path:
-            processed_rollout_paths.add(str(matched_rollout_path.resolve()))
+            if canonical_rollout_path:
+                processed_rollout_paths.add(canonical_rollout_path)
+
+        # A captured row already contains the authoritative totals and event
+        # timestamps for this thread. Keep it even when its rollout is gone,
+        # and never append a second session from the local JSONL copy.
+        if t_id.casefold() in persisted_by_id or canonical_rollout_path in persisted_rollout_paths:
+            continue
+
+        parsed: dict[str, Any] | None = None
+        if matched_rollout_path:
             parsed = _parse_rollout_file(matched_rollout_path)
-            if parsed.get("model"):
-                model = str(parsed["model"]).strip()
-            call_count = parsed["call_count"]
-            input_tokens = parsed["input_tokens"]
-            cached_input = parsed["cached_input_tokens"]
-            uncached_input = parsed["uncached_input_tokens"]
-            output = parsed["output_tokens"]
-            reasoning_output = parsed["reasoning_output_tokens"]
-            cache_write_tokens = parsed["cache_write_input_tokens"]
-            total_tokens = parsed["total_tokens"]
-            start_time = parsed["start_time"]
-            end_time = parsed["end_time"]
-            usage_events = list(parsed.get("usage_events") or [])
-        else:
-            call_count = 1 if db_tokens > 0 else 0
-            input_tokens = int(db_tokens * 0.8)
-            cached_input = 0
-            uncached_input = input_tokens
-            output = max(0, db_tokens - input_tokens)
-            reasoning_output = 0
-            cache_write_tokens = 0
-            total_tokens = db_tokens
-            start_time = None
-            end_time = None
-
-        # Fallback to DB tokens if parsed yielded 0 but DB had usage
-        if total_tokens == 0 and db_tokens > 0:
-            total_tokens = db_tokens
-            input_tokens = int(db_tokens * 0.8)
-            uncached_input = input_tokens
-            cached_input = 0
-            output = max(0, db_tokens - input_tokens)
-            cache_write_tokens = 0
-            call_count = max(1, call_count)
-
-        created_at_iso = _to_iso_string(created_at_raw) or (start_time or "")
-
-        if not usage_events and total_tokens > 0:
-            usage_events = [{
-                "timestamp": created_at_iso,
-                "input_tokens": input_tokens,
-                "cached_input_tokens": cached_input,
-                "output_tokens": output,
-                "reasoning_output_tokens": reasoning_output,
-                "cache_write_input_tokens": cache_write_tokens,
-                "total_tokens": total_tokens,
-            }]
-
-        priced = calculate_cost_strict(
-            model,
-            uncached_input,
-            cached_input,
-            output,
-            provider="codex",
-            cache_write=cache_write_tokens,
-        )
-        cost = {
-            "cost_cached_usd": float(priced.get("cost_cached_usd") or 0.0),
-            "cost_uncached_usd": float(priced.get("cost_uncached_usd") or 0.0),
-            "savings_usd": float(priced.get("savings_usd") or 0.0),
-        }
-        total_input = uncached_input + cached_input + cache_write_tokens
-        cache_hit_rate = round((cached_input / (uncached_input + cached_input) * 100.0), 2) if uncached_input + cached_input > 0 else 0.0
-
-        sessions.append({
-            "id": t_id,
-            "title": clean_title,
-            "tool": "codex",
-            "model": model,
-            "reasoning_effort": reasoning_effort,
-            "call_count": call_count,
-            "uncached_input": uncached_input,
-            "cached_input": cached_input,
-            "total_input": total_input,
-            "cache_write": cache_write_tokens,
-            "cache_write_tokens": cache_write_tokens,
-            "cache_write_input_tokens": cache_write_tokens,
-            "output": output,
-            "reasoning_output": reasoning_output,
-            "total_tokens": total_tokens,
-            "cache_hit_rate": cache_hit_rate,
-            "cost_cached_usd": cost["cost_cached_usd"],
-            "cost_uncached_usd": cost["cost_uncached_usd"],
-            "savings_usd": cost["savings_usd"],
-            "created_at": created_at_iso,
-            "start_time": start_time,
-            "end_time": end_time,
-            "usage_events": usage_events,
-        })
+        sessions.append(_codex_thread_session(
+            t_id,
+            title=t.get("title"),
+            model=t.get("model"),
+            reasoning_effort=t.get("reasoning_effort"),
+            tokens_used=db_tokens,
+            created_at=t.get("created_at"),
+            parsed=parsed,
+            source_path=matched_rollout_path,
+        ))
 
     # 4. Handle any orphan rollout files not indexed in threads table
     for rpath_str, rpath in rollout_files_by_path.items():
-        if rpath_str in processed_rollout_paths:
+        if rpath_str in processed_rollout_paths or rpath_str in persisted_rollout_paths:
+            continue
+        filename_match = re.search(
+            r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+            rpath.name,
+        )
+        if filename_match and filename_match.group(1).casefold() in persisted_by_id:
             continue
         parsed = _parse_rollout_file(rpath)
         if parsed["total_tokens"] == 0 and parsed["call_count"] == 0:
             continue
         # Extract UUID or basename
-        match = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", rpath.name)
-        orphan_id = match.group(1) if match else rpath.stem
-        orphan_model = str(parsed.get("model") or "").strip()
-        created_at_iso = parsed["start_time"] or ""
-
-        priced = calculate_cost_strict(
-            orphan_model,
-            parsed["uncached_input_tokens"],
-            parsed["cached_input_tokens"],
-            parsed["output_tokens"],
-            provider="codex",
-            cache_write=parsed["cache_write_input_tokens"],
+        orphan_id = filename_match.group(1) if filename_match else rpath.stem
+        session = _codex_thread_session(
+            orphan_id,
+            title=f"Codex Session {orphan_id[:8]}",
+            parsed=parsed,
+            source_path=rpath,
         )
-        cost = {
-            "cost_cached_usd": float(priced.get("cost_cached_usd") or 0.0),
-            "cost_uncached_usd": float(priced.get("cost_uncached_usd") or 0.0),
-            "savings_usd": float(priced.get("savings_usd") or 0.0),
-        }
-        tot_in = parsed["uncached_input_tokens"] + parsed["cached_input_tokens"] + parsed["cache_write_input_tokens"]
-        c_hit_rate = round((parsed["cached_input_tokens"] / (parsed["uncached_input_tokens"] + parsed["cached_input_tokens"]) * 100.0), 2) if parsed["uncached_input_tokens"] + parsed["cached_input_tokens"] > 0 else 0.0
-
-        sessions.append({
-            "id": orphan_id,
-            "title": f"Codex Session {orphan_id[:8]}",
-            "tool": "codex",
-            "model": orphan_model,
-            "reasoning_effort": None,
-            "call_count": parsed["call_count"],
-            "uncached_input": parsed["uncached_input_tokens"],
-            "cached_input": parsed["cached_input_tokens"],
-            "total_input": tot_in,
-            "cache_write": parsed["cache_write_input_tokens"],
-            "cache_write_tokens": parsed["cache_write_input_tokens"],
-            "cache_write_input_tokens": parsed["cache_write_input_tokens"],
-            "output": parsed["output_tokens"],
-            "reasoning_output": parsed["reasoning_output_tokens"],
-            "total_tokens": parsed["total_tokens"],
-            "cache_hit_rate": c_hit_rate,
-            "cost_cached_usd": cost["cost_cached_usd"],
-            "cost_uncached_usd": cost["cost_uncached_usd"],
-            "savings_usd": cost["savings_usd"],
-            "created_at": created_at_iso,
-            "start_time": parsed["start_time"],
-            "end_time": parsed["end_time"],
-            "usage_events": list(parsed.get("usage_events") or []),
-        })
+        sessions.append(session)
 
     # Sort sessions by created_at descending
     sessions.sort(key=lambda s: str(s.get("created_at") or ""), reverse=True)
@@ -854,6 +1115,360 @@ def _legacy_sessions_to_contract(
     return sessions
 
 
+def _read_codex_thread_metadata(codex_dir: Path, thread_id: str) -> dict[str, Any]:
+    """Read metadata for one Codex thread without scanning its history."""
+    db_path = codex_dir / "state_5.sqlite"
+    if not db_path.is_file():
+        return {}
+
+    conn: sqlite3.Connection | None = None
+    try:
+        uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA query_only = ON")
+        cursor.execute(
+            """
+            SELECT id, title, model, reasoning_effort, tokens_used, created_at,
+                   rollout_path
+            FROM threads
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (str(thread_id),),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row is not None else {}
+    except (OSError, sqlite3.Error) as exc:
+        logger.debug("Could not read Codex thread metadata from %s: %s", db_path, exc)
+        return {}
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _capture_codex_session_for_capture(
+    transcript_path: str | Path,
+    session_id: str,
+    model: str | None = None,
+    codex_dir: str | Path | None = None,
+) -> tuple[UsageSession | None, str]:
+    """Extract one completed transcript for the native Codex capture hook.
+
+    This reads only ``transcript_path`` and, when available, one matching row
+    from ``state_5.sqlite``. A model observed in the transcript takes
+    precedence over the caller's fallback model and thread metadata.
+    """
+    path = Path(transcript_path).expanduser()
+    if not path.is_file():
+        return None, "missing"
+
+    base_dir = Path(codex_dir).expanduser() if codex_dir else Path.home() / ".codex"
+    parsed: dict[str, Any] | None = None
+    stable_metadata: dict[str, Any] | None = None
+    for attempt in range(3):
+        before = _capture_file_metadata(path)
+        if before is None:
+            return None, "missing"
+        try:
+            parsed, read_succeeded = _parse_rollout_file_uncached(
+                path,
+                reject_malformed_tail=True,
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            logger.debug("Could not parse captured Codex transcript %s: %s", path, exc)
+            return None, "unreadable"
+        after = _capture_file_metadata(path)
+        if before == after:
+            stable_metadata = after
+            if not read_succeeded:
+                return None, "unreadable"
+            break
+        if attempt < 2:
+            time.sleep(0.03)
+    if stable_metadata is None or parsed is None:
+        return None, "unstable"
+
+    # Do not use state_5.sqlite's coarse aggregate to fabricate a complete
+    # native snapshot. That could replace a richer event history already in
+    # SQLite when the transcript is empty or has not flushed token records.
+    if _as_int(parsed.get("total_tokens")) <= 0:
+        return None, "empty"
+
+    thread_metadata = _read_codex_thread_metadata(base_dir, session_id)
+    session_data = _codex_thread_session(
+        session_id,
+        title=thread_metadata.get("title"),
+        model=model or thread_metadata.get("model"),
+        reasoning_effort=thread_metadata.get("reasoning_effort"),
+        tokens_used=0,
+        created_at=thread_metadata.get("created_at"),
+        parsed=parsed,
+        source_path=path,
+    )
+    if _as_int(session_data.get("total_tokens")) <= 0:
+        return None, "empty"
+
+    session = UsageSession.from_legacy_dict(session_data)
+    session.metadata.pop("rollout_path", None)
+    session.metadata.update(stable_metadata)
+    session.provider = "codex"
+    session.tool = "codex"
+    for event in session.events:
+        if event.model is None:
+            event.model = session.model
+    return session, "ok"
+
+
+def extract_codex_session_for_capture(
+    transcript_path: str | Path,
+    session_id: str,
+    model: str | None = None,
+    codex_dir: str | Path | None = None,
+) -> UsageSession | None:
+    """Extract one complete, stable transcript for the native Codex hook."""
+    session, _status = _capture_codex_session_for_capture(
+        transcript_path,
+        session_id,
+        model=model,
+        codex_dir=codex_dir,
+    )
+    return session
+
+
+def _codex_capture_event_signature(event: Any) -> tuple[Any, ...]:
+    usage = event.usage
+    timestamp = event.timestamp.isoformat() if event.timestamp is not None else ""
+    return (
+        event.event_id or "",
+        timestamp,
+        event.model or "",
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.output_tokens,
+        usage.reasoning_output_tokens,
+        usage.cache_write_tokens,
+        usage.cache_write_5m_tokens,
+        usage.cache_write_1h_tokens,
+    )
+
+
+def _ensure_codex_capture_fragments_disjoint(sessions: list[UsageSession]) -> None:
+    """Reject same-thread fragments that cannot be safely added together."""
+    from datetime import datetime
+
+    for index, left in enumerate(sessions):
+        left_signatures = {_codex_capture_event_signature(event) for event in left.events}
+        left_by_id = {
+            event.event_id: _codex_capture_event_signature(event)
+            for event in left.events
+            if event.event_id
+        }
+        left_times = [event.timestamp for event in left.events if event.timestamp is not None]
+        left_range = (min(left_times), max(left_times)) if left_times else None
+        for right in sessions[index + 1:]:
+            right_signatures = {_codex_capture_event_signature(event) for event in right.events}
+            right_by_id = {
+                event.event_id: _codex_capture_event_signature(event)
+                for event in right.events
+                if event.event_id
+            }
+            for event_id in left_by_id.keys() & right_by_id.keys():
+                if left_by_id[event_id] != right_by_id[event_id]:
+                    raise RuntimeError(
+                        f"Codex fragments disagree about response {event_id!r}; refusing an unsafe merge"
+                    )
+
+            right_times = [event.timestamp for event in right.events if event.timestamp is not None]
+            right_range = (min(right_times), max(right_times)) if right_times else None
+            if left_range and right_range:
+                # UsageEvent timestamps are normalized to aware UTC datetimes.
+                assert isinstance(left_range[0], datetime) and isinstance(right_range[0], datetime)
+                ranges_overlap = left_range[0] <= right_range[1] and right_range[0] <= left_range[1]
+                if ranges_overlap and left_signatures != right_signatures:
+                    raise RuntimeError(
+                        "Codex same-thread rollout fragments overlap in time; refusing an unsafe merge"
+                    )
+
+
+def _merge_codex_capture_fragments(
+    thread_id: str,
+    fragments: list[UsageSession],
+    *,
+    thread: dict[str, Any] | None = None,
+) -> UsageSession:
+    """Merge stable per-file snapshots while retaining fragment provenance."""
+    from src.parsers.aggregator import _merge_usage_sessions
+
+    _ensure_codex_capture_fragments_disjoint(fragments)
+    metadata_by_hash: dict[str, dict[str, int]] = {}
+    primary_metadata: dict[str, Any] = {}
+    for fragment in fragments:
+        source_hash = str(fragment.metadata.get("capture_source_hash") or "")
+        if not source_hash:
+            raise RuntimeError("Codex capture fragment lacks a stable source fingerprint")
+        revision = {
+            "capture_mtime_ns": _as_int(fragment.metadata.get("capture_mtime_ns")),
+            "capture_ctime_ns": _as_int(fragment.metadata.get("capture_ctime_ns")),
+            "capture_size": _as_int(fragment.metadata.get("capture_size")),
+        }
+        metadata_by_hash[source_hash] = revision
+        if not primary_metadata:
+            primary_metadata = dict(fragment.metadata)
+        for event in fragment.events:
+            event.metadata["capture_source_hash"] = source_hash
+
+    merged_sessions = _merge_usage_sessions(fragments)
+    if not merged_sessions:
+        raise RuntimeError(f"Could not merge Codex thread {thread_id!r}")
+    merged = merged_sessions[0]
+    merged.id = thread_id
+    merged.provider = "codex"
+    merged.tool = "codex"
+    merged.metadata.update(primary_metadata)
+    merged.metadata["capture_sources"] = metadata_by_hash
+    if len(metadata_by_hash) > 1:
+        merged.metadata["capture_quality"] = "merged-fragments"
+
+    if thread:
+        if thread.get("title"):
+            merged.title = str(thread["title"])
+        if thread.get("reasoning_effort"):
+            merged.reasoning_effort = str(thread["reasoning_effort"])
+        if thread.get("created_at"):
+            parsed_created_at = UsageSession.from_legacy_dict({
+                "id": thread_id,
+                "tool": "codex",
+                "created_at": thread.get("created_at"),
+            }).created_at
+            if parsed_created_at is not None:
+                merged.created_at = parsed_created_at
+    return merged
+
+
+def extract_all_codex_sessions_for_capture(
+    codex_dir: str | Path | None = None,
+) -> list[UsageSession]:
+    """Extract local Codex history for an explicit one-time database capture.
+
+    This deliberately bypasses the shared usage database so a migration cannot
+    re-import its own rows. Each transcript is captured with its own stable
+    before/after fingerprint; one unstable or unreadable file aborts the
+    backfill so the caller cannot enable DB-only mode with incomplete history.
+    It performs no writes.
+    """
+    base_dir = Path(codex_dir).expanduser() if codex_dir else Path.home() / ".codex"
+    candidate_paths: dict[str, Path] = {}
+    candidate_ids_by_path: dict[str, str] = {}
+    candidate_paths_by_id: defaultdict[str, list[str]] = defaultdict(list)
+
+    for path in base_dir.glob("**/*rollout-*.jsonl"):
+        canonical = str(path.resolve())
+        candidate_paths[canonical] = path
+        filename_match = re.search(
+            r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+            path.name,
+        )
+        session_id = filename_match.group(1) if filename_match else path.stem
+        candidate_ids_by_path[canonical] = session_id
+        candidate_paths_by_id[session_id.casefold()].append(canonical)
+
+    thread_rows_by_id: dict[str, dict[str, Any]] = {}
+    state_db = base_dir / "state_5.sqlite"
+    if state_db.is_file():
+        connection: sqlite3.Connection | None = None
+        try:
+            uri = f"file:{state_db.resolve().as_posix()}?mode=ro"
+            connection = sqlite3.connect(uri, uri=True)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only = ON")
+            rows = connection.execute(
+                """SELECT id, title, model, reasoning_effort, tokens_used,
+                          created_at, rollout_path
+                   FROM threads"""
+            ).fetchall()
+            for row in rows:
+                thread = dict(row)
+                thread_id = str(thread.get("id") or "")
+                if thread_id:
+                    thread_rows_by_id[thread_id.casefold()] = thread
+        except sqlite3.Error as exc:
+            logger.warning("Could not enumerate Codex thread rollouts in %s: %s", state_db, exc)
+            raise RuntimeError(f"Could not enumerate Codex source transcripts: {state_db}") from exc
+        finally:
+            if connection is not None:
+                connection.close()
+
+    # Include state_5's canonical path first, followed by every same-thread
+    # rollout fragment. Per-file parser reconciliation handles cumulative
+    # records within each file; the established session merger deduplicates
+    # shared response IDs/fingerprints across files.
+    sessions_by_id: dict[str, UsageSession] = {}
+    all_thread_keys = set(thread_rows_by_id) | set(candidate_paths_by_id)
+    for thread_key in sorted(all_thread_keys):
+        thread = thread_rows_by_id.get(thread_key)
+        thread_id = str(thread.get("id") or "") if thread else ""
+        state_rollout = _canonical_path(thread.get("rollout_path")) if thread else None
+        source_paths = list(candidate_paths_by_id.get(thread_key, []))
+        if state_rollout and Path(state_rollout).is_file():
+            candidate_paths.setdefault(state_rollout, Path(state_rollout))
+            candidate_ids_by_path[state_rollout] = thread_id
+            source_paths = [state_rollout, *(path for path in source_paths if path != state_rollout)]
+        else:
+            source_paths.sort()
+        fragments: list[UsageSession] = []
+        for canonical in source_paths:
+            transcript_path = candidate_paths[canonical]
+            source_session_id = thread_id or candidate_ids_by_path.get(canonical, thread_key)
+            session, status = _capture_codex_session_for_capture(
+                transcript_path,
+                source_session_id,
+                model=thread.get("model") if thread else None,
+                codex_dir=base_dir,
+            )
+            if status == "empty":
+                continue
+            if status != "ok" or session is None:
+                raise RuntimeError(
+                    f"Could not capture Codex transcript {transcript_path}: {status}"
+                )
+            fragments.append(session)
+
+        if fragments:
+            sessions_by_id[thread_key] = _merge_codex_capture_fragments(
+                thread_id or fragments[0].id,
+                fragments,
+                thread=thread,
+            )
+            continue
+
+        if thread and _as_int(thread.get("tokens_used")) > 0:
+            # Older dashboard imports showed state_5's coarse token estimate
+            # for threads whose rollout was missing or had no usage records.
+            # Keep that visible total in the one-time backfill, explicitly
+            # marked so it can never replace a later exact transcript snapshot.
+            summary_data = _codex_thread_session(
+                thread_id,
+                title=thread.get("title"),
+                model=thread.get("model"),
+                reasoning_effort=thread.get("reasoning_effort"),
+                tokens_used=thread.get("tokens_used"),
+                created_at=thread.get("created_at"),
+            )
+            summary_session = _legacy_sessions_to_contract({"sessions": [summary_data]})[0]
+            summary_session.metadata["capture_quality"] = "state-summary"
+            sessions_by_id[thread_key] = summary_session
+
+    sessions = list(sessions_by_id.values())
+
+    sessions.sort(
+        key=lambda session: str(session.created_at or session.start_time or ""),
+        reverse=True,
+    )
+    return sessions
+
+
 class CodexSource:
     """Provider adapter for Codex state and rollout files.
 
@@ -870,9 +1485,14 @@ class CodexSource:
     # that treats source paths generically.
     default_path = default_source_path
 
+    def __init__(self, usage_db_path: str | Path | None = None) -> None:
+        self.usage_db_path = usage_db_path
+
     def extract_sessions(self, root: str | Path | None = None) -> list[UsageSession]:
         source_root = root if root is not None else self.default_source_path
-        return _legacy_sessions_to_contract(parse_codex_usage(source_root))
+        return _legacy_sessions_to_contract(
+            parse_codex_usage(source_root, usage_db_path=self.usage_db_path)
+        )
 
 
 # Explicit alias for callers that name adapters after the provider/tool.

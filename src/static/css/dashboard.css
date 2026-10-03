@@ -313,14 +313,17 @@ button {
 
 .topbar__inner {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
-  grid-template-areas: "brand filters auto actions";
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-areas:
+    "brand auto actions"
+    "filters filters filters";
   align-items: center;
   column-gap: 24px;
   max-width: var(--page-max);
   min-height: var(--topbar-h);
   margin: 0 auto;
-  padding: 0 var(--page-pad);
+  padding: 8px var(--page-pad);
+  row-gap: 8px;
 }
 
 .wordmark {
@@ -360,6 +363,46 @@ button {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.capture-status {
+  grid-area: capture;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  justify-self: end;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  margin-left: auto;
+  padding: 0;
+  list-style: none;
+}
+
+.capture-status__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-size: 12px;
+}
+
+.capture-status__chip.is-stale {
+  background: var(--warn-bg);
+  color: var(--ink);
+}
+
+.store-health-banner {
+  margin-top: 16px;
+  padding: 16px;
+  border-radius: 16px;
+  background: var(--warn-bg);
+  color: var(--ink);
+  font-size: 13px;
+  overflow-wrap: anywhere;
 }
 
 /* --------------------------------------------------------------- controls */
@@ -1641,6 +1684,10 @@ th[aria-sort="ascending"] .model-sort__chevron {
 /* ------------------------------------------------------------ responsive */
 
 @media (min-width: 1200px) {
+  .meter:has(#receipt[hidden]) {
+    grid-template-columns: minmax(0, 1.35fr) minmax(320px, 1fr);
+  }
+
   .ledger__row {
     max-height: 68px;
   }
@@ -1655,6 +1702,18 @@ th[aria-sort="ascending"] .model-sort__chevron {
     padding-block: 10px;
     row-gap: 10px;
   }
+
+  .topbar__filters:has(.capture-status:not([hidden])) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "tool capture"
+      "range capture";
+  }
+
+  .tool-filter { grid-area: tool; justify-self: start; }
+  .range-control { grid-area: range; justify-self: start; }
+  .capture-status { max-width: 260px; }
 }
 
 @media (max-width: 1199px) {
@@ -1736,13 +1795,19 @@ th[aria-sort="ascending"] .model-sort__chevron {
     grid-template-areas:
       "brand actions"
       "tool tool"
-      "range auto";
+      "range auto"
+      "capture capture";
     column-gap: 12px;
     row-gap: 10px;
   }
 
-  .topbar__filters {
+  .topbar__filters,
+  .topbar__filters:has(.capture-status:not([hidden])) {
     display: contents;
+  }
+
+  .capture-status {
+    max-width: 100%;
   }
 
   .tool-filter {
@@ -1874,7 +1939,8 @@ th[aria-sort="ascending"] .model-sort__chevron {
       "brand actions"
       "tool tool"
       "range range"
-      "refresh refresh";
+      "refresh refresh"
+      "capture capture";
   }
 
   .topbar__inner:has(#custom-range-edit:not([hidden])) .topbar__auto {

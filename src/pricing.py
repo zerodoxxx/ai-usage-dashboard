@@ -18,7 +18,8 @@ import math
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timezone
 from pathlib import Path
 from threading import RLock
@@ -346,10 +347,37 @@ class PricingCatalog:
     """Registry for provider-scoped model rates and aliases."""
 
     def __init__(self, entries: Iterable[PricingEntry] | None = None) -> None:
-        self._entries: dict[tuple[str, str], PricingEntry] = {}
+        self._lock = RLock()
+        self._version = 0
+        self._entries = {}
         if entries:
             for entry in entries:
                 self.add_entry(entry)
+
+    @property
+    def version(self) -> int:
+        """Monotonic revision, including atomic catalog replacements on refresh."""
+        return self._version
+
+    @property
+    def _entries(self) -> dict[tuple[str, str], PricingEntry]:
+        return self._current_entries
+
+    @_entries.setter
+    def _entries(self, entries: dict[tuple[str, str], PricingEntry]) -> None:
+        # Refresh and test restoration also replace _entries directly. Rebuild
+        # every derived index together so no memo can outlive its catalog.
+        with self._lock:
+            self._current_entries = dict(entries)
+            self._normalized_entries = tuple(
+                (entry, _normalize(entry.model), tuple(_normalize(a) for a in entry.aliases))
+                for entry in entries.values()
+            )
+            self._known_providers = {entry.provider for entry in entries.values()}
+            self._entries_by_name = {(e.provider, e.model): e for e in entries.values()}
+            self._matches: OrderedDict[tuple[str, str | None], PricingResolution] = OrderedDict()
+            self._resolutions: OrderedDict[tuple[str, str | None, bool | None], PricingResolution] = OrderedDict()
+            self._version += 1
 
     def add_entry(self, entry: PricingEntry) -> PricingEntry:
         provider = normalize_provider(entry.provider) or entry.provider
@@ -361,9 +389,12 @@ class PricingCatalog:
             entry.off_peak_rates,
             exact_only=entry.exact_only,
         )
-        new_entries = dict(self._entries)
-        new_entries[(provider, _normalize(entry.model))] = normalized
-        self._entries = new_entries
+        with self._lock:
+            new_entries = dict(self._entries)
+            key = (provider, _normalize(entry.model))
+            if new_entries.get(key) != normalized:
+                new_entries[key] = normalized
+                self._entries = new_entries
         return normalized
 
     def register(
@@ -436,22 +467,51 @@ class PricingCatalog:
     def remove(self, provider: str, model: str) -> None:
         """Remove one exact provider/model entry, if present."""
         key = (normalize_provider(provider) or provider, _normalize(model))
-        current = self._entries
-        if key in current:
-            new_entries = dict(current)
-            new_entries.pop(key, None)
-            self._entries = new_entries
+        with self._lock:
+            current = self._entries
+            if key in current:
+                new_entries = dict(current)
+                new_entries.pop(key, None)
+                self._entries = new_entries
 
     def resolve(
+        self, model_name: str | None, provider: str | None = None, *, timestamp: Any = None
+    ) -> PricingResolution:
+        """Memoize model matching; only time-dependent rates consult timestamps."""
+        if not isinstance(model_name, str) or not model_name.strip():
+            return PricingResolution(model_name, normalize_provider(provider), None, None, "unknown")
+        with self._lock:
+            key = (model_name, provider)
+            base = self._matches.get(key)
+            if base is None:
+                base = self._resolve_uncached(model_name, provider)
+                self._matches[key] = base
+                if len(self._matches) > 1024:
+                    self._matches.popitem(last=False)
+            self._matches.move_to_end(key)
+            entry = self._entries_by_name.get((base.provider, base.canonical_model))
+            peak = is_deepseek_peak_utc(timestamp) if entry and entry.off_peak_rates is not None else None
+            resolution_key = (*key, peak)
+            result = self._resolutions.get(resolution_key)
+            if result is None:
+                result = base
+                if peak is False and entry is not None:
+                    result = replace(base, rates=entry.off_peak_rates, status="known", pricing_tier="off-peak")
+                self._resolutions[resolution_key] = result
+                if len(self._resolutions) > 2048:
+                    self._resolutions.popitem(last=False)
+            self._resolutions.move_to_end(resolution_key)
+            return result
+
+    def _resolve_uncached(
         self, model_name: str | None, provider: str | None = None, *, timestamp: Any = None
     ) -> PricingResolution:
         """Resolve without fallback, returning a status for every outcome."""
         if not isinstance(model_name, str) or not model_name.strip():
             return PricingResolution(model_name, normalize_provider(provider), None, None, "unknown")
 
-        current_entries = self._entries
         raw, scoped_provider, model = model_name.strip(), normalize_provider(provider), model_name.strip()
-        known_providers = {entry.provider for entry in current_entries.values()}
+        known_providers = self._known_providers
         for separator in ("/", ":"):
             if separator in raw:
                 prefix, candidate = raw.split(separator, 1)
@@ -461,24 +521,22 @@ class PricingCatalog:
                     model = candidate.strip()
                     break
 
-        entries = [entry for entry in current_entries.values() if not scoped_provider or entry.provider == scoped_provider]
+        entries = [row for row in self._normalized_entries if not scoped_provider or row[0].provider == scoped_provider]
         normalized_model = _normalize(model)
         matches: list[tuple[PricingEntry, str]] = [
-            (entry, "canonical") for entry in entries if _normalize(entry.model) == normalized_model
+            (entry, "canonical") for entry, canonical, _aliases in entries if canonical == normalized_model
         ]
         if not matches:
             matches = [
-                (entry, "alias") for entry in entries
-                if any(_normalize(alias) == normalized_model for alias in entry.aliases)
+                (entry, "alias") for entry, _canonical, aliases in entries
+                if normalized_model in aliases
             ]
         if not matches:
             fuzzy: list[tuple[PricingEntry, str, int]] = []
-            for entry in entries:
+            for entry, canonical, aliases in entries:
                 if entry.exact_only:
                     continue
-                keys = [(entry.model, "canonical"), *[(alias, "alias") for alias in entry.aliases]]
-                for key, _ in keys:
-                    key_normalized = _normalize(key)
+                for key_normalized in (canonical, *aliases):
                     if key_normalized and key_normalized in normalized_model:
                         fuzzy.append((entry, "fuzzy", len(key_normalized)))
             if fuzzy:
@@ -486,7 +544,7 @@ class PricingCatalog:
                 matches = [(entry, "fuzzy") for entry, _, size in fuzzy if size == longest]
 
         unique: dict[tuple[str, str], tuple[PricingEntry, str]] = {
-            (entry.provider, _normalize(entry.model)): (entry, matched_by) for entry, matched_by in matches
+            (entry.provider, entry.model): (entry, matched_by) for entry, matched_by in matches
         }
         matches = list(unique.values())
         if len(matches) != 1:
