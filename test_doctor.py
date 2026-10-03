@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import plistlib
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -237,6 +238,17 @@ def test_doctor_newest_backup_and_age(healthy):
     assert report["exit_code"] == 0
     assert _rows(report)["backups.newest"]["path"] == str(latest)
 
+
+def test_doctor_accepts_missing_backups_when_retention_disables_them(healthy):
+    home, db = healthy
+    for backup in (db.parent / "backups").iterdir():
+        backup.unlink()
+    assert _rows(doctor.diagnose(home))["backups.newest"]["status"] == "WARN"
+    plist = home / "Library/LaunchAgents" / f"{doctor.LABEL}.plist"
+    plist.write_bytes(plistlib.dumps({"ProgramArguments": ["python", "codex_retention.py", "--apply", "--no-backup"]}))
+    report = doctor.diagnose(home)
+    assert _rows(report)["backups.newest"]["status"] == "OK"
+    assert report["exit_code"] == 0
 
 def test_doctor_nonzero_launchctl_means_not_loaded(healthy, monkeypatch):
     home, _ = healthy

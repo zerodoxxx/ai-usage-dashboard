@@ -41,6 +41,8 @@ Apply requires Codex Desktop, its server, and all Codex CLI processes to be clos
 
 Before the first deletion in a run, it makes a **fresh verified SQLite backup** through `scripts/backup_usage_db.py`. Creation, integrity, per-provider session/event counts and token sums, publication, and rotation must succeed. A failure produces `backup_failed` and deletes no trees in that run. Eligibility is checked again after backup. Backups default to `<db dir>/backups`, retaining 14; see [backup and restore](SHARED_USAGE_DB.md#backup-and-restore).
 
+To skip the backup, install with `scripts/install_codex_retention.py --no-backup` (or pass `--no-backup` to `codex_retention.py --apply`). The SQLite database then becomes the only record of usage for deleted transcripts. `scripts/doctor.py` reports missing backups as OK when retention runs with `--no-backup`.
+
 Deletion calls Codex's own `--no-daemon delete <root-id> --force` command instead of unlinking files. Child processes pin **both `CODEX_HOME` and `CODEX_SQLITE_HOME`** to the resolved, verified Codex directory. Ambient home overrides cannot redirect deletion to another Codex store. Codex's writer lock can refuse deletion if a thread becomes active; failures stop remaining work.
 
 Retention never deletes or rewrites usage rows for any provider. Transcript byte counts are estimates; Codex deletion also updates its metadata.

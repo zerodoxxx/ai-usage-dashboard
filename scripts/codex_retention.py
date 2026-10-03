@@ -845,6 +845,7 @@ def apply_retention_plan(
     codex_cli_path: str | None = None,
     expected_codex_version: str | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    take_backup: bool = True,
 ) -> tuple[int, list[str]]:
     """Delete eligible trees through Codex after closed-state and race checks."""
     if plan.error:
@@ -917,7 +918,7 @@ def apply_retention_plan(
         ):
             errors.append("target rollout is outside the verified Codex home or changed; skipped")
             continue
-        if not backup_taken:
+        if take_backup and not backup_taken:
             try:
                 backup_usage_db(resolved_db_path)
             except BackupError:
@@ -1027,6 +1028,7 @@ def _arguments(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--codex-cli", type=Path, help="Override the Codex executable used by apply.")
     parser.add_argument("--apply", action="store_true", help="Apply the retention plan; default is preview only.")
+    parser.add_argument("--no-backup", action="store_true", help="Skip the usage database backup before deleting.")
     parser.add_argument("--json", action="store_true", help="Print aggregate preview data as JSON.")
     parser.add_argument("--log-file", type=Path, help=argparse.SUPPRESS)
     return parser.parse_args(argv)
@@ -1118,6 +1120,7 @@ def main(argv: list[str] | None = None) -> int:
         db_path=args.db,
         codex_cli_path=str(args.codex_cli) if args.codex_cli else None,
         expected_codex_version=args.codex_version,
+        take_backup=not args.no_backup,
     )
     result_record = {
         "status": "backup_failed" if "backup_failed" in errors else ("complete" if not errors else "stopped_safely"),

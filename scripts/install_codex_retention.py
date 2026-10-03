@@ -275,6 +275,7 @@ def install_codex_retention(
     python_interpreter: str | Path = sys.executable,
     codex_executable: str | Path | None = None,
     run: Any = subprocess.run,
+    backup_database: bool = True,
 ) -> InstallResult:
     """Write one version-pinned user LaunchAgent and immutable runtime."""
     source = Path(source_root).expanduser().resolve(strict=True)
@@ -346,6 +347,8 @@ def install_codex_retention(
             "--log-file",
             str(log_path),
         ]
+        if not backup_database:
+            arguments.append("--no-backup")
         desired = dict(existing_agent)
         desired.update({
             "Label": LAUNCH_AGENT_LABEL,
@@ -389,6 +392,7 @@ def _arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--db", type=Path)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--codex", type=Path, help="Codex CLI executable, for testing or nonstandard installs.")
+    parser.add_argument("--no-backup", action="store_true", help="Delete without backing up the usage database first.")
     return parser.parse_args(argv)
 
 
@@ -405,6 +409,7 @@ def main(argv: list[str] | None = None) -> int:
             database_path=args.db,
             python_interpreter=args.python,
             codex_executable=args.codex,
+            backup_database=not args.no_backup,
         )
     except (InstallError, OSError) as exc:
         print(f"Codex retention installation failed ({type(exc).__name__}).", file=sys.stderr)

@@ -70,7 +70,7 @@ Run these commands from the repository root. Use Python 3.12 or newer. Hook inst
 
    Review failures and warnings, including stale captures or deployed writers that differ from this checkout. Doctor cannot approve Codex hooks; use `/hooks` for that.
 
-8. Optionally enable 15-day Codex retention on macOS. **This deletes transcripts and removes the ability to resume those conversations.** Usage rows remain in SQLite. Deletion requires Codex to be closed, independently verified capture, and a fresh verified backup. Preview first:
+8. Optionally enable 15-day Codex retention on macOS. **This deletes transcripts and removes the ability to resume those conversations.** Usage rows remain in SQLite. Deletion requires Codex to be closed, independently verified capture, and a fresh verified backup (install with `--no-backup` to skip the backup). Preview first:
 
    ```bash
    python scripts/codex_retention.py

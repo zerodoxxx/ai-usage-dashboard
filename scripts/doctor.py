@@ -6,6 +6,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 import os
+import plistlib
 from pathlib import Path
 import shlex
 import shutil
@@ -51,6 +52,14 @@ class _PayloadView:
             and not codex_installer._is_denied_source_path(path.relative_to(self.root))
         ]
 
+
+def _retention_skips_backups(plist: Path) -> bool:
+    try:
+        with plist.open("rb") as stream:
+            document = plistlib.load(stream)
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
+    return isinstance(document, dict) and "--no-backup" in document.get("ProgramArguments", [])
 
 def expected_digest(installer) -> str:
     return codex_installer._artifact_digest(_PayloadView(installer))
@@ -288,6 +297,8 @@ def diagnose(home: Path | None = None) -> dict:
             age = (now.timestamp() - newest.stat().st_mtime)
             ok("backups.newest", age <= STALE_SECONDS,
                f"{newest}; age={age / 3600:.1f}h", "WARN", path=str(newest), age_seconds=age)
+        elif _retention_skips_backups(plist):
+            add("backups.newest", "OK", "backups disabled (retention runs with --no-backup)")
         else:
             add("backups.newest", "WARN", f"no backups in {backups}")
     except OSError as exc:

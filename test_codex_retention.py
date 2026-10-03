@@ -684,6 +684,27 @@ def test_apply_requires_backup_before_first_delete(tmp_path: Path) -> None:
                                 now=lambda: now) == (1, [])
 
 
+def test_apply_without_backup_deletes_and_writes_no_backup(tmp_path: Path) -> None:
+    now = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    root = tmp_path / "codex"
+    root.mkdir()
+    db = tmp_path / "usage.db"
+    paths, _ = _make_capture(root, db, now=now)
+    plan = build_retention_plan(now=now, codex_dir=root, db_path=db)
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if "--version" in command:
+            return subprocess.CompletedProcess(command, 0, stdout=f"codex-cli {SAFE_CODEX_VERSION}", stderr="")
+        for path in paths:
+            path.unlink()
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    assert apply_retention_plan(plan, codex_dir=root, db_path=db, process_check=lambda: [], run=run,
+                                codex_executable="codex", expected_codex_version=SAFE_CODEX_VERSION,
+                                now=lambda: now, take_backup=False) == (1, [])
+    assert not (db.parent / "backups").exists()
+
+
 @pytest.mark.parametrize("scope", ["thread", "turn"])
 def test_independent_verification_distinguishes_valid_scoped_totals(tmp_path: Path, scope: str) -> None:
     usage = _raw_token("one")["payload"]["usage"]

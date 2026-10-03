@@ -120,6 +120,16 @@ def test_installer_resolves_default_shared_database_into_plist(
     document = plistlib.loads(installed.launch_agent_path.read_bytes())
     assert _database_path(None) == expected
     assert document["ProgramArguments"][document["ProgramArguments"].index("--db") + 1] == str(expected)
+    assert "--no-backup" not in document["ProgramArguments"]
+
+    without_backup = install_codex_retention(
+        codex_home=codex_home,
+        launch_agents_dir=launch_agents,
+        codex_executable=codex,
+        backup_database=False,
+    )
+    document = plistlib.loads(without_backup.launch_agent_path.read_bytes())
+    assert "--no-backup" in document["ProgramArguments"]
 
 
 def test_installer_refuses_frozen_legacy_database(
