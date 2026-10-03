@@ -75,6 +75,23 @@ def test_replaces_legacy_flat_entry_with_backup_and_frozen_release(source, tmp_p
     assert result.publisher_script.read_bytes() == deployed
 
 
+def test_install_preserves_unrelated_nested_tool_hooks(source, tmp_path):
+    nested = {
+        "enabled": True,
+        "PreToolUse": [
+            {"matcher": "Bash|Shell", "hooks": [{"type": "command", "command": "before-tool"}]},
+            {"hooks": [{"command": "fallback-tool", "timeout": 5}]},
+        ],
+        "PostToolUse": [
+            {"matcher": "Write", "hooks": [{"type": "command", "command": "after-write"}]},
+        ],
+    }
+    home, hooks = _seed(tmp_path, {**EXISTING, "other-tool-hooks": nested})
+    result = _install(source, home)
+    assert result.changed
+    assert json.loads(hooks.read_text())["other-tool-hooks"] == nested
+
+
 def test_idempotence_and_source_update(source, tmp_path):
     home, hooks = _seed(tmp_path)
     first = _install(source, home)
@@ -112,6 +129,57 @@ def test_uninstall_preserves_unrelated_hooks_and_legacy_entry(source, tmp_path):
     assert result.changed and result.backup_file.read_bytes() == before
     assert json.loads(hooks.read_text()) == {"keep": EXISTING["keep"]}
     assert not installer.uninstall_agy_usage_hooks(gemini_home=home).changed
+
+
+def test_uninstall_preserves_unrelated_nested_tool_hooks(source, tmp_path):
+    nested = {
+        "PreToolUse": [{"matcher": "Bash", "hooks": [{"command": "keep-before"}]}],
+        "PostToolUse": [{"matcher": "Write", "hooks": [{"command": "keep-after"}]}],
+    }
+    home, hooks = _seed(tmp_path, {**EXISTING, "other-tool-hooks": nested})
+    _install(source, home)
+    result = installer.uninstall_agy_usage_hooks(gemini_home=home)
+    assert result.changed
+    assert json.loads(hooks.read_text())["other-tool-hooks"] == nested
+
+
+def test_uninstall_strips_owned_handler_inside_tracker_tool_event(tmp_path):
+    home = tmp_path / "Gemini Home"
+    install_directory = home / "usage-publisher"
+    owned_command = shlex.join([
+        "python", str(install_directory / "releases/current/scripts/agy_usage_writer.py"),
+    ])
+    unrelated_matcher = {"matcher": "Bash", "hooks": [{"command": "keep-command"}]}
+    owned_matcher = {"matcher": "Write", "hooks": [{"command": owned_command}]}
+    existing = {installer.ENTRY_NAME: {"PreToolUse": [unrelated_matcher, owned_matcher]}}
+
+    merged = installer._merge_hooks(existing, None, install_directory)
+
+    assert merged == {installer.ENTRY_NAME: {"PreToolUse": [unrelated_matcher]}}
+    assert existing[installer.ENTRY_NAME]["PreToolUse"] == [unrelated_matcher, owned_matcher]
+
+
+def test_handler_without_type_is_valid():
+    installer._validate_hooks({
+        "other": {
+            "Stop": [{"command": "run-me"}],
+            "PreToolUse": [{"matcher": "Shell", "hooks": [{"command": "run-too"}]}],
+        },
+    })
+
+
+@pytest.mark.parametrize(("event", "value"), [
+    ("PreToolUse", [{"matcher": "Shell"}]),
+    ("PreToolUse", [{"hooks": []}]),
+    ("PostToolUse", [{"matcher": 42, "hooks": [{"command": "valid"}]}]),
+    ("Stop", [{"command": "flat", "hooks": [{"command": "nested"}]}]),
+    ("PreInvocation", [{"type": "prompt", "command": "wrong type"}]),
+    ("PostInvocation", [{"command": "bool timeout", "timeout": True}]),
+    ("Stop", [{"command": "negative timeout", "timeout": -1}]),
+])
+def test_schema_invalid_hook_is_rejected(event, value):
+    with pytest.raises(installer.InstallError, match=event):
+        installer._validate_hooks({"other": {event: value}})
 
 
 @pytest.mark.parametrize("bad", [

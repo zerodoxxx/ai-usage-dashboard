@@ -9,6 +9,7 @@ sessions are updated in place.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sqlite3
@@ -77,6 +78,41 @@ def get_session_metadata(base_dir: Path, session_id: str) -> dict[str, str]:
     return meta
 
 
+def _capture_file_metadata(path: Path) -> dict[str, Any] | None:
+    """Return a transcript identity and revision for ordering snapshots."""
+    try:
+        resolved = path.expanduser().resolve()
+        stat = resolved.stat()
+    except (OSError, RuntimeError):
+        return None
+    return {
+        "capture_source_hash": hashlib.sha256(str(resolved).encode("utf-8")).hexdigest(),
+        "capture_mtime_ns": stat.st_mtime_ns,
+        "capture_ctime_ns": stat.st_ctime_ns,
+        "capture_size": stat.st_size,
+    }
+
+
+def _resolve_transcript(
+    base_dir: Path, session_id: str, hint: str | None = None,
+) -> Path | None:
+    """Resolve a conversation transcript using the hook's canonical order."""
+    candidates = []
+    if isinstance(hint, str) and hint:
+        candidates.append(Path(hint).expanduser())
+    candidates.extend((
+        base_dir / "brain" / session_id / "transcript.jsonl",
+        base_dir / "brain" / session_id / ".system_generated/logs/transcript.jsonl",
+    ))
+    for path in candidates:
+        try:
+            if path.is_file():
+                return path
+        except (OSError, RuntimeError):
+            continue
+    return None
+
+
 def _cost(model, usage, timestamp):
     from src.parsers.contracts import CostEstimate
     from src.pricing import calculate_cost_strict
@@ -97,6 +133,9 @@ def parse_transcript(transcript_path: Path, session_id: str, base_dir: Path):
     """Port the legacy context accumulation, call detection and 45% cache rule."""
     from src.parsers.contracts import TokenUsage, UsageEvent, UsageSession
 
+    capture_metadata = _capture_file_metadata(transcript_path)
+    if capture_metadata is None:
+        return None
     meta = get_session_metadata(base_dir, session_id)
     context_tokens = 0
     first_ts = last_ts = None
@@ -156,7 +195,10 @@ def parse_transcript(transcript_path: Path, session_id: str, base_dir: Path):
         title=meta["title"], created_at=first_ts, start_time=first_ts,
         end_time=last_ts, activity_at=last_ts, usage=usage, events=events,
         cost=_cost(meta["model"], usage, first_ts), call_count=len(events),
-        metadata={"estimated": True, "token_source": "estimated", "step_count": step_count},
+        metadata={
+            "estimated": True, "token_source": "estimated", "step_count": step_count,
+            **capture_metadata,
+        },
     )
 
 
@@ -176,18 +218,13 @@ def process_hook_payload(payload: Any, *, db_path=None, agy_dir=None) -> int | N
     if not isinstance(session_id, str) or not session_id.strip():
         return None
     base = _base_dir(agy_dir)
-    candidates = []
     transcript = payload.get("transcriptPath")
-    if isinstance(transcript, str) and transcript:
-        candidates.append(Path(transcript).expanduser())
-    candidates += [
-        base / "brain" / session_id / "transcript.jsonl",
-        base / "brain" / session_id / ".system_generated/logs/transcript.jsonl",
-    ]
-    path = next((p for p in candidates if p.is_file()), None)
+    path = _resolve_transcript(base, session_id, transcript)
     if path is None:
         return None
     session = parse_transcript(path, session_id, base)
+    if session is None:
+        return None
     return session.usage.total_tokens if _write_sessions([session], db_path) else None
 
 
@@ -197,12 +234,27 @@ def backfill_agy_usage(*, db_path=None, agy_dir=None) -> tuple[int, int]:
     if not brain.is_dir():
         raise FileNotFoundError("Antigravity brain directory is unavailable")
     sessions = events = 0
-    # Preserve the tracker's recursive order and last-transcript-wins behavior
-    # when a conversation contains more than one transcript.
+    grouped: dict[str, list[Path]] = {}
     for path in brain.glob("**/transcript.jsonl"):
         try:
             session_id = path.relative_to(brain).parts[0]
+        except (ValueError, IndexError) as exc:
+            print(f"Antigravity backfill skipped {path}: {exc}", file=sys.stderr)
+            continue
+        grouped.setdefault(session_id, []).append(path)
+
+    # Prefer the same canonical transcript the hook resolves. If neither
+    # canonical path exists, keep the tracker's recursive last-path behavior.
+    for session_id, paths in grouped.items():
+        path = _resolve_transcript(base, session_id) or paths[-1]
+        try:
             session = parse_transcript(path, session_id, base)
+            if session is None:
+                print(
+                    f"Antigravity backfill skipped {path}: could not capture transcript revision",
+                    file=sys.stderr,
+                )
+                continue
             sessions += _write_sessions([session], db_path)
             events += len(session.events)
         except Exception as exc:

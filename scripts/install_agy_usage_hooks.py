@@ -29,6 +29,8 @@ PUBLISHER_RELATIVE_PATH = Path("scripts/agy_usage_writer.py")
 DEFAULT_GEMINI_HOME = Path.home() / ".gemini"
 ENTRY_NAME = "agy-token-tracker"
 HOOK_EVENTS = ("PostInvocation", "Stop")
+TOOL_HOOK_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
+FLAT_HOOK_EVENTS = frozenset({"PreInvocation", "PostInvocation", "Stop"})
 
 
 @dataclass(frozen=True)
@@ -44,25 +46,62 @@ class InstallResult:
 
 def _validate_hooks(document: dict[str, Any]) -> None:
     """A malformed hook anywhere disables all agy hooks: reject the whole file."""
+
+    def valid_handler(handler: Any) -> bool:
+        if not isinstance(handler, dict):
+            return False
+        if handler.get("type", "command") != "command":
+            return False
+        command = handler.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return False
+        if "timeout" in handler:
+            timeout = handler["timeout"]
+            if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+                return False
+        return True
+
     for name, entry in document.items():
         if not isinstance(entry, dict):
             raise InstallError(f"Hook entry {name!r} must be an object")
-        for event, handlers in entry.items():
+        for event, config in entry.items():
             if event == "enabled":
-                if not isinstance(handlers, bool):
+                if not isinstance(config, bool):
                     raise InstallError(f"Hook entry {name!r} enabled must be boolean")
                 continue
-            if not isinstance(handlers, list):
+            if not isinstance(config, list):
                 raise InstallError(f"Hook entry {name!r}/{event} must be a list")
-            for handler in handlers:
-                if (
-                    not isinstance(handler, dict)
-                    or handler.get("type") != "command"
-                    or not isinstance(handler.get("command"), str)
-                    or not handler["command"].strip()
-                    or "hooks" in handler
-                ):
-                    raise InstallError(f"Malformed flat command hook in {name!r}/{event}")
+            if event in TOOL_HOOK_EVENTS:
+                for index, matcher in enumerate(config):
+                    if not isinstance(matcher, dict):
+                        raise InstallError(
+                            f"Malformed tool hook matcher in {name!r}/{event}[{index}]: expected an object"
+                        )
+                    handlers = matcher.get("hooks")
+                    if not isinstance(handlers, list) or not handlers:
+                        raise InstallError(
+                            f"Malformed tool hook matcher in {name!r}/{event}[{index}]: hooks must be a non-empty list"
+                        )
+                    if "matcher" in matcher and not isinstance(matcher["matcher"], str):
+                        raise InstallError(
+                            f"Malformed tool hook matcher in {name!r}/{event}[{index}]: matcher must be a string"
+                        )
+                    for handler_index, handler in enumerate(handlers):
+                        if not valid_handler(handler):
+                            raise InstallError(
+                                f"Malformed command hook in {name!r}/{event}[{index}]/hooks[{handler_index}]"
+                            )
+                continue
+            if event in FLAT_HOOK_EVENTS:
+                for index, handler in enumerate(config):
+                    if (
+                        not valid_handler(handler)
+                        or "hooks" in handler
+                        or "matcher" in handler
+                    ):
+                        raise InstallError(f"Malformed flat command hook in {name!r}/{event}[{index}]")
+                continue
+            # Future event arrays are accepted without interpreting their contents.
 
 
 def _owns(handler: Any, install_directory: Path) -> bool:
@@ -94,6 +133,27 @@ def _merge_hooks(existing, command, install_directory):
             removed = False
             for event, handlers in list(entry.items()):
                 if isinstance(handlers, list):
+                    if event in TOOL_HOOK_EVENTS:
+                        event_removed = False
+                        kept_matchers = []
+                        for matcher in handlers:
+                            nested = matcher.get("hooks") if isinstance(matcher, dict) else None
+                            if not isinstance(nested, list):
+                                kept_matchers.append(matcher)
+                                continue
+                            kept_handlers = [h for h in nested if not _owns(h, install_directory)]
+                            if kept_handlers != nested:
+                                event_removed = True
+                                matcher["hooks"] = kept_handlers
+                            if kept_handlers:
+                                kept_matchers.append(matcher)
+                        if event_removed:
+                            removed = True
+                            if kept_matchers:
+                                entry[event] = kept_matchers
+                            else:
+                                entry.pop(event)
+                        continue
                     kept = [h for h in handlers if not _owns(h, install_directory)]
                     removed |= kept != handlers
                     if kept:

@@ -88,9 +88,72 @@ def test_hook_replay_and_shorter_snapshot_replace_events(history, tmp_path):
     assert len(sessions) == 1 and len(sessions[0].events) == 2
     assert sessions[0].usage.total_tokens == total
     assert sessions[0].metadata["estimated"] is True
+    assert writer.backfill_agy_usage(db_path=db, agy_dir=base) == (1, 2)
+    after_backfill = read_usage_sessions("antigravity", db_path=db)[0]
+    assert len(after_backfill.events) == 2 and after_backfill.usage.total_tokens == total
+    assert after_backfill.metadata["capture_source_hash"] == sessions[0].metadata["capture_source_hash"]
     path.write_text('\n'.join(path.read_text().splitlines()[:5]) + '\n')
     writer.process_hook_payload(payload, db_path=db, agy_dir=base)
     assert len(read_usage_sessions("antigravity", db_path=db)[0].events) == 1
+
+
+def test_delayed_backfill_snapshot_cannot_replace_newer_hook_write(history, tmp_path):
+    base, path, _ = history
+    path.write_text(json.dumps({
+        "created_at": "2026-10-01T10:00:00Z", "source": "MODEL", "content": "one",
+    }) + "\n")
+    v1_stat = path.stat()
+    stale_snapshot = writer.parse_transcript(path, "raw-conversation", base)
+    assert stale_snapshot is not None and stale_snapshot.call_count == 1
+
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({
+            "created_at": "2026-10-01T10:01:00Z", "source": "MODEL", "content": "two three",
+        }) + "\n")
+    os.utime(path, ns=(v1_stat.st_atime_ns, v1_stat.st_mtime_ns + 2_000_000_000))
+    v2_stat = path.stat()
+    assert v2_stat.st_size != v1_stat.st_size
+    assert v2_stat.st_mtime_ns > stale_snapshot.metadata["capture_mtime_ns"]
+
+    db = tmp_path / "stale-backfill.db"
+    payload = {"conversationId": "raw-conversation", "transcriptPath": str(path)}
+    v2_total = writer.process_hook_payload(payload, db_path=db, agy_dir=base)
+    assert v2_total is not None and v2_total > stale_snapshot.usage.total_tokens
+    assert writer._write_sessions([stale_snapshot], db) == 0
+    stored = read_usage_sessions("antigravity", db_path=db)[0]
+    assert len(stored.events) == 2
+    assert stored.usage.total_tokens == v2_total
+
+
+def test_hook_and_backfill_stamp_same_transcript_source(history, tmp_path):
+    base, path, _ = history
+    hook_db = tmp_path / "hook-source.db"
+    backfill_db = tmp_path / "backfill-source.db"
+    payload = {"conversationId": "raw-conversation", "transcriptPath": str(path)}
+
+    assert writer.process_hook_payload(payload, db_path=hook_db, agy_dir=base) is not None
+    assert writer.backfill_agy_usage(db_path=backfill_db, agy_dir=base) == (1, 2)
+    hook = read_usage_sessions("antigravity", db_path=hook_db)[0]
+    backfill = read_usage_sessions("antigravity", db_path=backfill_db)[0]
+    assert hook.metadata["capture_source_hash"] == backfill.metadata["capture_source_hash"]
+
+
+def test_backfill_prefers_canonical_transcript_once(history, tmp_path):
+    base, nested_path, _ = history
+    canonical_path = base / "brain" / "raw-conversation" / "transcript.jsonl"
+    canonical_path.write_text(json.dumps({
+        "created_at": "2026-10-01T10:00:00Z", "source": "MODEL", "content": "canonical",
+    }) + "\n")
+    db = tmp_path / "canonical-backfill.db"
+
+    assert writer.backfill_agy_usage(db_path=db, agy_dir=base) == (1, 1)
+    sessions = read_usage_sessions("antigravity", db_path=db)
+    assert len(sessions) == 1 and len(sessions[0].events) == 1
+    assert sessions[0].usage.total_tokens == writer.count_tokens("canonical")
+    assert sessions[0].metadata["capture_source_hash"] == writer._capture_file_metadata(canonical_path)[
+        "capture_source_hash"
+    ]
+    assert nested_path.exists()
 
 
 def test_hook_fallback_paths_and_skips(history, tmp_path):
