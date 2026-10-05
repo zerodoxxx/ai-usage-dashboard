@@ -2,9 +2,10 @@
 
 from datetime import datetime, timezone
 
-from src.parsers.aggregator import get_tool_usage
+from src.parsers.aggregator import DEFAULT_SOURCE_REGISTRY, get_tool_usage
 from src.parsers.contracts import TokenUsage, UsageEvent, UsageSession
 from src.parsers.source_registry import SourceRegistry
+from src.parsers.store_source import StoreUsageSource
 
 
 class DummySource:
@@ -56,3 +57,11 @@ def test_all_uses_every_registered_source() -> None:
     result = get_tool_usage("all", registry=registry)
     assert result["tool"] == "all"
     assert result["summary"]["call_count"] == 1
+
+
+def test_default_registry_uses_only_shared_store_sources() -> None:
+    assert set(DEFAULT_SOURCE_REGISTRY.keys()) == {"antigravity", "claude-code", "codex"}
+    assert all(
+        isinstance(source, StoreUsageSource)
+        for source in DEFAULT_SOURCE_REGISTRY.list_sources()
+    )

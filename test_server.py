@@ -36,6 +36,10 @@ def test_index_html_cache_busts_charts_js() -> None:
     out = version_static_assets(html)
     charts_v = _static_asset_version("/static/js/charts.js")
     assert "Cost by tool" in out
+    assert '<ul id="capture-status" class="capture-status" aria-label="Capture status" hidden>' in out
+    assert '<div id="store-health-banner" class="store-health-banner" role="status" hidden>' in out
+    assert '<main id="main" class="page">\n    <div id="store-health-banner"' in out
+    assert out.index('id="store-health-banner"') < out.index('<section class="meter"')
     assert f"/static/js/charts.js?v={charts_v}" in out
     assert "Cost / 1K Tokens" not in out
 
@@ -161,6 +165,7 @@ def main() -> None:
     assert usage_all["tool"] == "all"
     assert "no-store" in headers.get("cache-control", "")
     assert "summary" in usage_all and "models" in usage_all and "timeline" in usage_all and "sessions" in usage_all
+    assert set(usage_all["store"]) == {"path", "database_exists", "readable", "error", "providers"}
     assert "hourly_timeline" in usage_all and "weekday_hour" in usage_all
     assert "heatmap_daily" in usage_all
     assert len(usage_all["hourly_timeline"]) == 24

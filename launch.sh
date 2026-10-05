@@ -81,11 +81,11 @@ else
 fi
 
 # ─── Step 5: Quick sanity check on the parsers ───────────────────────────────
-info "Running parser sanity check..."
-if "$PYTHON" -c "from src.parsers.aggregator import get_tool_usage; d = get_tool_usage('all'); assert d.get('tool') == 'all'" 2>/dev/null; then
-  success "Parser check passed (data found)"
+info "Checking parser modules and provider registry..."
+if "$PYTHON" -c "from src.parsers.aggregator import DEFAULT_SOURCE_REGISTRY; required = {'codex', 'antigravity', 'claude-code'}; available = set(DEFAULT_SOURCE_REGISTRY.keys()); missing = required - available; assert not missing, f'Missing parser sources: {sorted(missing)}'" 2>/dev/null; then
+  success "Parser modules loaded and provider registry is ready"
 else
-  warn "Parser check could not verify data — continuing anyway"
+  warn "Parser module check failed — continuing anyway"
 fi
 
 # ─── Step 6: Check if port is already in use ─────────────────────────────────
