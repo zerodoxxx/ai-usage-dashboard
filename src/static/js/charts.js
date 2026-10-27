@@ -646,7 +646,8 @@
       .map((row) => {
         const cached = num(row.cached_input);
         const uncached = num(row.uncached_input);
-        const cacheable = cached + uncached;
+        const cacheWrite = num(row.cache_write);
+        const cacheable = cached + uncached + cacheWrite;
         let cacheRate = null;
         if (cacheable > 0) {
           cacheRate = row.cache_hit_rate !== undefined && row.cache_hit_rate !== null

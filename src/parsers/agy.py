@@ -16,9 +16,12 @@ from ..pricing import calculate_cost, calculate_cost_strict
 
 logger = logging.getLogger(__name__)
 
-# AGY transcripts carry text but no provider token counts (quota is tracked
-# server-side by Google), so tokens are estimated with the standard
-# chars//4 heuristic. Cache behavior is split by turn count:
+# This legacy parser is no longer on the runtime path (the dashboard reads the
+# shared store written by `scripts/agy_usage_writer.py`) and is kept for tests.
+# Older AGY transcripts carry text only (quota is tracked server-side by
+# Google); newer ones, since 2026-10-03, carry per-call token keys that the
+# writer reads. This parser ignores those keys and estimates tokens with the
+# standard chars//4 heuristic. Cache behavior is split by turn count:
 # - single-turn (call_count <= 1): 0% cache hit. There is no prior context
 #   to reuse, so assuming any cache hit would overstate savings.
 # - multi-turn (call_count > 1): flat 45% of input treated as cached. This

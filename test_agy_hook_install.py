@@ -29,6 +29,12 @@ def source(tmp_path):
     (root / "scripts/agy_usage_writer.py").write_text("import argparse\nargparse.ArgumentParser().parse_args()\n")
     for name in ("src/__init__.py", "src/usage_store.py", "src/pricing.py", "src/parsers/__init__.py", "src/parsers/contracts.py"):
         (root / name).write_text("")
+    (root / "src/agy_conversation_usage.py").write_text(
+        "class ProtoError(Exception):\n    pass\n\n\n"
+        "class AgyCall:\n    pass\n\n\n"
+        "def parse_fields(data):\n    return []\n\n\n"
+        "def read_conversation_calls(*args, **kwargs):\n    return []\n"
+    )
     (root / "src/secret.json").write_text("{}")
     (root / "src/usage.db").write_bytes(b"private")
     return root
@@ -73,6 +79,24 @@ def test_replaces_legacy_flat_entry_with_backup_and_frozen_release(source, tmp_p
     deployed = result.publisher_script.read_bytes()
     (source / "scripts/agy_usage_writer.py").write_text("print('new source')\n")
     assert result.publisher_script.read_bytes() == deployed
+
+
+def test_frozen_release_contains_conversation_reader_module(source, tmp_path):
+    home, _ = _seed(tmp_path)
+    result = _install(source, home)
+    assert (result.artifact_directory / "src/agy_conversation_usage.py").is_file()
+
+
+def test_smoke_check_fails_when_conversation_reader_cannot_import(source, tmp_path):
+    (source / "src/agy_conversation_usage.py").write_text("raise ImportError('reader unavailable')\n")
+    home, hooks = _seed(tmp_path)
+    before = hooks.read_bytes()
+    with pytest.raises(installer.InstallError, match="reader unavailable"):
+        _install(source, home)
+    assert hooks.read_bytes() == before
+    assert not (home / "usage-publisher").exists()
+    assert not list(hooks.parent.glob("*.bak"))
+    assert not list(home.glob(".usage-publisher.stage-*"))
 
 
 def test_install_preserves_unrelated_nested_tool_hooks(source, tmp_path):

@@ -6,6 +6,8 @@
 **Location:** `/Users/zerodoxxx/Desktop/Self Projects/ai-usage-dashboard`
 **Conda Env:** `ai-usage-dashboard` (Python 3.12.14)
 
+> **Update:** AGY token counts are now read from the usage agy records itself (see [HOW_IT_WORKS.md](HOW_IT_WORKS.md)). The 45% cache estimate described below applies only to sessions with no recorded counts.
+
 ---
 
 ## 1. How to Run Immediately

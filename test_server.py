@@ -13,6 +13,19 @@ import uvicorn
 
 from src.app import NO_STORE_HEADERS, _static_asset_version, version_static_assets
 
+# Pinned byte for byte: the estimated-token copy shown for AGY sessions with no
+# recorded counts (index footnote and the `EST_TOOLTIP` string in utils.js).
+EST_FOOTNOTE_HTML = (
+    '<p class="footnote" id="models-est-footnote" hidden>'
+    'Rows marked <span class="chip">est.</span> or ~ are Antigravity sessions with no '
+    'recorded token counts. Their tokens are estimated from transcript text, with a flat '
+    '45% treated as cached after the first call.</p>'
+)
+EST_TOOLTIP = (
+    'Estimated from transcript text because Antigravity recorded no token counts for this '
+    'session. Other counts are the exact figures each tool recorded.'
+)
+
 
 def test_version_static_assets_pins_mtime_and_replaces_stale_query() -> None:
     html = (
@@ -42,6 +55,11 @@ def test_index_html_cache_busts_charts_js() -> None:
     assert out.index('id="store-health-banner"') < out.index('<section class="meter"')
     assert f"/static/js/charts.js?v={charts_v}" in out
     assert "Cost / 1K Tokens" not in out
+    assert EST_FOOTNOTE_HTML in out
+    utils_js = (Path(__file__).resolve().parent / "src" / "static" / "js" / "utils.js").read_text(
+        encoding="utf-8"
+    )
+    assert f"const EST_TOOLTIP = '{EST_TOOLTIP}';" in utils_js
 
 
 def test_no_store_headers_are_complete() -> None:
@@ -135,6 +153,7 @@ def main() -> None:
     assert "Projected 30-day cost" in html
     assert "Projected Monthly Cost" not in html
     assert "/static/js/charts.js?v=" in html
+    assert EST_FOOTNOTE_HTML in html
     assert "no-store" in headers.get("cache-control", "")
     print("✓ GET / (Dashboard HTML) passed")
 

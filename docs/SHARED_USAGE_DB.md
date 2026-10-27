@@ -1,6 +1,6 @@
 # Shared usage database
 
-The dashboard's only usage source is `~/.local/share/ai-usage/usage.db`. Set `AI_USAGE_DB_PATH` to override it; writer scripts also accept `--db`. Writers create directories and ensure the schema. Dashboard reads never create or migrate the database and never fall back to provider transcripts or the legacy location.
+The dashboard's only usage source is `~/.local/share/ai-usage/usage.db`. Set `AI_USAGE_DB_PATH` to override it; writer scripts also accept `--db`. Writers create directories and ensure the schema. They also refresh the summary view definitions when those have drifted, without changing `PRAGMA user_version`. Dashboard reads never create or migrate the database and never fall back to provider transcripts or the legacy location.
 
 ## Schema
 
@@ -28,11 +28,15 @@ New snapshots written through the shared API, including the current AGY writer, 
 - `output_tokens` includes reasoning output; reasoning is a subset.
 - `total_tokens` is preserved from the normalized source snapshot.
 
-Legacy AGY rows use semantics version 1 and `cache_write_mode='embedded_in_input'`. Their cache-write estimate is already included in input and total. Readers preserve those totals but zero the cache-write fields to prevent double counting. The current AGY writer emits additive snapshots with zero cache writes.
+Legacy AGY rows use semantics version 1 and `cache_write_mode='embedded_in_input'`. Their cache-write estimate is already included in input and total. Readers preserve those totals but zero the cache-write fields to prevent double counting. The current AGY writer emits additive snapshots with zero cache writes: no cache-write field has been observed in agy's recorded usage, so AGY cache writes are recorded as 0.
 
-The **estimated flag is metadata**, not a standalone table column: `metadata_json.estimated` and `token_source` distinguish token provenance. Current AGY snapshots set `estimated: true` and `token_source: "estimated"`; legacy AGY reads default to estimated. Codex and Claude default to reported token counts. Being stored in SQLite does not make estimates reported.
+The **cache hit rate** is `cache read / (uncached input + cache read + cache write)`, as a percentage. Providers without cache writes (Codex, AGY) reduce to cache read / (uncached input + cache read). Claude previously showed about 100% because cache writes were left out of the denominator. The SQL views `provider_daily_summary` and `provider_model_summary`, and the legacy AGY-only `daily_summary` and `model_summary`, use the same definition, counting `cache_write_tokens` only for rows whose `cache_write_mode` is `additive`.
+
+The **estimated flag is metadata**, not a standalone table column: `metadata_json.estimated` and `token_source` distinguish token provenance. Current AGY snapshots take their counts from one of three sources per session (see [Writers and hooks](#writers-and-hooks)). Snapshots built from usage that agy recorded set `estimated: false` and `token_source: "reported"`, with `token_origin` naming the source (`agy-conversation-db` or `agy-transcript-json`). Only the transcript-text fallback sets `estimated: true` and has no `token_origin`; legacy AGY reads default to estimated. Codex and Claude default to reported token counts. Being stored in SQLite does not make estimates reported.
 
 Cost provenance is separate. `cost_usd` retains the compatible payable/estimated amount; `cost_source`, `reported_cost_usd`, `cost_cached_estimate_usd`, `cost_uncached_usd`, `savings_usd`, and `cost_currency` retain the distinctions. A calculated cost remains estimated even when its token counts are reported. Unknown rates remain unpriced.
+
+Events written by the AGY hook (and backfill) carry only the cost known at write time, so model ids whose rates exist only in the LiteLLM index are stored as unpriced with zero cost. The dashboard re-prices from the raw model id every time it reads, so its numbers are right. Raw SQL consumers and the SQL summary views (`provider_daily_summary`, `provider_model_summary`) see the write-time cost fields and understate AGY cost.
 
 ## Writer contract
 
@@ -44,6 +48,8 @@ sessions = read_usage_sessions("claude-code")
 ```
 
 Writes replace full `UsageSession` snapshots and their event lists atomically; they are not token deltas. Replaying a snapshot cannot add the same session twice, and a shorter corrected snapshot removes old tail events. Stable event IDs support deduplication. Codex/Claude capture revisions prevent an older parse from replacing a newer snapshot; Claude additionally claims response ownership to avoid counting copied history twice.
+
+For AGY the store ranks snapshots by `token_origin`: `agy-conversation-db` above `agy-transcript-json` above none. A lower-ranked snapshot never replaces a higher-ranked one, and a snapshot with fewer calls, or the same number of calls with fewer total tokens, never replaces a real one of the same rank, because agy may prune old conversation databases. Replays are idempotent. To correct an overcounted session, restore a backup or delete its rows and re-run the AGY backfill; see the recovery steps and SQL in [How it works](../HOW_IT_WORKS.md#antigravity-agy).
 
 Capture state records backfill completion, not hook configuration or approval. Dashboard reads do not require `enabled=1`.
 
@@ -67,7 +73,13 @@ python scripts/install_agy_usage_hooks.py
 
 Codex parses only the hook transcript and matching thread metadata. `SubagentStop` uses `agent_id`/`agent_transcript_path`. Hook stdout is `{}`; diagnostics go to stderr and failures are nonfatal. Claude parses the named transcript, captures subagents separately, and sweeps the subagent directory at session end; it emits no hook stdout and exits 0 on hook errors.
 
-AGY estimates tokens with `tiktoken` when available, otherwise a regex/character fallback. It estimates cache reads at zero for the first response and 45% of accumulated context thereafter, with zero additive cache writes. Its hook emits `{}` and nonfatal diagnostics. These are estimates, not provider token reports.
+AGY takes token counts from the best source available for each session, in priority order:
+
+1. **Conversation database.** Real per-call usage that agy records in `~/.gemini/antigravity-cli/conversations/<conversationId>.db` (table `gen_metadata`, protobuf). Google does not document this schema; the field layout was reverse engineered and verified locally, and it may change between agy releases. Each call gives uncached input, cache-read tokens, output tokens (with the thinking subset), and the model that ran. Snapshots carry `estimated: false`, `token_source: "reported"`, and `token_origin: "agy-conversation-db"`. If more than 5% of a conversation database's non-empty rows fail to decode (a sign the undocumented schema changed), the database is treated as unrecognised and the session falls to the next tier instead of storing partial numbers as recorded. agy's databases are opened read-only and never modified; reading through a live write-ahead log may update agy's own shared-memory index, which holds no durable data. The call count is the number of real model calls, one per `gen_metadata` row with non-zero usage. Events carry the per-call model id as recorded (for example `gemini-3.8-flash`), and a session that used several models is labelled `mixed`. Routing variants such as `gemini-3.7-flash-tiered` are priced through explicit aliases in `src/litellm_pricing.py`. The aliases assume a variant has the same per-token rates as its base model. That is an inference: Google does not publish them, and a "tiered" variant may in reality be priced differently. Unknown ids stay unpriced.
+2. **Transcript JSON.** Plain JSON keys `input_tokens` (uncached input only; cached reads are the separate `cache_read_tokens`), `cache_read_tokens`, and `output_tokens` on each `PLANNER_RESPONSE` line of `brain/<id>/.system_generated/logs/transcript.jsonl`. Each line holds that call's own counts, not running totals. They exist only for sessions started on or after 2026-10-03 and are used only when every such line has them (all or nothing). Reasoning tokens are unknown and stored as 0. Snapshots carry `estimated: false`, `token_source: "reported"`, and `token_origin: "agy-transcript-json"`.
+3. **Estimate.** Used only when neither real source exists. The writer estimates tokens from transcript text with `tiktoken` when available, otherwise a regex/character fallback. It treats a flat 45% of accumulated context as cached after the first call, and single-turn sessions get 0% cached. It still counts every model-source transcript line as a call, so its call counts run high. Snapshots carry `estimated: true` and no `token_origin`.
+
+All three tiers use zero additive cache writes. The AGY hook emits `{}` and nonfatal diagnostics.
 
 ```bash
 python scripts/codex_usage_writer.py --backfill
@@ -78,7 +90,7 @@ python scripts/claude_usage_writer.py --status
 python scripts/agy_usage_writer.py --status
 ```
 
-Codex backfill imports history once and becomes a no-op once capture is enabled. Claude and AGY backfills can be repeated. Claude's `--no-enable-capture` suppresses its backfill flag. Status commands report database counts/state, not hook approval. Use `--codex-dir`, `--claude-dir`, or `--agy-dir` on the corresponding writer for alternate history roots.
+Codex backfill imports history once and becomes a no-op once capture is enabled. Claude and AGY backfills can be repeated. The AGY backfill re-imports every conversation, conversation databases first and then transcript-only sessions, and is idempotent. Take a backup with `scripts/backup_usage_db.py` before running it. Claude's `--no-enable-capture` suppresses its backfill flag. Status commands report database counts/state, not hook approval. Use `--codex-dir`, `--claude-dir`, or `--agy-dir` on the corresponding writer for alternate history roots.
 
 ## Concurrency
 
