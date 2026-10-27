@@ -19,7 +19,7 @@ from ..pricing import (
     calculate_cost_strict,
 )
 from ..timezones import local_timezone, timezone_name
-from .contracts import CostEstimate, TokenUsage, UsageEvent, UsageSession
+from .contracts import CostEstimate, TokenUsage, UsageEvent, UsageSession, cache_hit_rate
 from .source_registry import SOURCE_REGISTRY, SourceRegistry, normalize_source_key
 from .store_source import StoreUsageSource, antigravity_store_source, claude_store_source, codex_store_source
 
@@ -705,8 +705,7 @@ def _slice_session(
         "output": output,
         "reasoning_output": reasoning_output,
         "total_tokens": total_tokens,
-        "cache_hit_rate": round((cached_input / (uncached_input + cached_input) * 100.0), 2)
-        if uncached_input + cached_input > 0 else 0.0,
+        "cache_hit_rate": cache_hit_rate(uncached_input, cached_input, cache_write),
         "cost_cached_usd": round(cost_cached, 6),
         "cost_uncached_usd": round(cost_uncached, 6),
         "savings_usd": round(savings, 6),
@@ -861,10 +860,10 @@ def _add_token_metrics(
         row["total_input"] = int(row.get("total_input") or 0) + uncached_input + cached_input + cache_write
         row["output"] = int(row.get("output") or 0) + output
         row["reasoning_output"] = int(row.get("reasoning_output") or 0) + reasoning_output
-        cacheable_input = int(row.get("uncached_input") or 0) + int(row.get("cached_input") or 0)
-        row["cache_hit_rate"] = (
-            round(int(row.get("cached_input") or 0) / cacheable_input * 100.0, 2)
-            if cacheable_input > 0 else 0.0
+        row["cache_hit_rate"] = cache_hit_rate(
+            int(row.get("uncached_input") or 0),
+            int(row.get("cached_input") or 0),
+            int(row.get("cache_write") or 0),
         )
         row["cost_uncached_usd"] = float(row.get("cost_uncached_usd") or 0.0) + float(
             cost.get("cost_uncached_usd") or 0.0
@@ -1227,11 +1226,11 @@ def _build_usage_data(
             model["tps_status"] = "approximate"
         model["tps_duration_seconds"] = round(model["tps_duration_seconds"], 6)
         model["session_count"] = len(model.pop("session_ids"))
-        cacheable_input = int(model["uncached_input"]) + int(model["cached_input"])
-        model["cache_hit_rate"] = round(
-            int(model["cached_input"]) / cacheable_input * 100.0,
-            2,
-        ) if cacheable_input > 0 else 0.0
+        model["cache_hit_rate"] = cache_hit_rate(
+            int(model["uncached_input"]),
+            int(model["cached_input"]),
+            int(model["cache_write"]),
+        )
         model["est_cost_cached_usd"] = round(float(model["est_cost_cached_usd"]), 6)
         model["est_cost_uncached_usd"] = round(float(model["est_cost_uncached_usd"]), 6)
         model["est_savings_usd"] = round(float(model["est_savings_usd"]), 6)
@@ -1500,7 +1499,7 @@ def _build_usage_data(
         "cost_uncached_usd": cost_uncached,
         "savings_usd": savings,
         "total_cost_usd": cost_cached,
-        "cache_hit_rate": round((cached_input / (uncached_input + cached_input) * 100.0), 2) if uncached_input + cached_input > 0 else 0.0,
+        "cache_hit_rate": cache_hit_rate(uncached_input, cached_input, cache_write),
         "session_count": len(sessions_combined),
         "call_count": sum(int(s.get("call_count") or 0) for s in sessions_combined),
         "unpriced_model_count": unpriced_count,

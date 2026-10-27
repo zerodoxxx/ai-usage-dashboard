@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 import unittest
 
-from src.parsers.contracts import CostEstimate, TokenUsage, UsageEvent, UsageSession
+from src.parsers.contracts import CostEstimate, TokenUsage, UsageEvent, UsageSession, cache_hit_rate
 from src.parsers.source_registry import SourceRegistry
 
 
@@ -37,6 +37,45 @@ class ProviderContractTests(unittest.TestCase):
 
         self.assertEqual(usage.total_input, 150)
         self.assertEqual(usage.total_tokens, 160)
+
+    def test_cache_hit_rate_counts_cache_writes_in_the_denominator(self) -> None:
+        # 10 uncached + 900 cache read + 90 cache write: 900 / 1000, not 900 / 910.
+        usage = TokenUsage(input_tokens=910, cached_input_tokens=900, cache_write_tokens=90)
+        self.assertEqual(usage.uncached_input_tokens, 10)
+        self.assertEqual(usage.total_input, 1_000)
+        self.assertEqual(cache_hit_rate(10, 900, 90), 90.0)
+
+        legacy = UsageSession(id="s-cache-write", tool="claude-code", usage=usage).to_legacy_dict()
+        self.assertEqual(legacy["uncached_input"], 10)
+        self.assertEqual(legacy["cached_input"], 900)
+        self.assertEqual(legacy["cache_write"], 90)
+        self.assertEqual(legacy["cache_hit_rate"], 90.0)
+
+    def test_cache_hit_rate_without_cache_writes_is_unchanged(self) -> None:
+        # Codex and AGY never report cache writes; the rate stays cached / input.
+        for uncached, cached in ((200, 800), (1, 2), (7, 0), (0, 5), (123_457, 987_651)):
+            self.assertEqual(
+                cache_hit_rate(uncached, cached, 0),
+                round(cached / (uncached + cached) * 100.0, 2),
+            )
+            self.assertEqual(cache_hit_rate(uncached, cached), cache_hit_rate(uncached, cached, 0))
+
+        usage = TokenUsage(input_tokens=1_000, cached_input_tokens=800, output_tokens=10)
+        legacy = UsageSession(id="s-codex", tool="codex", usage=usage).to_legacy_dict()
+        self.assertEqual(legacy["cache_write"], 0)
+        self.assertEqual(legacy["cache_hit_rate"], 80.0)
+
+    def test_cache_hit_rate_is_zero_without_input(self) -> None:
+        self.assertEqual(cache_hit_rate(0, 0, 0), 0.0)
+        self.assertEqual(cache_hit_rate(0, 0), 0.0)
+        self.assertEqual(UsageSession(id="empty", tool="codex").to_legacy_dict()["cache_hit_rate"], 0.0)
+        # Writes alone are input the cache never served.
+        self.assertEqual(cache_hit_rate(0, 0, 50), 0.0)
+
+    def test_cache_hit_rate_rounds_to_two_decimals(self) -> None:
+        self.assertEqual(cache_hit_rate(28_087, 1_634_778_578, 68_786_057), 95.96)
+        # 2/3 = 66.666...: rounds up to 66.67, truncation would give 66.66.
+        self.assertEqual(cache_hit_rate(1, 2, 0), 66.67)
 
     def test_session_total_reconciles_corrected_event_totals(self) -> None:
         session = UsageSession(

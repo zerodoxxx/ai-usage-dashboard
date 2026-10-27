@@ -421,6 +421,8 @@ def test_embedded_cache_write_rows_are_not_double_counted(monkeypatch) -> None:
     assert summary["uncached_input"] == 700
     assert summary["output"] == 50
     assert summary["total_input"] + summary["output"] == summary["total_tokens"]
+    # 300 cached of 1,000 input; the zeroed embedded write is not added again.
+    assert summary["cache_hit_rate"] == 30.0
     from src.pricing import calculate_cost_strict
 
     expected = calculate_cost_strict("gemini-2.5-pro", 700, 300, 50, provider="antigravity")

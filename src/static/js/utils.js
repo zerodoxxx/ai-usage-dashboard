@@ -90,11 +90,13 @@
     };
   }
 
-  // AGY token counts in usage.db are transcript estimates; Codex/Claude
-  // counts come from recorded usage. The backend preserves token provenance
-  // with `estimated` / `token_source`. Cost provenance stays in
+  // AGY token counts come from the usage agy records in its conversation
+  // databases; only sessions with no recorded counts fall back to an estimate
+  // from transcript text, flagged `estimated`. Codex/Claude counts come from
+  // recorded usage. The backend preserves token provenance with
+  // `estimated` / `token_source`. Cost provenance stays in
   // `cost_source`/`pricing_status`.
-  const EST_TOOLTIP = 'Antigravity counts are estimated by tokenizing transcript text, not reported by the API. Codex and Claude counts are exact API reports.';
+  const EST_TOOLTIP = 'Estimated from transcript text because Antigravity recorded no token counts for this session. Other counts are the exact figures each tool recorded.';
   const PROVENANCE_LABELS = {
     reported: 'reported',
     estimated: 'est.',

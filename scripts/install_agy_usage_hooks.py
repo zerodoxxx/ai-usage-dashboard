@@ -188,7 +188,7 @@ def _validate_publisher(interpreter, staging):
     # prevent a missing dependency from failing the host's hook invocation.
     checks = [
         [str(interpreter), str(staging / PUBLISHER_RELATIVE_PATH), "--help"],
-        [str(interpreter), "-c", "import src.usage_store; import src.pricing; import src.parsers.contracts"],
+        [str(interpreter), "-c", "import src.usage_store; import src.pricing; import src.parsers.contracts; import src.agy_conversation_usage"],
     ]
     for command in checks:
         try:

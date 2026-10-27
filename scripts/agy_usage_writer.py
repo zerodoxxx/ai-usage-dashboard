@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
-"""Capture Antigravity transcript estimates through the shared usage store.
+"""Capture Antigravity token usage through the shared usage store.
 
-The external tracker's cache-write estimate was already part of input. We use
-additive store semantics with zero cache writes, matching read-side normalization
-of its embedded_in_input rows. The store keeps native IDs so existing tracker
-sessions are updated in place.
+A session is captured by the first of three tiers that has data for it:
+
+1. Conversation database (token_origin "agy-conversation-db"): real per-call
+   counts and per-call model ids read from <agy dir>/conversations/<id>.db.
+2. Transcript JSON (token_origin "agy-transcript-json"): the real per-call
+   counts newer agy versions write on every PLANNER_RESPONSE transcript line.
+3. Estimate (no token_origin): counts estimated from the transcript text with
+   tiktoken or a regex fallback. Only used when no recorded counts exist.
+
+The store never lets a lower tier replace a higher one. Cache writes are always
+stored as zero: no cache-write field has been observed in agy's recorded usage.
+We use additive store semantics, matching read-side normalization of the
+external tracker's embedded_in_input rows. The store keeps native IDs so
+existing tracker sessions are updated in place.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,6 +35,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 PROVIDER = "antigravity"
+ORIGIN_CONVERSATION_DB = "agy-conversation-db"
+ORIGIN_TRANSCRIPT_JSON = "agy-transcript-json"
+TIER_CONVERSATION_DB, TIER_TRANSCRIPT_JSON, TIER_ESTIMATE = "tier1", "tier2", "tier3"
+TIER_SKIPPED = "skipped"
+_SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
 _ENC = None
 _ENCODING_ATTEMPTED = False
 
@@ -94,11 +111,15 @@ def _capture_file_metadata(path: Path) -> dict[str, Any] | None:
 
 
 def _resolve_transcript(
-    base_dir: Path, session_id: str, hint: str | None = None,
+    base_dir: Path, session_id: str, hint: str | os.PathLike | None = None,
 ) -> Path | None:
-    """Resolve a conversation transcript using the hook's canonical order."""
+    """Resolve a conversation transcript using the hook's canonical order.
+
+    ``hint`` is the hook payload's ``transcriptPath`` (a string) or a path the
+    backfill discovered. It only locates a transcript, never a conversation database.
+    """
     candidates = []
-    if isinstance(hint, str) and hint:
+    if isinstance(hint, (str, os.PathLike)) and hint:
         candidates.append(Path(hint).expanduser())
     candidates.extend((
         base_dir / "brain" / session_id / "transcript.jsonl",
@@ -113,13 +134,27 @@ def _resolve_transcript(
     return None
 
 
-def _cost(model, usage, timestamp):
+def conversation_db_path(base_dir: str | Path, session_id: str) -> Path | None:
+    """Locate a conversation database from the session id alone, or ``None``.
+
+    Ids that could escape ``conversations/`` are refused; the hook payload's
+    ``transcriptPath`` is deliberately never involved.
+    """
+    if (
+        not isinstance(session_id, str) or session_id.startswith(".")
+        or _SESSION_ID_PATTERN.fullmatch(session_id) is None
+    ):
+        return None
+    return Path(base_dir) / "conversations" / f"{session_id}.db"
+
+
+def _cost(model, usage, timestamp, provider=PROVIDER):
     from src.parsers.contracts import CostEstimate
     from src.pricing import calculate_cost_strict
 
     costs = calculate_cost_strict(
         model, usage.uncached_input_tokens, usage.cached_input_tokens,
-        usage.output_tokens, provider=PROVIDER, timestamp=timestamp,
+        usage.output_tokens, provider=provider, timestamp=timestamp,
     )
     if costs["cost_cached_usd"] is None:
         return None
@@ -202,6 +237,172 @@ def parse_transcript(transcript_path: Path, session_id: str, base_dir: Path):
     )
 
 
+def _model_provider(model: str) -> str:
+    """Pricing provider for a per-call model id, by the aggregator's own rules.
+
+    A call is therefore priced the same at write time and on read. An id no rule
+    matches keeps the session's provider. Importing the contracts already loads
+    the aggregator through ``src.parsers``, so this adds no import cost.
+    """
+    from src.parsers.aggregator import _model_provider as aggregator_provider
+
+    return aggregator_provider(model, PROVIDER) or PROVIDER
+
+
+def _file_time(path: Path | None) -> datetime | None:
+    """A source file's modification time in UTC, or ``None`` when it cannot be read."""
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc) if path else None
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _real_event(session_id, step_index, timestamp, model, uncached, cache_read, output, reasoning):
+    """One call with recorded counts: input includes cache reads, cache writes are zero."""
+    from src.parsers.contracts import TokenUsage, UsageEvent
+
+    usage = TokenUsage(
+        input_tokens=uncached + cache_read, cached_input_tokens=cache_read,
+        output_tokens=output, reasoning_output_tokens=reasoning,
+        total_tokens=uncached + cache_read + output, cache_write_tokens=0,
+    )
+    # An unpriced id keeps cost=None; the aggregator re-prices the raw id on read.
+    return UsageEvent(
+        timestamp=timestamp, model=model, usage=usage,
+        cost=_cost(model, usage, timestamp, _model_provider(model)),
+        event_id=f"{session_id}:call:{step_index}",
+    )
+
+
+def _real_session(session_id, title, events, origin, fallback_time=None):
+    """Assemble a session whose totals are exactly the sums of its events.
+
+    When no event carries a timestamp the session is dated ``fallback_time``
+    (its source file's mtime), so a replay does not move it to "now".
+    """
+    from decimal import Decimal
+    from src.parsers.contracts import CostEstimate, TokenUsage, UsageSession
+
+    usage = TokenUsage(**{
+        key: sum(getattr(event.usage, key) for event in events)
+        for key in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens")
+    })
+    models = {event.model for event in events}
+    stamps = [event.timestamp for event in events if event.timestamp is not None]
+    first_ts, last_ts = (min(stamps), max(stamps)) if stamps else (fallback_time, fallback_time)
+    priced = [event.cost for event in events if event.cost is not None]
+    cost = CostEstimate(
+        cached_usd=sum((item.cached_usd for item in priced), Decimal("0")),
+        uncached_usd=sum((item.uncached_usd for item in priced), Decimal("0")),
+        savings_usd=sum((item.savings_usd for item in priced), Decimal("0")),
+        source="estimated",
+    ) if priced else None
+    return UsageSession(
+        id=session_id, tool=PROVIDER, provider=PROVIDER,
+        model=next(iter(models)) if len(models) == 1 else "mixed",
+        title=title, created_at=first_ts, start_time=first_ts,
+        end_time=last_ts, activity_at=last_ts, usage=usage, events=events,
+        cost=cost, call_count=len(events),
+        metadata={"estimated": False, "token_source": "reported", "token_origin": origin},
+    )
+
+
+def build_real_session(session_id, calls, base_dir, origin):
+    """Tier 1: one event per recorded call, using the model id each call ran on."""
+    meta = get_session_metadata(base_dir, session_id)
+    modeled = Counter(call.model for call in calls if call.model)
+    # A call without a model id takes the session's most common one, else the label.
+    fallback = modeled.most_common(1)[0][0] if modeled else meta["model"]
+    events = [
+        _real_event(
+            session_id, call.step_index, call.timestamp, call.model or fallback,
+            call.uncached_input, call.cache_read, call.output, call.reasoning,
+        )
+        for call in calls
+    ]
+    fallback_time = _file_time(conversation_db_path(base_dir, session_id))
+    return _real_session(session_id, meta["title"], events, origin, fallback_time)
+
+
+def parse_transcript_json_usage(transcript_path: Path, session_id: str, base_dir: Path):
+    """Tier 2: real counts from PLANNER_RESPONSE transcript lines, all or nothing.
+
+    Returns ``None`` unless every PLANNER_RESPONSE line carries integer
+    ``input_tokens`` (uncached), ``cache_read_tokens`` and ``output_tokens``.
+    """
+    from src.agy_conversation_usage import MAX_TOKEN_COUNT, UNPAIRED_STEP_BASE
+
+    def is_count(value):
+        return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_TOKEN_COUNT
+
+    rows = []
+    with transcript_path.open("r", encoding="utf-8", errors="ignore") as stream:
+        for idx, line in enumerate(stream):
+            if not line.strip():
+                continue
+            try:
+                step = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(step, dict) or step.get("type") != "PLANNER_RESPONSE":
+                continue
+            counts = [step.get(key) for key in ("input_tokens", "cache_read_tokens", "output_tokens")]
+            if not all(is_count(value) for value in counts):
+                return None
+            rows.append((idx, step, *counts))
+    meta = get_session_metadata(base_dir, session_id)
+    events, seen = [], set()
+    for idx, step, uncached, cache_read, output in rows:
+        if not (uncached or cache_read or output):
+            continue
+        step_index = step.get("step_index")
+        if not is_count(step_index) or step_index in seen:
+            step_index = UNPAIRED_STEP_BASE + idx
+        seen.add(step_index)
+        created = step.get("created_at")
+        events.append(_real_event(
+            session_id, step_index, created if isinstance(created, str) and created else None,
+            meta["model"], uncached, cache_read, output, 0,
+        ))
+    if not events:
+        return None
+    return _real_session(
+        session_id, meta["title"], events, ORIGIN_TRANSCRIPT_JSON, _file_time(transcript_path),
+    )
+
+
+def _skip(stage: str, exc: Exception) -> None:
+    print(f"Antigravity {stage} skipped ({type(exc).__name__}).", file=sys.stderr)
+
+
+def capture_session(base_dir, session_id, hint=None):
+    """Return ``(session, tier)`` from the best tier that has data, else ``(None, "skipped")``.
+
+    A tier that fails for any reason degrades to the next one.
+    """
+    db_path = conversation_db_path(base_dir, session_id)
+    if db_path is not None:
+        try:
+            from src.agy_conversation_usage import read_conversation_calls
+
+            calls = read_conversation_calls(db_path)
+            if calls:
+                return build_real_session(session_id, calls, base_dir, ORIGIN_CONVERSATION_DB), TIER_CONVERSATION_DB
+        except Exception as exc:
+            _skip("conversation database", exc)
+    path = _resolve_transcript(base_dir, session_id, hint)
+    if path is None:
+        return None, TIER_SKIPPED
+    try:
+        session = parse_transcript_json_usage(path, session_id, base_dir)
+        if session is not None:
+            return session, TIER_TRANSCRIPT_JSON
+    except Exception as exc:
+        _skip("transcript token counts", exc)
+    session = parse_transcript(path, session_id, base_dir)
+    return (session, TIER_ESTIMATE) if session is not None else (None, TIER_SKIPPED)
+
+
 def _write_sessions(sessions, db_path=None) -> int:
     from src.usage_store import write_usage_sessions
 
@@ -218,47 +419,69 @@ def process_hook_payload(payload: Any, *, db_path=None, agy_dir=None) -> int | N
     if not isinstance(session_id, str) or not session_id.strip():
         return None
     base = _base_dir(agy_dir)
-    transcript = payload.get("transcriptPath")
-    path = _resolve_transcript(base, session_id, transcript)
-    if path is None:
-        return None
-    session = parse_transcript(path, session_id, base)
+    session, _tier = capture_session(base, session_id, payload.get("transcriptPath"))
     if session is None:
         return None
+    # One snapshot per run: when the store rejects it (a better tier already
+    # holds this session) nothing lower is tried.
     return session.usage.total_tokens if _write_sessions([session], db_path) else None
 
 
 def backfill_agy_usage(*, db_path=None, agy_dir=None) -> tuple[int, int]:
     base = _base_dir(agy_dir)
-    brain = base / "brain"
-    if not brain.is_dir():
-        raise FileNotFoundError("Antigravity brain directory is unavailable")
-    sessions = events = 0
+    conversations, brain = base / "conversations", base / "brain"
+    if not conversations.is_dir() and not brain.is_dir():
+        raise FileNotFoundError("Antigravity conversations and brain directories are unavailable")
     grouped: dict[str, list[Path]] = {}
-    for path in brain.glob("**/transcript.jsonl"):
-        try:
-            session_id = path.relative_to(brain).parts[0]
-        except (ValueError, IndexError) as exc:
-            print(f"Antigravity backfill skipped {path}: {exc}", file=sys.stderr)
-            continue
-        grouped.setdefault(session_id, []).append(path)
-
-    # Prefer the same canonical transcript the hook resolves. If neither
-    # canonical path exists, keep the tracker's recursive last-path behavior.
-    for session_id, paths in grouped.items():
-        path = _resolve_transcript(base, session_id) or paths[-1]
-        try:
-            session = parse_transcript(path, session_id, base)
-            if session is None:
-                print(
-                    f"Antigravity backfill skipped {path}: could not capture transcript revision",
-                    file=sys.stderr,
-                )
+    if brain.is_dir():
+        for path in brain.glob("**/transcript.jsonl"):
+            try:
+                session_id = path.relative_to(brain).parts[0]
+            except (ValueError, IndexError) as exc:
+                print(f"Antigravity backfill skipped {path}: {exc}", file=sys.stderr)
                 continue
-            sessions += _write_sessions([session], db_path)
-            events += len(session.events)
+            grouped.setdefault(session_id, []).append(path)
+
+    counts = {TIER_CONVERSATION_DB: 0, TIER_TRANSCRIPT_JSON: 0, TIER_ESTIMATE: 0, TIER_SKIPPED: 0}
+    sessions = events = 0
+
+    def capture(session_id: str) -> None:
+        nonlocal sessions, events
+        # Prefer the same canonical transcript the hook resolves. If neither
+        # canonical path exists, keep the tracker's recursive last-path behavior
+        # by passing that path as the transcript hint (tiers 2 and 3 only).
+        paths = grouped.get(session_id)
+        hint = _resolve_transcript(base, session_id) or (paths[-1] if paths else None)
+        try:
+            session, tier = capture_session(base, session_id, hint)
+            if session is not None and _write_sessions([session], db_path):
+                counts[tier] += 1
+                sessions += 1
+                events += len(session.events)
+            else:
+                counts[TIER_SKIPPED] += 1
         except Exception as exc:
-            print(f"Antigravity backfill skipped {path}: {exc}", file=sys.stderr)
+            counts[TIER_SKIPPED] += 1
+            print(f"Antigravity backfill skipped {session_id}: {exc}", file=sys.stderr)
+
+    # Conversation databases first: they cover tiers 1-3 for each session.
+    handled: set[str] = set()
+    if conversations.is_dir():
+        for db_file in sorted(conversations.glob("*.db")):
+            handled.add(db_file.stem)
+            if conversation_db_path(base, db_file.stem) is None:
+                counts[TIER_SKIPPED] += 1
+                continue
+            capture(db_file.stem)
+    # Then transcript-only sessions that no conversation database covered.
+    for session_id in grouped:
+        if session_id not in handled:
+            capture(session_id)
+    print(
+        f"Antigravity backfill: tier1={counts[TIER_CONVERSATION_DB]} tier2={counts[TIER_TRANSCRIPT_JSON]} "
+        f"tier3={counts[TIER_ESTIMATE]} skipped={counts[TIER_SKIPPED]}",
+        file=sys.stderr,
+    )
     return sessions, events
 
 
@@ -267,8 +490,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         parser = argparse.ArgumentParser(description=__doc__)
         modes = parser.add_mutually_exclusive_group()
-        modes.add_argument("--backfill", action="store_true")
-        modes.add_argument("--status", action="store_true")
+        modes.add_argument(
+            "--backfill", action="store_true",
+            help="capture every conversation database first, then transcript-only sessions",
+        )
+        modes.add_argument("--status", action="store_true", help="print shared usage database status")
         parser.add_argument("--db", type=Path)
         parser.add_argument("--agy-dir", type=Path, help="Antigravity CLI history directory")
         args = parser.parse_args(argv)
@@ -277,7 +503,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(get_usage_store_status(args.db), sort_keys=True))
         elif args.backfill:
             sessions, events = backfill_agy_usage(db_path=args.db, agy_dir=args.agy_dir)
-            print(f"Backfilled {sessions} Antigravity transcripts ({events} events).", file=sys.stderr)
+            print(f"Backfilled {sessions} Antigravity sessions ({events} events).", file=sys.stderr)
         else:
             # The hook protocol expects an empty JSON object on stdout.
             print("{}", flush=True)

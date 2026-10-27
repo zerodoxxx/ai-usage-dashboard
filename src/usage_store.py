@@ -81,6 +81,7 @@ _SESSION_METADATA_KEYS = frozenset({
     "capture_mtime_ns",
     "capture_ctime_ns",
     "capture_size",
+    "token_origin",
 })
 _EVENT_METADATA_KEYS = frozenset({
     "capture_source_hash",
@@ -143,6 +144,19 @@ def _metadata_json(value: dict[str, Any] | None, allowed: frozenset[str]) -> str
             return json.dumps(scalar, sort_keys=True, separators=(",", ":"), allow_nan=False)
         except (TypeError, ValueError):
             return "{}"
+
+
+# How trustworthy an Antigravity snapshot's token counts are, from the session
+# ``token_origin`` metadata. A higher rank is never replaced by a lower one;
+# a missing or unknown origin (legacy rows, local estimates) ranks 0.
+_ANTIGRAVITY_TOKEN_ORIGIN_RANKS = {"agy-conversation-db": 2, "agy-transcript-json": 1}
+
+
+def _token_origin_rank(provider: str, metadata: dict[str, Any]) -> int:
+    if provider != "antigravity":
+        return 0
+    origin = metadata.get("token_origin")
+    return _ANTIGRAVITY_TOKEN_ORIGIN_RANKS.get(origin, 0) if isinstance(origin, str) else 0
 
 
 def _decode_metadata(value: Any) -> dict[str, Any]:
@@ -293,46 +307,75 @@ def _assert_session_key(connection: sqlite3.Connection) -> None:
             raise RuntimeError("usage database sessions.session_id must be a primary or unique key")
 
 
-def _recreate_views(connection: sqlite3.Connection) -> None:
-    for view_name in ("daily_summary", "model_summary", "provider_daily_summary", "provider_model_summary"):
-        existing = connection.execute(
-            "SELECT type FROM sqlite_master WHERE name = ?", (view_name,)
-        ).fetchone()
-        if existing and existing[0] == "view":
-            connection.execute(f"DROP VIEW {view_name}")
+_VIEW_NAMES = ("daily_summary", "model_summary", "provider_daily_summary", "provider_model_summary")
 
-    metric_columns = """COUNT(*) AS sessions,
+
+def _view_definitions() -> dict[str, str]:
+    """Return the CREATE VIEW statement for each summary view, keyed by name."""
+    # Hit rate = cache reads / all input the model saw. Additive rows keep cache
+    # writes outside ``input_tokens``, so they join the denominator; legacy
+    # ``embedded_in_input`` rows already count them in ``input_tokens`` (their
+    # stored write count is a diagnostic copy) and must not be added twice.
+    total_input = (
+        "(input_tokens + CASE WHEN cache_write_mode = 'additive' "
+        "THEN cache_write_tokens ELSE 0 END)"
+    )
+    metric_columns = f"""COUNT(*) AS sessions,
         SUM(input_tokens) AS input_tokens,
         SUM(cached_input_tokens) AS cached_input_tokens,
         SUM(output_tokens) AS output_tokens,
         SUM(cache_write_tokens) AS cache_write_tokens,
         SUM(total_tokens) AS total_tokens,
         ROUND(SUM(cost_usd), 4) AS cost_usd,
-        CASE WHEN SUM(input_tokens) > 0
-             THEN ROUND(CAST(SUM(cached_input_tokens) AS REAL) / SUM(input_tokens) * 100.0, 2)
+        CASE WHEN SUM({total_input}) > 0
+             THEN ROUND(CAST(SUM(cached_input_tokens) AS REAL) / SUM({total_input}) * 100.0, 2)
              ELSE 0.0 END AS cache_hit_rate"""
-    connection.execute(
-        f"""CREATE VIEW daily_summary AS
+    return {
+        "daily_summary": f"""CREATE VIEW daily_summary AS
             SELECT date, {metric_columns}
             FROM sessions WHERE provider = 'antigravity'
-            GROUP BY date ORDER BY date DESC"""
-    )
-    connection.execute(
-        f"""CREATE VIEW model_summary AS
+            GROUP BY date ORDER BY date DESC""",
+        "model_summary": f"""CREATE VIEW model_summary AS
             SELECT model, {metric_columns}
             FROM sessions WHERE provider = 'antigravity'
-            GROUP BY model ORDER BY total_tokens DESC"""
-    )
-    connection.execute(
-        f"""CREATE VIEW provider_daily_summary AS
+            GROUP BY model ORDER BY total_tokens DESC""",
+        "provider_daily_summary": f"""CREATE VIEW provider_daily_summary AS
             SELECT provider, date, {metric_columns}
-            FROM sessions GROUP BY provider, date ORDER BY date DESC, provider"""
-    )
-    connection.execute(
-        f"""CREATE VIEW provider_model_summary AS
+            FROM sessions GROUP BY provider, date ORDER BY date DESC, provider""",
+        "provider_model_summary": f"""CREATE VIEW provider_model_summary AS
             SELECT provider, model, {metric_columns}
-            FROM sessions GROUP BY provider, model ORDER BY total_tokens DESC"""
+            FROM sessions GROUP BY provider, model ORDER BY total_tokens DESC""",
+    }
+
+
+def _views_current(connection: sqlite3.Connection) -> bool:
+    """Return whether every summary view matches the current definition.
+
+    ``user_version`` is deliberately not bumped for view-only changes (older
+    installed writers reject a newer schema), so view drift is detected here.
+    """
+    stored = {
+        str(name): " ".join(str(sql or "").split())
+        for name, sql in connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'view'"
+        )
+    }
+    return all(
+        stored.get(name) == " ".join(sql.split())
+        for name, sql in _view_definitions().items()
     )
+
+
+def _recreate_views(connection: sqlite3.Connection) -> None:
+    for view_name in _VIEW_NAMES:
+        existing = connection.execute(
+            "SELECT type FROM sqlite_master WHERE name = ?", (view_name,)
+        ).fetchone()
+        if existing and existing[0] == "view":
+            connection.execute(f"DROP VIEW {view_name}")
+
+    for statement in _view_definitions().values():
+        connection.execute(statement)
 
 
 def ensure_schema(db_path: str | Path | None = None, *, deadline: float | None = None) -> None:
@@ -357,6 +400,7 @@ def ensure_schema(db_path: str | Path | None = None, *, deadline: float | None =
                 and connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'usage_capture_state'"
                 ).fetchone() is not None
+                and _views_current(connection)
             )
             if current_version > SCHEMA_VERSION:
                 raise RuntimeError(
@@ -1364,15 +1408,34 @@ def _upsert_session(connection: sqlite3.Connection, provider: str, session: Usag
     session = _prepare_capture_session(session)
     values = _session_row(provider, session)
     existing = connection.execute(
-        "SELECT metadata_json FROM sessions WHERE session_id = ? AND provider = ?",
+        "SELECT metadata_json, call_count, total_tokens FROM sessions WHERE session_id = ? AND provider = ?",
         (values[0], provider),
     ).fetchone()
     if existing is not None:
         stored_metadata = _decode_metadata(existing["metadata_json"])
         incoming_metadata = dict(session.metadata or {})
-        stored_sources = _source_manifest(stored_metadata)
+        # Antigravity token provenance: real counts are never replaced by
+        # estimates. A higher incoming rank, or an equal non-estimate rank that
+        # is not smaller (an idempotent replay, or more calls), overwrites the
+        # row wholesale; the per-source manifest and fragment merge below only
+        # describe estimated transcript captures and would double count here.
+        overwrite_by_origin = False
+        if provider == "antigravity":
+            incoming_rank = _token_origin_rank(provider, incoming_metadata)
+            stored_rank = _token_origin_rank(provider, stored_metadata)
+            if incoming_rank < stored_rank:
+                return False
+            if incoming_rank > stored_rank:
+                overwrite_by_origin = True
+            elif incoming_rank >= 1:
+                # ``values``: total_tokens at 11, call_count at 12. Fewer calls
+                # (agy pruned old data) must not shrink a real snapshot.
+                if (values[12], values[11]) < (existing["call_count"], existing["total_tokens"]):
+                    return False
+                overwrite_by_origin = True
+        stored_sources = {} if overwrite_by_origin else _source_manifest(stored_metadata)
         incoming_sources = _source_manifest(incoming_metadata)
-        stored_source = stored_metadata.get("capture_source_hash")
+        stored_source = None if overwrite_by_origin else stored_metadata.get("capture_source_hash")
         incoming_source = incoming_metadata.get("capture_source_hash")
         stored_revision = _capture_revision(stored_metadata)
         incoming_revision = _capture_revision(incoming_metadata)

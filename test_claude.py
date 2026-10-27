@@ -199,3 +199,48 @@ def test_claude_5_5_session_extraction_and_reasoning_tokens(tmp_path: Path, monk
     assert models["Claude Opus 5.5"]["pricing_status"] == "known"
     assert models["Claude Sonnet 5.5"]["reasoning_output"] == 120
     assert models["Claude Opus 5.5"]["reasoning_output"] == 250
+
+
+def test_claude_cache_hit_rate_counts_cache_writes(tmp_path: Path) -> None:
+    session_dir = tmp_path / ".claude" / "projects" / "-tmp-project"
+    session_dir.mkdir(parents=True)
+    records = [
+        {
+            "type": "user",
+            "sessionId": "session-cache",
+            "cwd": "/tmp/project",
+            "timestamp": "2026-09-08T10:00:00Z",
+            "message": {"role": "user", "content": "Measure the cache hit rate"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "msg-cache",
+            "timestamp": "2026-09-08T10:00:01Z",
+            "message": {
+                "id": "msg-cache",
+                "role": "assistant",
+                "model": "claude-sonnet-4-20250514",
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_read_input_tokens": 900,
+                    "cache_creation_input_tokens": 90,
+                    "output_tokens": 5,
+                },
+            },
+        },
+    ]
+    (session_dir / "session-cache.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8"
+    )
+
+    result = get_tool_usage(
+        "claude-code",
+        claude_dir=tmp_path / ".claude",
+        registry=legacy_file_source_registry(),
+    )
+
+    # 900 cache read of 10 uncached + 900 read + 90 written (98.9 if writes were ignored).
+    assert result["sessions"][0]["cache_hit_rate"] == 90.0
+    assert result["models"][0]["cache_hit_rate"] == 90.0
+    assert result["summary"]["cache_hit_rate"] == 90.0
+    assert [day["cache_hit_rate"] for day in result["timeline"] if day["total_input"]] == [90.0]

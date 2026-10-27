@@ -29,6 +29,18 @@ def _non_negative_int(value: Any) -> int:
         return 0
 
 
+def cache_hit_rate(uncached_input: int, cached_input: int, cache_write: int = 0) -> float:
+    """Return the prompt-cache hit rate as a percentage rounded to 2 decimals.
+
+    Cache reads are measured against all input the model saw: regular input,
+    cache reads and cache writes. Providers without cache writes (Codex, AGY)
+    pass zero, which reduces to ``cached / (uncached + cached)``. An empty
+    denominator yields ``0.0``.
+    """
+    total = uncached_input + cached_input + cache_write
+    return round(cached_input / total * 100.0, 2) if total > 0 else 0.0
+
+
 def _decimal(value: Any) -> Decimal | None:
     if value is None or isinstance(value, bool):
         return None
@@ -538,7 +550,11 @@ class UsageSession:
             "output": self.usage.output_tokens,
             "reasoning_output": self.usage.reasoning_output_tokens,
             "total_tokens": self.usage.total_tokens,
-            "cache_hit_rate": round(self.usage.cached_input_tokens / self.usage.input_tokens * 100.0, 2) if self.usage.input_tokens else 0.0,
+            "cache_hit_rate": cache_hit_rate(
+                self.usage.uncached_input_tokens,
+                self.usage.cached_input_tokens,
+                self.usage.cache_write_tokens,
+            ),
         }
         if self.cost is not None:
             result.update(self.cost.to_legacy_dict())

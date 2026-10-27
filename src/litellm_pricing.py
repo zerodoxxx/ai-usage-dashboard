@@ -209,6 +209,17 @@ def validate_index(index: Mapping[str, Any]) -> None:
         )
 
 
+# agy per-call routing ids (lowercase) mapped to the LiteLLM key they are priced as.
+# These variants are assumed to share the base model's per-token rates: an inference,
+# not something Google publishes. Unlisted routing ids (e.g. gemini-default) stay unpriced.
+AGY_MODEL_ALIASES: dict[str, str] = {
+    "gemini-3.7-flash-tiered": "gemini-3.7-flash",
+    "gemini-3.7-flash-control": "gemini-3.7-flash",
+    "gemini-3.6-flash-tiered": "gemini-3.6-flash",
+    "gemini-3.1-pro-low": "gemini-3.1-pro-preview",
+}
+
+
 def litellm_key_candidates(model: str) -> list[str]:
     """Generate ordered, de-duplicated exact-lookup candidates for a model name."""
     raw = str(model or "").strip().casefold()
@@ -244,6 +255,11 @@ def litellm_key_candidates(model: str) -> list[str]:
 
     _add(primary)
     _add(dot_replaced)
+
+    # Fallback only: a real LiteLLM entry for the exact id always wins over the alias.
+    alias_target = AGY_MODEL_ALIASES.get(base)
+    if alias_target:
+        _add(alias_target)
 
     for item in list(candidates):
         if item.endswith("-latest"):

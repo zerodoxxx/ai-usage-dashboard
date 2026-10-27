@@ -255,6 +255,195 @@ def test_migration_preserves_legacy_agy_rows_and_keeps_summary_views_agy_only(
     assert provider_daily == [("antigravity", 1), ("codex", 1)]
 
 
+def _claude_like_session(session_id: str = "claude-views") -> UsageSession:
+    # 1,000 input tokens (900 read from cache) plus 100 additive cache writes.
+    return UsageSession(
+        id=session_id,
+        tool="claude-code",
+        provider="claude-code",
+        model="claude-sonnet-5-5",
+        created_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+        usage=TokenUsage(
+            input_tokens=1_000,
+            cached_input_tokens=900,
+            cache_write_tokens=100,
+            output_tokens=10,
+        ),
+    )
+
+
+def _provider_rates(path: Path) -> dict[tuple[str, str], float]:
+    """Return ``(view, provider) -> cache_hit_rate`` for the provider-aware views."""
+    rates: dict[tuple[str, str], float] = {}
+    with sqlite3.connect(path) as connection:
+        for view in ("provider_daily_summary", "provider_model_summary"):
+            for provider, rate in connection.execute(f"SELECT provider, cache_hit_rate FROM {view}"):
+                rates[(view, provider)] = rate
+    return rates
+
+
+def test_provider_summary_views_count_additive_cache_writes_in_hit_rate(tmp_path: Path) -> None:
+    path = tmp_path / "usage.db"
+    write_usage_sessions("claude-code", [_claude_like_session()], path)
+
+    # 900 / (1,000 + 100), not 900 / 1,000.
+    assert _provider_rates(path) == {
+        ("provider_daily_summary", "claude-code"): 81.82,
+        ("provider_model_summary", "claude-code"): 81.82,
+    }
+    with sqlite3.connect(path) as connection:
+        # The raw columns stay as stored: only the rate's denominator changed.
+        assert connection.execute(
+            "SELECT input_tokens, cached_input_tokens, cache_write_tokens FROM provider_daily_summary"
+        ).fetchone() == (1_000, 900, 100)
+
+
+def test_summary_views_keep_legacy_agy_hit_rate_unchanged(tmp_path: Path) -> None:
+    path = tmp_path / "token_usage.db"
+    _legacy_db(path)  # embedded_in_input row: input 100, cached 40, diagnostic write 15
+    ensure_schema(path)
+    write_usage_sessions("claude-code", [_claude_like_session()], path)
+    # A current-writer AGY snapshot: additive mode with zero cache writes.
+    write_usage_sessions("antigravity", [UsageSession(
+        id="agy-new",
+        tool="antigravity",
+        provider="antigravity",
+        model="Gemini Flash",
+        created_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+        usage=TokenUsage(input_tokens=200, cached_input_tokens=50, output_tokens=5),
+    )], path)
+
+    with sqlite3.connect(path) as connection:
+        modes = dict(connection.execute(
+            "SELECT session_id, cache_write_mode FROM sessions WHERE provider = 'antigravity'"
+        ))
+        # The pre-change formula, computed straight from the table.
+        old_overall = connection.execute(
+            "SELECT ROUND(CAST(SUM(cached_input_tokens) AS REAL) / SUM(input_tokens) * 100.0, 2) "
+            "FROM sessions WHERE provider = 'antigravity'"
+        ).fetchone()[0]
+        old_daily = dict(connection.execute(
+            "SELECT date, ROUND(CAST(SUM(cached_input_tokens) AS REAL) / SUM(input_tokens) * 100.0, 2) "
+            "FROM sessions WHERE provider = 'antigravity' GROUP BY date"
+        ))
+        daily = dict(connection.execute("SELECT date, cache_hit_rate FROM daily_summary"))
+        model = connection.execute("SELECT model, cache_hit_rate FROM model_summary").fetchall()
+        provider_model = dict(connection.execute(
+            "SELECT provider, cache_hit_rate FROM provider_model_summary"
+        ))
+
+    assert modes == {"agy-old": "embedded_in_input", "agy-new": "additive"}
+    assert old_overall == 30.0
+    assert daily == old_daily == {"2026-09-20": 40.0, "2026-09-21": 25.0}
+    assert model == [("Gemini Flash", old_overall)]
+    assert provider_model == {"antigravity": old_overall, "claude-code": 81.82}
+
+
+def test_summary_views_hit_rate_is_zero_without_input(tmp_path: Path) -> None:
+    path = tmp_path / "usage.db"
+    write_usage_sessions("codex", [UsageSession(
+        id="empty",
+        tool="codex",
+        provider="codex",
+        model="gpt-5-codex",
+        created_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+        usage=TokenUsage(),
+    )], path)
+
+    assert _provider_rates(path) == {
+        ("provider_daily_summary", "codex"): 0.0,
+        ("provider_model_summary", "codex"): 0.0,
+    }
+
+
+# The summary views as they were defined before cache writes joined the
+# denominator, used to prove an existing database picks up the new definition.
+_OLD_VIEW_METRICS = """COUNT(*) AS sessions,
+        SUM(input_tokens) AS input_tokens,
+        SUM(cached_input_tokens) AS cached_input_tokens,
+        SUM(output_tokens) AS output_tokens,
+        SUM(cache_write_tokens) AS cache_write_tokens,
+        SUM(total_tokens) AS total_tokens,
+        ROUND(SUM(cost_usd), 4) AS cost_usd,
+        CASE WHEN SUM(input_tokens) > 0
+             THEN ROUND(CAST(SUM(cached_input_tokens) AS REAL) / SUM(input_tokens) * 100.0, 2)
+             ELSE 0.0 END AS cache_hit_rate"""
+
+
+def _install_old_views(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        for view in ("daily_summary", "model_summary", "provider_daily_summary", "provider_model_summary"):
+            connection.execute(f"DROP VIEW {view}")
+        connection.execute(
+            f"CREATE VIEW daily_summary AS SELECT date, {_OLD_VIEW_METRICS} "
+            "FROM sessions WHERE provider = 'antigravity' GROUP BY date ORDER BY date DESC"
+        )
+        connection.execute(
+            f"CREATE VIEW model_summary AS SELECT model, {_OLD_VIEW_METRICS} "
+            "FROM sessions WHERE provider = 'antigravity' GROUP BY model ORDER BY total_tokens DESC"
+        )
+        connection.execute(
+            f"CREATE VIEW provider_daily_summary AS SELECT provider, date, {_OLD_VIEW_METRICS} "
+            "FROM sessions GROUP BY provider, date ORDER BY date DESC, provider"
+        )
+        connection.execute(
+            f"CREATE VIEW provider_model_summary AS SELECT provider, model, {_OLD_VIEW_METRICS} "
+            "FROM sessions GROUP BY provider, model ORDER BY total_tokens DESC"
+        )
+
+
+@pytest.mark.parametrize("upgrade", ["ensure_schema", "writer"])
+def test_existing_database_with_old_views_is_upgraded_without_a_schema_bump(
+    tmp_path: Path,
+    upgrade: str,
+) -> None:
+    path = tmp_path / "usage.db"
+    write_usage_sessions("claude-code", [_claude_like_session()], path)
+    _install_old_views(path)
+    with sqlite3.connect(path) as connection:
+        version_before = connection.execute("PRAGMA user_version").fetchone()[0]
+    assert _provider_rates(path)[("provider_daily_summary", "claude-code")] == 90.0
+
+    if upgrade == "ensure_schema":
+        ensure_schema(path)
+    else:
+        write_usage_sessions("claude-code", [_claude_like_session("claude-views-2")], path)
+
+    assert _provider_rates(path) == {
+        ("provider_daily_summary", "claude-code"): 81.82,
+        ("provider_model_summary", "claude-code"): 81.82,
+    }
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == version_before == 1
+        definition = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'provider_daily_summary'"
+        ).fetchone()[0]
+    assert "cache_write_mode = 'additive'" in definition
+
+
+def test_ensure_schema_skips_view_rebuild_when_views_are_current(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.usage_store as usage_store
+
+    path = tmp_path / "usage.db"
+    ensure_schema(path)
+
+    rebuilds: list[int] = []
+    real_recreate = usage_store._recreate_views
+    monkeypatch.setattr(
+        usage_store, "_recreate_views",
+        lambda connection: (rebuilds.append(1), real_recreate(connection))[1],
+    )
+    ensure_schema(path)  # views already match: the per-write fast path must not rebuild them
+    assert rebuilds == []
+
+    _install_old_views(path)
+    ensure_schema(path)
+    assert rebuilds == [1]
+
+
 def test_provider_namespaces_and_token_cost_timing_metadata_round_trip(tmp_path: Path) -> None:
     path = tmp_path / "usage.db"
     codex = _session("codex", "shared-id", input_tokens=120, output_tokens=40, cost_source="reported")
@@ -968,3 +1157,292 @@ def test_write_deadline_bounds_busy_wait_and_raises(tmp_path, monkeypatch):
         blocker.close()
     # Without contention a deadline does not interfere.
     assert write_usage_sessions("codex", [_session()], db, deadline=time.monotonic() + 5) == 1
+
+
+# --- Antigravity token provenance: real counts are never replaced by estimates ---
+
+_REAL_ORIGIN = "agy-conversation-db"
+_TRANSCRIPT_ORIGIN = "agy-transcript-json"
+
+
+def _agy_snapshot(
+    origin: str | None,
+    *,
+    session_id: str = "agy-origin",
+    calls: int = 2,
+    input_tokens: int = 100,
+    mtime: int | None = None,
+    source_hash: str = "sha256:agy-transcript",
+) -> UsageSession:
+    snapshot = _session(
+        "antigravity",
+        session_id,
+        input_tokens=input_tokens,
+        event_count=calls,
+        mtime=mtime,
+        source_hash=source_hash,
+    )
+    if origin is not None:
+        snapshot.metadata["token_origin"] = origin
+    return snapshot
+
+
+def _stored_agy(path: Path) -> UsageSession:
+    (stored,) = read_usage_sessions("antigravity", path)
+    return stored
+
+
+def _raw_rows(path: Path) -> tuple[list[tuple], list[tuple]]:
+    with sqlite3.connect(path) as connection:
+        return (
+            connection.execute("SELECT * FROM sessions ORDER BY session_id").fetchall(),
+            connection.execute("SELECT * FROM token_events ORDER BY id").fetchall(),
+        )
+
+
+def test_real_agy_snapshot_replaces_legacy_row_with_empty_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "token_usage.db"
+    _legacy_db(path)
+    ensure_schema(path)
+    real = _agy_snapshot(_REAL_ORIGIN, session_id="agy-old", calls=3, input_tokens=300)
+
+    assert write_usage_sessions("antigravity", [real], path) == 1
+
+    stored = _stored_agy(path)
+    assert stored.id == "agy-old"
+    assert stored.usage.total_tokens == real.usage.total_tokens
+    assert len(stored.events) == 3
+    assert stored.metadata["token_origin"] == _REAL_ORIGIN
+
+
+def test_real_agy_snapshot_replaces_placeholder_session_after_prefix_fold(tmp_path: Path) -> None:
+    path = tmp_path / "prefixed.db"
+    placeholder = UsageSession(
+        id="raw-conversation", tool="antigravity", provider="antigravity",
+        model="gemini", usage=TokenUsage(input_tokens=123),
+    )
+    write_usage_sessions("antigravity", [placeholder], path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE sessions SET session_id = 'antigravity:raw-conversation'")
+    real = _agy_snapshot(_REAL_ORIGIN, session_id="raw-conversation", calls=2)
+
+    assert write_usage_sessions("antigravity", [real], path) == 1
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT session_id, total_tokens FROM sessions").fetchall() == [
+            ("raw-conversation", real.usage.total_tokens),
+        ]
+        assert connection.execute("SELECT DISTINCT session_id FROM token_events").fetchall() == [
+            ("raw-conversation",),
+        ]
+    assert len(_stored_agy(path).events) == 2
+
+
+@pytest.mark.parametrize("real_has_sources", [True, False])
+def test_real_agy_snapshot_replaces_estimate_with_capture_sources_without_merging(
+    tmp_path: Path,
+    real_has_sources: bool,
+) -> None:
+    path = tmp_path / "usage.db"
+    estimated = _agy_snapshot(None, calls=3, input_tokens=300, mtime=100, source_hash="sha256:estimate")
+    assert write_usage_sessions("antigravity", [estimated], path) == 1
+    assert len(_stored_agy(path).events) == 3
+
+    real = _agy_snapshot(
+        _REAL_ORIGIN,
+        calls=2,
+        input_tokens=80,
+        mtime=500 if real_has_sources else None,
+        source_hash="sha256:real-db",
+    )
+    assert write_usage_sessions("antigravity", [real], path) == 1
+
+    stored = _stored_agy(path)
+    # Exactly the real snapshot: no estimated fragments merged back in.
+    assert len(stored.events) == len(real.events) == 2
+    assert stored.usage.total_tokens == real.usage.total_tokens
+    assert stored.metadata["token_origin"] == _REAL_ORIGIN
+    if real_has_sources:
+        assert set(stored.metadata["capture_sources"]) == {"sha256:real-db"}
+
+
+@pytest.mark.parametrize("source_hash", ["sha256:shared", "sha256:other-source", None])
+def test_newer_revision_estimate_cannot_replace_real_agy_snapshot(
+    tmp_path: Path,
+    source_hash: str | None,
+) -> None:
+    path = tmp_path / "usage.db"
+    real = _agy_snapshot(_REAL_ORIGIN, calls=2, input_tokens=100, mtime=100, source_hash="sha256:shared")
+    assert write_usage_sessions("antigravity", [real], path) == 1
+    before = _raw_rows(path)
+
+    estimate = _agy_snapshot(
+        None,
+        calls=5,
+        input_tokens=900,
+        mtime=900 if source_hash else None,
+        source_hash=source_hash or "sha256:unused",
+    )
+    assert write_usage_sessions("antigravity", [estimate], path) == 0
+
+    assert _raw_rows(path) == before
+    stored = _stored_agy(path)
+    assert stored.usage.total_tokens == real.usage.total_tokens
+    assert len(stored.events) == 2
+    assert stored.metadata["token_origin"] == _REAL_ORIGIN
+
+
+def test_real_agy_snapshot_never_shrinks_replay_is_idempotent_and_growth_replaces(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "usage.db"
+    full = _agy_snapshot(_REAL_ORIGIN, calls=3, input_tokens=300)
+    assert write_usage_sessions("antigravity", [full], path) == 1
+    before = _raw_rows(path)
+
+    # agy pruned old data: fewer calls is rejected, stored data untouched.
+    fewer = _agy_snapshot(_REAL_ORIGIN, calls=2, input_tokens=200)
+    assert write_usage_sessions("antigravity", [fewer], path) == 0
+    assert _raw_rows(path) == before
+
+    # Same call count but fewer total tokens is rejected too.
+    lighter = _agy_snapshot(_REAL_ORIGIN, calls=3, input_tokens=250)
+    assert write_usage_sessions("antigravity", [lighter], path) == 0
+    assert _raw_rows(path) == before
+
+    # An identical replay is accepted and leaves the same counts.
+    assert write_usage_sessions("antigravity", [full], path) == 1
+    replayed = _stored_agy(path)
+    assert replayed.usage.total_tokens == full.usage.total_tokens
+    assert len(replayed.events) == 3
+    assert len(_raw_rows(path)[1]) == 3
+
+    # Same calls with more tokens replaces.
+    heavier = _agy_snapshot(_REAL_ORIGIN, calls=3, input_tokens=350)
+    assert write_usage_sessions("antigravity", [heavier], path) == 1
+    assert _stored_agy(path).usage.total_tokens == heavier.usage.total_tokens
+
+    # More calls replaces even with fewer total tokens (calls compare first).
+    grown = _agy_snapshot(_REAL_ORIGIN, calls=4, input_tokens=100)
+    assert grown.usage.total_tokens < heavier.usage.total_tokens
+    assert write_usage_sessions("antigravity", [grown], path) == 1
+    stored = _stored_agy(path)
+    assert stored.usage.total_tokens == grown.usage.total_tokens
+    assert len(stored.events) == 4
+
+
+def test_agy_conversation_db_snapshot_replaces_transcript_json_but_not_the_reverse(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "usage.db"
+    transcript = _agy_snapshot(_TRANSCRIPT_ORIGIN, calls=3, input_tokens=300)
+    assert write_usage_sessions("antigravity", [transcript], path) == 1
+    # Equal rank follows the call/total rule: a smaller transcript replay is refused.
+    smaller = _agy_snapshot(_TRANSCRIPT_ORIGIN, calls=2, input_tokens=100)
+    assert write_usage_sessions("antigravity", [smaller], path) == 0
+    assert _stored_agy(path).usage.total_tokens == transcript.usage.total_tokens
+
+    # A higher origin wins even when it carries fewer calls.
+    conversation_db = _agy_snapshot(_REAL_ORIGIN, calls=2, input_tokens=100)
+    assert write_usage_sessions("antigravity", [conversation_db], path) == 1
+    stored = _stored_agy(path)
+    assert stored.metadata["token_origin"] == _REAL_ORIGIN
+    assert stored.usage.total_tokens == conversation_db.usage.total_tokens
+    assert len(stored.events) == 2
+
+    before = _raw_rows(path)
+    bigger_transcript = _agy_snapshot(_TRANSCRIPT_ORIGIN, calls=6, input_tokens=900)
+    assert write_usage_sessions("antigravity", [bigger_transcript], path) == 0
+    assert _raw_rows(path) == before
+
+
+@pytest.mark.parametrize("provider", ["codex", "claude-code"])
+def test_token_origin_does_not_guard_other_providers(tmp_path: Path, provider: str) -> None:
+    # Codex/Claude shrink-replace and revision guards are covered by
+    # test_snapshot_replay_is_idempotent_and_replacement_removes_stale_tail,
+    # test_older_overlapping_hook_cannot_replace_newer_transcript_snapshot and
+    # test_fragment_updates_replace_only_the_matching_revisioned_source. This
+    # only pins that the Antigravity origin rank never applies to them.
+    path = tmp_path / "usage.db"
+    stamped = _session(provider, event_count=3)
+    stamped.metadata["token_origin"] = _REAL_ORIGIN
+    assert write_usage_sessions(provider, [stamped], path) == 1
+
+    shorter = _session(provider, input_tokens=60, output_tokens=10, event_count=1)
+    assert write_usage_sessions(provider, [shorter], path) == 1
+
+    (stored,) = read_usage_sessions(provider, path)
+    assert stored.usage.total_tokens == 77
+    assert len(stored.events) == 1
+    assert "token_origin" not in stored.metadata
+
+
+@pytest.mark.parametrize("origin", [
+    "agy-unknown",
+    "",
+    " agy-conversation-db",
+    "AGY-CONVERSATION-DB",
+    None,
+    5,
+    True,
+    ["agy-conversation-db"],
+    {"agy-conversation-db": 2},
+])
+def test_unknown_or_garbage_token_origin_ranks_zero(origin: object) -> None:
+    from src.usage_store import _token_origin_rank
+
+    assert _token_origin_rank("antigravity", {"token_origin": origin}) == 0
+
+
+def test_token_origin_rank_known_values_missing_key_and_other_providers() -> None:
+    from src.usage_store import _token_origin_rank
+
+    assert _token_origin_rank("antigravity", {"token_origin": _REAL_ORIGIN}) == 2
+    assert _token_origin_rank("antigravity", {"token_origin": _TRANSCRIPT_ORIGIN}) == 1
+    assert _token_origin_rank("antigravity", {}) == 0
+    for provider in ("codex", "claude-code", "other-tool"):
+        assert _token_origin_rank(provider, {"token_origin": _REAL_ORIGIN}) == 0
+        assert _token_origin_rank(provider, {"token_origin": _TRANSCRIPT_ORIGIN}) == 0
+
+
+def test_agy_snapshot_with_unknown_origin_behaves_like_rank_zero(tmp_path: Path) -> None:
+    path = tmp_path / "usage.db"
+    unknown = _agy_snapshot("agy-unknown", calls=3, input_tokens=300, mtime=100, source_hash="sha256:shared")
+    assert write_usage_sessions("antigravity", [unknown], path) == 1
+    assert _stored_agy(path).metadata["token_origin"] == "agy-unknown"
+
+    # Rank 0 vs rank 0 keeps the pre-existing revision logic: an older
+    # revision of the same source is refused...
+    older = _agy_snapshot(None, calls=2, input_tokens=100, mtime=50, source_hash="sha256:shared")
+    before = _raw_rows(path)
+    assert write_usage_sessions("antigravity", [older], path) == 0
+    assert _raw_rows(path) == before
+
+    # ...and a newer revision replaces it, even with fewer calls and tokens.
+    newer = _agy_snapshot(None, calls=1, input_tokens=40, mtime=200, source_hash="sha256:shared")
+    assert write_usage_sessions("antigravity", [newer], path) == 1
+    stored = _stored_agy(path)
+    assert stored.usage.total_tokens == newer.usage.total_tokens
+    assert len(stored.events) == 1
+
+    # A real conversation-db snapshot replaces an unknown-origin row.
+    other = _agy_snapshot("agy-unknown", session_id="agy-unknown-2", calls=3, input_tokens=300)
+    assert write_usage_sessions("antigravity", [other], path) == 1
+    real = _agy_snapshot(_REAL_ORIGIN, session_id="agy-unknown-2", calls=1, input_tokens=60)
+    assert write_usage_sessions("antigravity", [real], path) == 1
+    replaced = next(row for row in read_usage_sessions("antigravity", path) if row.id == "agy-unknown-2")
+    assert replaced.metadata["token_origin"] == _REAL_ORIGIN
+    assert replaced.usage.total_tokens == real.usage.total_tokens
+    assert len(replaced.events) == 1
+
+
+def test_unknown_origin_snapshot_cannot_replace_a_ranked_snapshot(tmp_path: Path) -> None:
+    path = tmp_path / "usage.db"
+    transcript = _agy_snapshot(_TRANSCRIPT_ORIGIN, calls=2, input_tokens=100)
+    assert write_usage_sessions("antigravity", [transcript], path) == 1
+    before = _raw_rows(path)
+
+    # Rank 0 is below rank 1 however many calls it carries.
+    unknown = _agy_snapshot("agy-unknown", calls=6, input_tokens=900)
+    assert write_usage_sessions("antigravity", [unknown], path) == 0
+    assert _raw_rows(path) == before
