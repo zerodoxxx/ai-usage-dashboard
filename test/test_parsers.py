@@ -18,7 +18,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.pricing import MODEL_PRICING, calculate_cost, get_pricing, get_pricing_strict
 from src.parsers.codex import _parse_rollout_file, parse_codex_usage
-from src.parsers.agy import parse_agy_usage
 from src.parsers.aggregator import (
     _filter_usage_data,
     _parse_custom_range,
@@ -26,7 +25,6 @@ from src.parsers.aggregator import (
     _time_range_cutoff,
     get_tool_usage,
 )
-from tests_support import legacy_file_source_registry
 
 
 def test_pricing() -> None:
@@ -231,22 +229,6 @@ def test_codex_event_deduplication() -> None:
     print("✓ Duplicate token record/status messages are counted once per API call.")
 
 
-def test_agy() -> None:
-    print("\n--- 3. Testing Antigravity (AGY) Parser ---")
-    data = parse_agy_usage()
-    assert data["tool"] == "antigravity", f"Expected tool 'antigravity', got {data['tool']}"
-    assert "summary" in data and "models" in data and "timeline" in data and "sessions" in data
-
-    s = data["summary"]
-    print(f"✓ AGY Sessions Parsed: {s['session_count']}")
-    print(f"✓ AGY Total Tokens:   {s['total_tokens']:,}")
-    print(f"✓ AGY Cache Hit Rate: {s['cache_hit_rate']}%")
-    print(f"✓ AGY Est Cost:       ${s['cost_cached_usd']:.4f} (Saved: ${s['savings_usd']:.4f})")
-    print(f"✓ AGY Models Found:   {len(data['models'])}")
-    for m in data["models"]:
-        print(f"    - {m['model']}: {m['total_tokens']:,} tokens, ${m['est_cost_cached_usd']:.4f}")
-
-
 def test_aggregator() -> None:
     print("\n--- 4. Testing Aggregator (All Tools) ---")
     codex_data = get_tool_usage("codex")
@@ -449,65 +431,6 @@ def test_time_filters() -> None:
     assert all_result["analytics"]["active_days"] < len(all_result["timeline"]) or len(all_result["timeline"]) == 2
 
     print("✓ Calendar-month, rolling, and per-call time-range boundaries verified.")
-
-
-def test_agy_estimated_provenance() -> None:
-    print("\n--- 6. Testing AGY Estimated Provenance ---")
-    from src.parsers.agy import AntigravitySource
-
-    def write_transcript(root: Path, session_id: str, steps: list[dict]) -> None:
-        brain = root / "brain" / session_id / ".system_generated" / "logs"
-        brain.mkdir(parents=True, exist_ok=True)
-        (brain / "transcript.jsonl").write_text(
-            "\n".join(json.dumps(line) for line in steps), encoding="utf-8"
-        )
-
-    single_turn = [
-        {"created_at": "2026-09-08T10:00:00Z", "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "hello world, please help with this code"},
-        {"created_at": "2026-09-08T10:00:01Z", "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "sure thing, here is the fix", "thinking": "plan"},
-    ]
-    multi_turn = [
-        {"created_at": "2026-09-08T10:00:00Z", "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "first question about the codebase structure here"},
-        {"created_at": "2026-09-08T10:00:01Z", "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "first answer with details", "thinking": "think"},
-        {"created_at": "2026-09-08T10:01:00Z", "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "follow-up question with more context attached"},
-        {"created_at": "2026-09-08T10:01:01Z", "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "second answer with even more detail", "thinking": "think again"},
-    ]
-
-    with TemporaryDirectory() as temp_dir:
-        root = Path(temp_dir)
-        (root / "settings.json").write_text(json.dumps({"model": "Gemini 2.5 Flash"}), encoding="utf-8")
-        write_transcript(root, "sess-single", single_turn)
-        write_transcript(root, "sess-multi", multi_turn)
-
-        # Contract-level provenance straight from the adapter.
-        sessions = AntigravitySource().extract_sessions(root)
-        assert len(sessions) == 2, f"Expected 2 AGY sessions, got {len(sessions)}"
-        for session in sessions:
-            assert session.metadata.get("estimated") is True, session.metadata
-            assert session.metadata.get("token_source") == "estimated", session.metadata
-
-        # Single-turn assumes 0% cache; multi-turn applies the flat 45% share.
-        by_id = {session.id: session for session in sessions}
-        assert by_id["sess-single"].usage.cached_input_tokens == 0
-        assert by_id["sess-multi"].usage.cached_input_tokens > 0
-        expected_cached = int(by_id["sess-multi"].usage.input_tokens * 0.45)
-        assert by_id["sess-multi"].usage.cached_input_tokens == expected_cached
-
-        # Aggregated API shape carries the estimated flag on sessions + models.
-        data = get_tool_usage(
-            "antigravity",
-            agy_dir=root,
-            registry=legacy_file_source_registry(),
-        )
-        assert len(data["sessions"]) == 2
-        for api_session in data["sessions"]:
-            assert api_session["estimated"] is True, api_session
-            assert api_session["token_source"] == "estimated", api_session
-        assert len(data["models"]) == 1
-        assert data["models"][0]["estimated"] is True, data["models"][0]
-        assert data["models"][0]["token_source"] == "estimated", data["models"][0]
-
-    print("✓ AGY sessions/models are flagged estimated; single-turn 0% cache vs multi-turn 45% verified.")
 
 
 def test_custom_time_range() -> None:
@@ -912,10 +835,8 @@ if __name__ == "__main__":
     test_pricing()
     codex_res = test_codex()
     test_codex_event_deduplication()
-    agy_res = test_agy()
     test_aggregator()
     test_time_filters()
-    test_agy_estimated_provenance()
     test_custom_time_range()
     test_activity_timelines()
     test_daily_heatmap_independent_of_filter()

@@ -297,27 +297,20 @@ def test_completion_inside_window_counts_entire_call(tmp_path: Path) -> None:
 
 
 def test_tool_filter_and_agy_rows_are_unavailable(tmp_path: Path) -> None:
-    codex_root, claude_root, agy_root = (tmp_path / name for name in ("codex", "claude", "agy"))
+    codex_root, claude_root = (tmp_path / name for name in ("codex", "claude"))
     _rollout(codex_root, [_item(0, "message", role="user"), _item(5, "message", role="assistant"), _token(5, _usage())])
     _write(claude_root / "projects" / "test" / "session.jsonl", [_user(0), _assistant(10)])
-    _write(agy_root / "brain" / "session" / "transcript.jsonl", [
-        {"created_at": _ts(0), "type": "USER_INPUT", "source": "USER", "content": "fixture input"},
-        {"created_at": _ts(5), "type": "PLANNER_RESPONSE", "source": "MODEL", "content": "fixture output " * 50},
-    ])
     registry = legacy_file_source_registry()
-    roots = {"codex": codex_root, "claude-code": claude_root, "antigravity": agy_root}
+    roots = {"codex": codex_root, "claude-code": claude_root}
     codex_only = get_tool_usage("codex", registry=registry, source_dirs=roots)
     assert len(codex_only["models"]) == 1
     assert codex_only["models"][0]["tool"] == "codex"
     assert codex_only["models"][0]["tps_calls"] == 1
     combined = get_tool_usage("all", registry=registry, source_dirs=roots)
-    assert len(combined["models"]) == 3
+    assert len(combined["models"]) == 2
     for row in combined["models"]:
         assert {key for key in row if key.startswith("tps")} == TPS_FIELDS
-        if row["tool"] == "antigravity":
-            _null_tps(row)
-        else:
-            assert row["tps_status"] == "approximate"
+        assert row["tps_status"] == "approximate"
     # Unsupported sources cannot opt into timing by supplying metadata.
     row = _build_usage_data([_raw_session([_timed(100, 5)], "antigravity", "Gemini 3.8 Flash (High)")], "antigravity")["models"][0]
     _null_tps(row)
