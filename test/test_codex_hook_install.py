@@ -405,7 +405,7 @@ def test_invalid_existing_hooks_json_is_left_untouched(tmp_path: Path) -> None:
 def test_current_repository_payload_stages_without_touching_database(
     tmp_path: Path,
 ) -> None:
-    source = Path(__file__).resolve().parent
+    source = Path(__file__).resolve().parents[1]
     codex_home = tmp_path / "Codex home with spaces"
     database = tmp_path / "AGY database" / "token usage.db"
 

@@ -182,7 +182,7 @@ def test_dashboard_uses_embedded_pricing_with_generation_protection_and_legacy_f
     if node is None:
         pytest.skip("Node.js is required for the dashboard integration harness")
 
-    dashboard_path = Path(__file__).resolve().parent / "src" / "static" / "js" / "dashboard.js"
+    dashboard_path = Path(__file__).resolve().parents[1] / "src" / "static" / "js" / "dashboard.js"
     result = subprocess.run(
         [node, "-e", NODE_DASHBOARD_HARNESS, str(dashboard_path)],
         check=True,

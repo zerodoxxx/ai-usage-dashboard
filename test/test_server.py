@@ -43,7 +43,7 @@ def test_version_static_assets_pins_mtime_and_replaces_stale_query() -> None:
 
 
 def test_index_html_cache_busts_charts_js() -> None:
-    html = (Path(__file__).resolve().parent / "src" / "templates" / "index.html").read_text(
+    html = (Path(__file__).resolve().parents[1] / "src" / "templates" / "index.html").read_text(
         encoding="utf-8"
     )
     out = version_static_assets(html)
@@ -56,7 +56,7 @@ def test_index_html_cache_busts_charts_js() -> None:
     assert f"/static/js/charts.js?v={charts_v}" in out
     assert "Cost / 1K Tokens" not in out
     assert EST_FOOTNOTE_HTML in out
-    utils_js = (Path(__file__).resolve().parent / "src" / "static" / "js" / "utils.js").read_text(
+    utils_js = (Path(__file__).resolve().parents[1] / "src" / "static" / "js" / "utils.js").read_text(
         encoding="utf-8"
     )
     assert f"const EST_TOOLTIP = '{EST_TOOLTIP}';" in utils_js

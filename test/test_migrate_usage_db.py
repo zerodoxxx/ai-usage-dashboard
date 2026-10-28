@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(__file__).parent / "scripts" / "migrate_usage_db.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "migrate_usage_db.py"
 spec = importlib.util.spec_from_file_location("migrate_usage_db", SCRIPT)
 migrate_usage_db = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(migrate_usage_db)
