@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from src.parsers.agy import parse_agy_usage
 from src.parsers.aggregator import get_tool_usage
 from src.parsers.codex import (
     CodexSource,
@@ -114,47 +113,6 @@ def _write_threads_db(root: Path, rows: list[tuple[str, str, int]]) -> None:
         connection.close()
 
 
-def test_agy_legacy_database_without_provider_column_keeps_old_totals(tmp_path: Path) -> None:
-    connection = sqlite3.connect(tmp_path / "token_usage.db")
-    try:
-        connection.executescript(
-            """
-            CREATE TABLE sessions (
-                session_id TEXT, title TEXT, model TEXT, input_tokens INTEGER,
-                cached_input_tokens INTEGER, output_tokens INTEGER,
-                reasoning_output_tokens INTEGER, total_tokens INTEGER,
-                cache_write_tokens INTEGER, cost_usd REAL, call_count INTEGER,
-                timestamp TEXT, updated_at TEXT
-            );
-            CREATE TABLE token_events (
-                session_id TEXT, step_index INTEGER, timestamp TEXT, model TEXT,
-                input_tokens INTEGER, cached_input_tokens INTEGER,
-                output_tokens INTEGER, cache_write_tokens INTEGER,
-                reasoning_output_tokens INTEGER, total_tokens INTEGER, cost_usd REAL
-            );
-            """
-        )
-        connection.execute(
-            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("legacy", "Legacy AGY", "Gemini 3.8 Flash (High)", 100, 80, 10, 0, 110,
-             20, 0.25, 1, _TIME, _TIME),
-        )
-        connection.execute(
-            "INSERT INTO token_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("legacy", 0, _TIME, "Gemini 3.8 Flash (High)", 100, 80, 10, 20, 0, 110, 0.25),
-        )
-        connection.commit()
-    finally:
-        connection.close()
-
-    result = parse_agy_usage(tmp_path, db_path=tmp_path / "token_usage.db")
-
-    assert result["summary"]["total_tokens"] == 110
-    assert result["summary"]["total_input"] == 100
-    assert result["summary"]["cache_write"] == 0
-    assert result["sessions"][0]["id"] == "legacy"
-
-
 def test_shared_database_keeps_agy_codex_and_claude_provider_rows_separate(tmp_path: Path) -> None:
     agy_root = tmp_path / "agy"
     agy_root.mkdir()
@@ -167,12 +125,8 @@ def test_shared_database_keeps_agy_codex_and_claude_provider_rows_separate(tmp_p
     for row in rows:
         write_usage_sessions(row.provider or row.tool, [row], db_path=db_path)
 
-    agy = parse_agy_usage(agy_root, db_path=db_path)
     codex = CodexSource(usage_db_path=db_path).extract_sessions(agy_root / "separate-codex-root")
 
-    assert [(row["tool"], row["total_tokens"]) for row in agy["sessions"]] == [
-        ("antigravity", 110),
-    ]
     assert [(row.provider, row.id, row.usage.total_tokens) for row in codex] == [
         ("codex", "same-native-id", 120),
     ]

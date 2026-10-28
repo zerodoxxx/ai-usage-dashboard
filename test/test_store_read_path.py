@@ -9,7 +9,6 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import src.app as app_module
-from src.parsers import agy as agy_parser
 from src.parsers import claude as claude_parser
 from src.parsers import codex as codex_parser
 from src.parsers import file_cache
@@ -270,7 +269,6 @@ def _assert_no_raw_file_reads(monkeypatch) -> None:
 
     monkeypatch.setattr(codex_parser, "parse_codex_usage", unexpected_raw_read)
     monkeypatch.setattr(codex_parser, "_parse_rollout_file", unexpected_raw_read)
-    monkeypatch.setattr(agy_parser, "parse_agy_usage", unexpected_raw_read)
     monkeypatch.setattr(ClaudeCodeSource, "extract_sessions", unexpected_raw_read)
     monkeypatch.setattr(claude_parser, "_session_files", unexpected_raw_read)
     monkeypatch.setattr(codex_parser.Path, "glob", unexpected_raw_read)

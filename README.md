@@ -98,6 +98,10 @@ Run these commands from the repository root. Use Python 3.12 or newer. Hook inst
    AI_USAGE_TIMEZONE=America/New_York python run.py --open
    ```
 
+   `run.py` also accepts `--host`, `--port` (default 8765), and `--no-reload`. Pricing rates are cached at `~/.cache/ai-usage-dashboard/litellm-pricing.json`; set `AI_USAGE_PRICING_CACHE` to move it.
+
+   `launch.sh` and `launch_background.sh` are conda-based shortcuts: they create or update the `ai-usage-dashboard` conda environment, then start the server in the foreground or detached (`launch_background.sh --status` or `--stop` to manage it; logs go to `~/.ai-usage-dashboard/`).
+
 ## Data sources
 
 | Tool | Database provider | Writer inputs | Capture |
@@ -122,6 +126,7 @@ python -m pytest
 | `GET /api/usage?tool=codex&time_range=30d` | Codex usage for the past 30 days |
 | `GET /api/usage?tool=agy&time_range=month` | AGY usage for the current calendar month |
 | `GET /api/usage?tool=claude-code&time_range=7d` | Claude Code usage for the past 7 days |
+| `GET /api/usage?tool=all&time_range=custom&start=2026-10-01&end=2026-10-15` | Inclusive local-date range; `end` is optional |
 | `GET /api/pricing` | Model rates and `__meta__` source/freshness |
 | `GET /api/health` | Server health check |
 
@@ -129,6 +134,8 @@ python -m pytest
 
 ```text
 run.py                         # Server entry point
+launch.sh                      # Conda setup and foreground launch
+launch_background.sh           # Detached launch with --status and --stop
 scripts/
 ├── codex_usage_writer.py       # Codex capture and one-time backfill
 ├── install_codex_usage_hooks.py
@@ -144,6 +151,7 @@ scripts/
 src/
 ├── app.py                     # FastAPI endpoints and response cache
 ├── usage_store.py             # Shared SQLite schema, reads, and writes
+├── agy_conversation_usage.py  # Recorded AGY per-call tokens from conversations/*.db
 ├── pricing.py                 # Pricing catalog and memoized resolution
 ├── litellm_pricing.py          # Pricing feed parser
 ├── timezones.py               # Local-calendar boundaries
@@ -151,7 +159,6 @@ src/
 │   ├── store_source.py        # Dashboard's database-only adapters
 │   ├── codex.py               # Codex writer/backfill parser
 │   ├── claude.py              # Claude writer/backfill parser
-│   ├── agy.py                 # Legacy AGY parser, kept for tests; off the runtime path
 │   ├── file_cache.py          # Transcript parser cache
 │   ├── contracts.py           # Normalized usage contracts
 │   ├── source_registry.py     # Provider registry
@@ -163,6 +170,6 @@ src/
 docs/
 ├── SHARED_USAGE_DB.md
 └── CODEX_RETENTION.md
-HOW_IT_WORKS.md                 # Read path, estimates, pricing, and caches
-test_*.py                      # Pytest suites
+HOW_IT_WORKS.md                # Read path, estimates, pricing, and caches
+test/                          # Pytest suites
 ```
